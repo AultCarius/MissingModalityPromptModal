@@ -1,0 +1,28 @@
+# 忽略数据集
+data/
+datasets/
+Dataset/
+*.zip
+*.tar.gz
+
+# 忽略训练结果和模型
+experiments/
+checkpoints/
+results/
+*.ckpt
+*.pt
+*.pth
+*.h5
+
+# 忽略 Jupyter Notebook 的输出
+.ipynb_checkpoints/
+
+# 忽略虚拟环境
+venv/
+.env/
+__pycache__/
+*.pyc
+
+# 忽略日志
+*.log
+logs/

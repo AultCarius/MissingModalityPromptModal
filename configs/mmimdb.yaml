@@ -1,0 +1,52 @@
+# 实验配置
+experiment_name: "mmimdb__patch16_test_0429_exp1"
+
+# Model Configuration
+image_model_name: "vit_base_patch16_224"
+text_model_name: "openai/clip-vit-base-patch16"
+image_prompt_len: 36
+text_prompt_len: 36
+prompt_depth: 6
+fusion_dim: 512
+freeze_image_encoder: True
+freeze_text_encoder: True
+use_quality_prompt: True
+use_cross_modal_prompt: True
+
+# Training Configuration
+epochs: 50
+batch_size: 16
+num_workers: 4
+image_size: 224
+patch_size: 16
+lr: 0.00005
+weight_decay: 0.005
+warmup_percent: 0.5
+min_lr: 0.000001
+seed: 42
+save_every_epochs: 10
+
+
+# Data Configuration
+dataset: "mmimdb"
+data_dir: "./data/mmimdb"
+
+missing_strategy: "both"
+missing_prob: 0.7
+val_missing_strategy: "both"
+val_missing_prob: 0.7
+test_missing_strategy: "both"
+test_missing_prob: 0.7
+
+# 评估指标设置
+metrics: ["accuracy", "macro_f1", "micro_f1"]
+primary_metric: "macro_f1"
+
+# Logging Configuration
+use_tensorboard: true
+
+# Device Configuration
+device: "cuda"  # "cuda" or "cpu"
+
+# Resuming (optional)
+# resume_path: "./checkpoints/model_epochX.pt"
