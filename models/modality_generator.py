@@ -44,7 +44,10 @@ class CrossModalGenerator(nn.Module):
         # 对于"both"情况（双模态缺失）需要的先验生成器
         self.prior_generators = nn.ModuleDict({
             mod_name: nn.Sequential(
-                nn.Linear(1, fusion_hidden_dim),  # 从随机噪声生成
+                nn.Linear(128, fusion_hidden_dim),  # 从更丰富的随机噪声生成
+                nn.LayerNorm(fusion_hidden_dim),
+                nn.GELU(),
+                nn.Linear(fusion_hidden_dim, fusion_hidden_dim),
                 nn.LayerNorm(fusion_hidden_dim),
                 nn.GELU(),
                 nn.Linear(fusion_hidden_dim, dim),
@@ -56,7 +59,14 @@ class CrossModalGenerator(nn.Module):
         """将特定模态的特征编码到共享空间"""
         if features is None:
             return None
-        return self.encoders[modality](features)
+
+        # 处理多个token的情况
+        if features.dim() > 2:  # [batch_size, token_count, dim]
+            # 对每个token分别编码
+            encoded_features = self.encoders[modality](features)
+            return encoded_features
+        else:  # [token_count, dim] 或 [batch_size, dim]
+            return self.encoders[modality](features)
 
     def generate(self, source_features, source_modality, target_modality):
         """基于源模态特征生成目标模态特征"""
@@ -155,15 +165,34 @@ class ModReconstructor(nn.Module):
             ) for mod_name, dim in modality_dims.items()
         })
 
+        # 添加注意力融合层，用于多token处理
+        self.attention_fusion = nn.ModuleDict({
+            mod_name: nn.MultiheadAttention(embed_dim=dim, num_heads=8, batch_first=True)
+            for mod_name, dim in modality_dims.items()
+        })
+
     def forward(self, features):
         """重建各模态特征"""
         if not isinstance(features, dict):
-            raise ValueError(f"CycleGenerationModel expects input features as a dict, got {type(features)}")
+            raise ValueError(f"ModReconstructor expects input features as a dict, got {type(features)}")
+
         outputs = {}
         for mod, feat in features.items():
             if feat is not None:
-                feat = feat.clone()  # <-- 加这一行，避免inplace问题
-                outputs[mod] = self.decoders[mod](feat)
+                feat = feat.clone()  # 避免inplace问题
+
+                # 使用自注意力机制处理多个token
+                if feat.dim() > 2:  # 批次 + 多token情况
+                    attn_output, _ = self.attention_fusion[mod](
+                        query=feat,
+                        key=feat,
+                        value=feat
+                    )
+                    # 对每个token进行解码
+                    outputs[mod] = self.decoders[mod](attn_output)
+                else:  # 单token情况
+                    outputs[mod] = self.decoders[mod](feat)
+
         return outputs
 
 
@@ -243,28 +272,52 @@ class CycleGenerationModel(nn.Module):
 
     def _generate_for_sample(self, features, missing_type):
         """针对单个样本生成缺失模态特征"""
-        generated = {
-            mod: (features[mod].clone() if features.get(mod) is not None else None)
-            for mod in self.modality_dims.keys()
-        }
+        token_count = 5  # 使用的token数量
+
+        generated = {}
+        for mod in self.modality_dims.keys():
+            if features.get(mod) is not None:
+                # 如果特征是2D的，则提取前token_count个token
+                if features[mod].dim() == 2:
+                    if features[mod].size(0) >= token_count:
+                        generated[mod] = features[mod][:token_count].clone()
+                    else:
+                        # 如果token不够，则复制现有的token
+                        repeat_times = (token_count + features[mod].size(0) - 1) // features[mod].size(0)
+                        generated[mod] = features[mod].repeat(repeat_times, 1)[:token_count].clone()
+                else:
+                    # 对于单个样本的情况
+                    generated[mod] = features[mod].clone()
+            else:
+                generated[mod] = None
 
         # 根据缺失类型生成特征
         if missing_type == 1:  # 图像缺失
             if features.get("text") is not None:
-                text_feat = features["text"].clone()
+                text_feat = generated["text"]  # 使用多个token
                 encoded_text = self.generator.encode(text_feat, "text")
                 generated["image"] = self.generator.generators["text_to_image"](encoded_text)
+                # 添加一点噪声提高泛化能力
+                generated["image"] = generated["image"] + torch.randn_like(generated["image"]) * 0.01
 
         elif missing_type == 2:  # 文本缺失
             if features.get("image") is not None:
-                image_feat = features["image"].clone()
+                image_feat = generated["image"]  # 使用多个token
                 encoded_image = self.generator.encode(image_feat, "image")
                 generated["text"] = self.generator.generators["image_to_text"](encoded_image)
+                # 添加一点噪声提高泛化能力
+                generated["text"] = generated["text"] + torch.randn_like(generated["text"]) * 0.01
 
         elif missing_type == 3:  # 双模态缺失
             # 使用随机噪声生成特征
-            noise = torch.randn(1, 1, device=next(self.parameters()).device)
+            noise = torch.randn(token_count, 1, device=next(self.parameters()).device)
             generated["image"] = self.generator.prior_generators["image"](noise)
             generated["text"] = self.generator.prior_generators["text"](noise)
+
+        # 添加正则项
+        if missing_type == 1:  # Image missing
+            generated["image"] = generated["image"] + torch.randn_like(generated["image"]) * 0.01
+        elif missing_type == 2:  # Text missing
+            generated["text"] = generated["text"] + torch.randn_like(generated["text"]) * 0.01
 
         return generated, self.reconstructor(generated)

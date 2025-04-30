@@ -243,7 +243,9 @@ class Trainer:
 
     def train(self):
         num_epochs = self.config.get("epochs", 10)
+        max_epochs = num_epochs
         for epoch in range(self.start_epoch, num_epochs):
+            current_epoch = epoch
             self.model.train()
             total_loss = 0
             cls_loss = 0
@@ -299,6 +301,7 @@ class Trainer:
                     # Calculate reconstruction loss if modality generator is used
                     if additional_info and 'reconstructed_features' in additional_info and additional_info[
                         'reconstructed_features']:
+                        generated_features = additional_info['generated_features']
                         recon_features = additional_info['reconstructed_features']
                         orig_features = additional_info['original_features']
 
@@ -310,7 +313,13 @@ class Trainer:
                                 missing_img_orig = orig_features['image'][missing_mask]
 
                                 if len(missing_img_recon) > 0:
-                                    img_recon_loss = F.mse_loss(missing_img_recon, missing_img_orig)
+                                    # 调整形状以适应多token情况
+                                    if missing_img_recon.dim() > 2:  # [batch, token_count, dim]
+                                        # 计算每个token位置的MSE损失并平均
+                                        img_recon_loss = F.mse_loss(missing_img_recon, missing_img_orig)
+                                    else:  # 单token情况
+                                        img_recon_loss = F.mse_loss(missing_img_recon, missing_img_orig)
+
                                     reconstruction_loss += img_recon_loss
                                     gen_stats['image']['mse'].append(img_recon_loss.item())
                                     gen_stats['image']['count'] += len(missing_img_recon)
@@ -323,14 +332,46 @@ class Trainer:
                                 missing_txt_orig = orig_features['text'][missing_mask]
 
                                 if len(missing_txt_recon) > 0:
-                                    txt_recon_loss = F.mse_loss(missing_txt_recon, missing_txt_orig)
+                                    # 调整形状以适应多token情况
+                                    if missing_txt_recon.dim() > 2:  # [batch, token_count, dim]
+                                        # 计算每个token位置的MSE损失并平均
+                                        txt_recon_loss = F.mse_loss(missing_txt_recon, missing_txt_orig)
+                                    else:  # 单token情况
+                                        txt_recon_loss = F.mse_loss(missing_txt_recon, missing_txt_orig)
+
                                     reconstruction_loss += txt_recon_loss
                                     gen_stats['text']['mse'].append(txt_recon_loss.item())
                                     gen_stats['text']['count'] += len(missing_txt_recon)
 
                     # Total loss with weighted reconstruction loss
-                    recon_weight = self.config.get("reconstruction_weight", 0.1)
+                    # recon_weight = self.config.get("reconstruction_weight", 0.1)
+                    initial_recon_weight = 0.1
+                    final_recon_weight = 0.01
+                    recon_weight = initial_recon_weight * (1 - current_epoch / max_epochs) + final_recon_weight * (
+                                current_epoch / max_epochs)
                     total_batch_loss = classification_loss + recon_weight * reconstruction_loss
+
+                    if is_image_missing.any() and recon_features['image'] is not None and orig_features[
+                        'image'] is not None:
+                        # 获取缺失图像的生成特征和原始特征
+                        missing_img_recon = recon_features['image'][is_image_missing]
+                        missing_img_orig = orig_features['image'][is_image_missing]
+
+                        if len(missing_img_recon) > 1:  # 需要至少两个样本计算对比损失
+                            contra_img_loss = self.contrastive_loss(missing_img_recon, missing_img_orig)
+                            # 添加到总损失，使用较小的权重
+                            reconstruction_loss += 0.05 * contra_img_loss
+
+                    if is_text_missing.any() and recon_features['text'] is not None and orig_features[
+                        'text'] is not None:
+                        # 获取缺失文本的生成特征和原始特征
+                        missing_txt_recon = recon_features['text'][is_text_missing]
+                        missing_txt_orig = orig_features['text'][is_text_missing]
+
+                        if len(missing_txt_recon) > 1:  # 需要至少两个样本计算对比损失
+                            contra_txt_loss = self.contrastive_loss(missing_txt_recon, missing_txt_orig)
+                            # 添加到总损失，使用较小的权重
+                            reconstruction_loss += 0.05 * contra_txt_loss
 
                     # Collect quality assessment data
                     if additional_info and 'quality_scores' in additional_info:
@@ -843,3 +884,26 @@ class Trainer:
         }
 
         return detailed_metrics
+
+    def contrastive_loss(self,x1, x2, temperature=0.1):
+        """计算对比损失，用于提高特征表示质量"""
+        # 确保输入是2D的 [batch_size, feature_dim]
+        if x1.dim() > 2:
+            x1 = x1.view(x1.size(0), -1)  # 展平多token特征
+        if x2.dim() > 2:
+            x2 = x2.view(x2.size(0), -1)  # 展平多token特征
+
+        batch_size = x1.size(0)
+        x1_norm = F.normalize(x1, p=2, dim=1)
+        x2_norm = F.normalize(x2, p=2, dim=1)
+
+        # 计算相似度矩阵
+        logits = torch.matmul(x1_norm, x2_norm.transpose(0, 1)) / temperature
+        # 正样本是对角线元素
+        labels = torch.arange(batch_size, device=x1.device)
+
+        # 双向对比损失
+        loss_x1_x2 = F.cross_entropy(logits, labels)
+        loss_x2_x1 = F.cross_entropy(logits.transpose(0, 1), labels)
+
+        return loss_x1_x2 + loss_x2_x1

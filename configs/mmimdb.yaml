@@ -1,30 +1,31 @@
 # 实验配置
-experiment_name: "mmimdb__patch16_test_0429_exp1"
+experiment_name: "mmimdb_patch16_test_0430_exp2"
 
 # Model Configuration
 image_model_name: "vit_base_patch16_224"
 text_model_name: "openai/clip-vit-base-patch16"
-image_prompt_len: 36
-text_prompt_len: 36
+image_prompt_len: 32
+text_prompt_len: 32
 prompt_depth: 6
 fusion_dim: 512
 freeze_image_encoder: True
 freeze_text_encoder: True
 use_quality_prompt: True
 use_cross_modal_prompt: True
+reconstruction_weight: 0.2
 
 # Training Configuration
-epochs: 50
+epochs: 100
 batch_size: 16
 num_workers: 4
 image_size: 224
 patch_size: 16
 lr: 0.00005
 weight_decay: 0.005
-warmup_percent: 0.5
+warmup_percent: 0.4
 min_lr: 0.000001
-seed: 42
-save_every_epochs: 10
+seed: 666
+save_every_epochs: 20
 
 
 # Data Configuration
