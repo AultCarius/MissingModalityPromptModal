@@ -10,7 +10,12 @@ from datetime import datetime
 from sklearn.metrics import f1_score, roc_auc_score, accuracy_score
 from transformers import get_linear_schedule_with_warmup
 import torch.nn.functional as F
-
+from scripts.emailsender import (
+    setup_email_config,
+    parse_log_file,
+    create_training_plots,
+    send_email_with_results
+)
 
 # torch.autograd.set_detect_anomaly(True)
 GENRE_CLASS = [
@@ -32,7 +37,7 @@ class Trainer:
             with open(config, 'r') as f:
                 config = yaml.safe_load(f)
         self.config = config
-
+        self.config = setup_email_config(self.config)
         # 设置实验名称
         self.experiment_name = config.get("experiment_name", f"exp_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
 
@@ -61,6 +66,58 @@ class Trainer:
         if config.get("resume_path"):
             self._load_checkpoint(config["resume_path"])
 
+    def send_training_results_email(self):
+        """Send training results and logs via email"""
+        if not self.config.get("email", {}).get("send_email", False):
+            self.logger.info("Email notifications disabled in config")
+            return
+
+        self.logger.info("Preparing to send training results via email...")
+
+        # Get paths to logs
+        log_dir = self.log_dir
+        log_files = [os.path.join(log_dir, f) for f in os.listdir(log_dir)
+                     if f.endswith('.log')]
+
+        # Get the most recent log file
+        if log_files:
+            log_files.sort(key=os.path.getmtime, reverse=True)
+            latest_log = log_files[0]
+        else:
+            latest_log = None
+
+        # Parse log file to extract metrics
+        if latest_log:
+            metrics = parse_log_file(latest_log)
+        else:
+            metrics = None
+
+        # Create output directory for plots
+        plots_dir = os.path.join(self.base_dir, "plots")
+        os.makedirs(plots_dir, exist_ok=True)
+
+        # Create plots from metrics
+        plot_paths = []
+        if metrics:
+            plot_paths = create_training_plots(metrics, plots_dir)
+
+        # Create summary of best metrics
+        best_metrics_summary = {
+            metric: value for metric, value in self.best_metrics.items()
+        }
+
+        # Send email with results
+        success = send_email_with_results(
+            self.config,
+            [latest_log] if latest_log else [],
+            plot_paths,
+            best_metrics_summary
+        )
+
+        if success:
+            self.logger.info("Training results email sent successfully")
+        else:
+            self.logger.warning("Failed to send training results email")
     def _setup_experiment_directories(self):
         """创建实验相关的目录结构"""
         # 基础目录
@@ -132,6 +189,7 @@ class Trainer:
         # 文件处理程序
         log_file = os.path.join(self.log_dir, f'train_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log')
         fh = logging.FileHandler(log_file)
+        self.logfilename = log_file
 
         # 控制台处理程序
         ch = logging.StreamHandler()
@@ -489,6 +547,8 @@ class Trainer:
         # Print all best metrics
         metrics_str = " | ".join([f"{k}={v:.4f}" for k, v in self.best_metrics.items()])
         self.logger.info(f"Best metrics: {metrics_str}")
+
+        self.send_training_results_email()
 
         if self.writer:
             self.writer.close()

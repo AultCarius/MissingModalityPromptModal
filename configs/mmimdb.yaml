@@ -1,18 +1,18 @@
 # 实验配置
-experiment_name: "mmimdb_patch16_test_0430_exp2"
+experiment_name: "mmimdb_patch16_test_0501_exp1"
 
 # Model Configuration
 image_model_name: "vit_base_patch16_224"
 text_model_name: "openai/clip-vit-base-patch16"
 image_prompt_len: 32
 text_prompt_len: 32
-prompt_depth: 6
+prompt_depth: 4
 fusion_dim: 512
 freeze_image_encoder: True
 freeze_text_encoder: True
 use_quality_prompt: True
 use_cross_modal_prompt: True
-reconstruction_weight: 0.2
+reconstruction_weight: 0.8
 
 # Training Configuration
 epochs: 100
@@ -20,9 +20,9 @@ batch_size: 16
 num_workers: 4
 image_size: 224
 patch_size: 16
-lr: 0.00005
+lr: 0.0001
 weight_decay: 0.005
-warmup_percent: 0.4
+warmup_percent: 0.5
 min_lr: 0.000001
 seed: 666
 save_every_epochs: 20
@@ -45,6 +45,16 @@ primary_metric: "macro_f1"
 
 # Logging Configuration
 use_tensorboard: true
+
+# Email configuration
+email:
+  send_email: true
+  smtp_server: "smtp.qq.com"
+  smtp_port: 465
+  sender_email: "1494032646@qq.com"
+  sender_password: "gmhibktcmuggiiab"
+  recipient_email: "aultcarius@163.com"
+  email_subject: "Training Results: MMIMDB Experiment"
 
 # Device Configuration
 device: "cuda"  # "cuda" or "cpu"
