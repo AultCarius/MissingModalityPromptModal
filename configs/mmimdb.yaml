@@ -1,9 +1,9 @@
 # 实验配置
-experiment_name: "mmimdb_patch16_test_0501_exp1"
+experiment_name: "mmimdb_patch16_test_0501_exp4"
 
 # Model Configuration
 image_model_name: "vit_base_patch16_224"
-text_model_name: "openai/clip-vit-base-patch16"
+text_model_name: "roberta-base"
 image_prompt_len: 32
 text_prompt_len: 32
 prompt_depth: 4
@@ -12,20 +12,29 @@ freeze_image_encoder: True
 freeze_text_encoder: True
 use_quality_prompt: True
 use_cross_modal_prompt: True
-reconstruction_weight: 0.8
+initial_recon_weight: 0.8
+final_recon_weight: 0.1
+max_length: 512
 
 # Training Configuration
-epochs: 100
+epochs: 50
 batch_size: 16
 num_workers: 4
 image_size: 224
 patch_size: 16
-lr: 0.0001
+lr: 0.001
 weight_decay: 0.005
-warmup_percent: 0.5
+warmup_percent: 0.4
 min_lr: 0.000001
-seed: 666
+seed: 66666
 save_every_epochs: 20
+
+use_focal_loss: true
+focal_start_epoch: 4
+focal_gamma: 2.0
+gamma_ramp_epochs: 5
+focal_alpha: 0.5
+
 
 
 # Data Configuration

@@ -36,7 +36,9 @@ class MMIMDBDataset(Dataset):
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.5] * 3, std=[0.5] * 3)
         ])
-        self.tokenizer = tokenizer or CLIPTokenizer.from_pretrained("openai/clip-vit-base-patch16")
+        # Replace CLIP tokenizer with RoBERTa tokenizer
+        from transformers import RobertaTokenizer
+        self.tokenizer = tokenizer or RobertaTokenizer.from_pretrained("roberta-base")
         self.max_length = max_length
         self.missing_strategy = missing_strategy
 
@@ -229,3 +231,19 @@ class mmimdbDataModule(BaseDataModule):
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.5] * 3, std=[0.5] * 3)
         ])
+
+    def get_class_weights(self):
+        """
+        返回每个类别的加权 BCE 权重，值为 max_count / class_count。
+        可用于 pos_weight 参数。
+        """
+        class_counts = torch.tensor([
+            13967, 8592, 5364, 5192, 3838, 3550, 2710, 2703, 2082, 2057,
+            1991, 1933, 1668, 1343, 1335, 1143, 1045, 997, 841, 705,
+            634, 471, 338
+        ], dtype=torch.float32)
+        max_count = class_counts.max()
+        weights = max_count / class_counts
+        return weights
+
+

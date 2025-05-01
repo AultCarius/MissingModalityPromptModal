@@ -16,6 +16,8 @@ from scripts.emailsender import (
     create_training_plots,
     send_email_with_results
 )
+from tqdm import tqdm
+
 
 # torch.autograd.set_detect_anomaly(True)
 GENRE_CLASS = [
@@ -32,7 +34,7 @@ class Trainer:
         self.model = model
         self.train_loader = train_loader
         self.val_loader = val_loader
-
+        self.class_weights = None
         if isinstance(config, str):
             with open(config, 'r') as f:
                 config = yaml.safe_load(f)
@@ -302,7 +304,15 @@ class Trainer:
     def train(self):
         num_epochs = self.config.get("epochs", 10)
         max_epochs = num_epochs
+        focal_start_epoch = self.config.get("focal_start_epoch", 3)
+        use_focal_loss = self.config.get("use_focal_loss", True)
+        focal_alpha = self.config.get("focal_alpha", 0.5)
+        focal_max_gamma = self.config.get("focal_gamma", 2.0)
+        gamma_ramp_epochs = self.config.get("gamma_ramp_epochs", 5)
+
+
         for epoch in range(self.start_epoch, num_epochs):
+
             current_epoch = epoch
             self.model.train()
             total_loss = 0
@@ -318,40 +328,30 @@ class Trainer:
             gen_stats = {'image': {'mse': [], 'count': 0}, 'text': {'mse': [], 'count': 0}}
 
             self.logger.info(f"Epoch {epoch} start")
-
+            batch_pbar = tqdm(total=len(self.train_loader),
+                              desc=f"Epoch {epoch + 1}/{num_epochs}",
+                              dynamic_ncols=True,
+                              leave=False)
 
             for batch_idx, batch in enumerate(self.train_loader):
                 image, input_ids, attention_mask, label, missing_type = [x.to(self.device) for x in batch]
                 is_image_missing = (missing_type == 1) | (missing_type == 3)
                 is_text_missing = (missing_type == 2) | (missing_type == 3)
-                #
-                # if is_image_missing.any():
-                #     # 对于缺失的图像样本，将对应位置设置为None
-                #     # 但我们仍保留original_image用于重建损失计算
-                #     masked_image = image.clone()
-                #     masked_image[is_image_missing] = 0  # 将缺失图像置零
-                # else:
-                #     masked_image = image
-                #
-                # if is_text_missing.any():
-                #     # 对于缺失的文本样本，将对应位置设置为None
-                #     # 但我们仍保留original_input_ids用于重建损失计算
-                #     masked_input_ids = input_ids.clone()
-                #     masked_attention_mask = attention_mask.clone()
-                #     masked_input_ids[is_text_missing] = 0  # 将缺失文本置零
-                #     masked_attention_mask[is_text_missing] = 0  # 将缺失文本的注意力掩码置零
-                # else:
-                #     masked_input_ids = input_ids
-                #     masked_attention_mask = attention_mask
-                # # Forward pass with additional info
-
                 output = self.model(image, input_ids, attention_mask, missing_type)
 
                 if isinstance(output, tuple):
                     logits, additional_info = output
 
                     # Calculate classification loss
-                    classification_loss = torch.nn.functional.binary_cross_entropy_with_logits(logits, label)
+                    # classification_loss = self.focal_loss(logits, label)
+                    if use_focal_loss and epoch >= focal_start_epoch:
+                        progress = min(1.0, (epoch - focal_start_epoch + 1) / gamma_ramp_epochs)
+                        gamma = focal_max_gamma * progress
+                        classification_loss = self.focal_loss(logits, label, alpha=focal_alpha, gamma=gamma)
+                    else:
+                        classification_loss = F.binary_cross_entropy_with_logits(
+                            logits, label, pos_weight=self.class_weights
+                        )
 
                     # Initialize reconstruction loss
                     reconstruction_loss = 0.0
@@ -402,9 +402,8 @@ class Trainer:
                                     gen_stats['text']['count'] += len(missing_txt_recon)
 
                     # Total loss with weighted reconstruction loss
-                    # recon_weight = self.config.get("reconstruction_weight", 0.1)
-                    initial_recon_weight = 0.1
-                    final_recon_weight = 0.01
+                    initial_recon_weight = self.config.get("reconstruction_weight", 0.1)
+                    final_recon_weight = self.config.get("final_recon_weight", 0.01)
                     recon_weight = initial_recon_weight * (1 - current_epoch / max_epochs) + final_recon_weight * (
                                 current_epoch / max_epochs)
                     total_batch_loss = classification_loss + recon_weight * reconstruction_loss
@@ -450,11 +449,18 @@ class Trainer:
                                                                            torch.Tensor) else reconstruction_loss
                 else:
                     logits = output
-                    total_batch_loss = torch.nn.functional.binary_cross_entropy_with_logits(logits, label)
+                    classification_loss = F.binary_cross_entropy_with_logits(
+                        logits, label, pos_weight=self.class_weights
+                    )
+                    total_batch_loss = classification_loss
+                    cls_loss += classification_loss.item()
 
                 # Optimization step
                 self.optimizer.zero_grad()
                 total_batch_loss.backward()
+
+                batch_pbar.set_postfix({"loss": f"{total_batch_loss.item():.4f}"})
+                batch_pbar.update(1)
 
                 # Optional gradient clipping
                 if self.config.get("clip_grad_norm", 0) > 0:
@@ -480,6 +486,9 @@ class Trainer:
                 # Collect predictions and true labels for metrics
                 all_preds.append(preds.cpu().detach())
                 all_labels.append(label.cpu().detach())
+
+
+            batch_pbar.close()
 
             # Merge all batch predictions and labels
             all_preds = torch.cat(all_preds, dim=0)
@@ -967,3 +976,12 @@ class Trainer:
         loss_x2_x1 = F.cross_entropy(logits.transpose(0, 1), labels)
 
         return loss_x1_x2 + loss_x2_x1
+
+    def focal_loss(self, logits, targets, alpha=0.5, gamma=2.0, eps=1e-8):
+        probs = torch.sigmoid(logits)
+        pt = probs * targets + (1 - probs) * (1 - targets)
+        w = alpha * targets + (1 - alpha) * (1 - targets)
+        loss = -w * ((1 - pt) ** gamma) * torch.log(pt + eps)
+        return loss.mean()
+
+
