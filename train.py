@@ -70,7 +70,7 @@ if __name__ == '__main__':
     # Create model
     model = create_multimodal_prompt_model(
         image_model_name=config.get("image_model_name", "vit_base_patch16_224"),
-        text_model_name=config.get("text_model_name", "openai/clip-vit-base-patch16"),
+        clip_model_name='ViT-B/16',
         image_prompt_len=config.get("image_prompt_len", 5),
         text_prompt_len=config.get("text_prompt_len", 5),
         prompt_depth=config.get("prompt_depth", 6),
@@ -80,7 +80,7 @@ if __name__ == '__main__':
         freeze_text_encoder=config.get("freeze_text_encoder", False),
         use_quality_prompt=config.get("use_quality_prompt", False),
         use_cross_modal_prompt=config.get("use_cross_modal_prompt",False),
-
+        download_root="path/to/save/models"
     )
 
     # Initialize trainer

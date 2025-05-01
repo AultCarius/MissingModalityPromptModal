@@ -10,6 +10,8 @@ from models.quality_aware_prompting import EnhancedModalityQualityEstimator, \
 
 from .modality_generator import CycleGenerationModel, CrossModalGenerator
 
+from .custom_text_encoder import create_extended_text_encoder
+
 
 class InterLayerPromptBlock(nn.Module):
     def __init__(self, embed_dim, prompt_len):
@@ -161,19 +163,32 @@ class MultimodalPromptModel(nn.Module):
             freeze_text_encoder=False,
             use_quality_prompt=True,
             use_cross_modal_prompt=True,
-            use_modality_generator=True  # 添加参数以启用/禁用模态生成器
+            use_modality_generator=True,  # 添加参数以启用/禁用模态生成器
+            max_text_length=1024,
+            device="cpu",
+            download_root=None
+            # NEW: Maximum text sequence lengt
     ):
         super().__init__()
 
         self.image_encoder = image_encoder_backbone
-        self.text_encoder = CLIPTextModel.from_pretrained(text_encoder_name)
+
+        self.text_encoder = create_extended_text_encoder(
+            model_name=text_encoder_name,
+            max_position_embeddings=max_text_length,
+            prompt_length=text_prompt_len,
+            prompt_depth=prompt_depth,
+            device=device,
+            download_root=download_root
+        )
 
         self.image_dim = self.image_encoder.embed_dim
-        self.text_dim = self.text_encoder.config.hidden_size
+        self.text_dim = self.text_encoder.transformer_width
         self.use_quality_prompt = use_quality_prompt
         self.use_cross_modal_prompt = use_cross_modal_prompt
         self.use_modality_generator = use_modality_generator
         self.prompt_depth = prompt_depth
+        self.max_text_length = max_text_length
 
         # 图像和文本的特征提取器
         self.image_patch_embed = self.image_encoder.patch_embed
@@ -183,17 +198,15 @@ class MultimodalPromptModel(nn.Module):
         self.image_blocks = self.image_encoder.blocks
         self.image_norm = self.image_encoder.norm
 
-        self.text_embeddings = self.text_encoder.text_model.embeddings
-        self.text_blocks = self.text_encoder.text_model.encoder.layers
-        self.text_norm = self.text_encoder.text_model.final_layer_norm
-
         # 初始提示参数
         self.image_prompt_len = image_prompt_len
         self.text_prompt_len = text_prompt_len
         self.image_init_prompt = nn.Parameter(torch.randn(1, image_prompt_len, self.image_dim))
         self.text_init_prompt = nn.Parameter(torch.randn(1, text_prompt_len, self.text_dim))
+        self.fusion_dim = fusion_dim
+        self.num_classes = num_classes
 
-        # 集成模态生成器（使用CycleGenerationModel替代CrossModalGenerator）
+        # 集成模态生成器
         if use_modality_generator:
             modality_dims = {
                 'image': self.image_dim,
@@ -201,11 +214,11 @@ class MultimodalPromptModel(nn.Module):
             }
             self.modality_generator = CycleGenerationModel(modality_dims, fusion_hidden_dim=fusion_dim)
 
-        # 使用增强的质量评估器替换原有评估器
+        # 使用增强的质量评估器
         if use_quality_prompt:
             self.quality_estimator = EnhancedModalityQualityEstimator(self.image_dim, self.text_dim)
 
-        # 使用质量引导的特征融合替换跨模态提示
+        # 使用质量引导的特征融合
         if use_cross_modal_prompt:
             self.feature_fusion = QualityGuidedFeatureFusion(
                 self.image_dim,
@@ -233,7 +246,7 @@ class MultimodalPromptModel(nn.Module):
         if use_quality_prompt:
             fusion_input_dim += 9  # 增加质量评分（2个基础分+3个详细评分）
 
-        print("fusion_input_dim=",fusion_input_dim)
+        print("fusion_input_dim=", fusion_input_dim)
         self.fusion = nn.Sequential(
             nn.Linear(fusion_input_dim, fusion_dim),
             nn.ReLU(),
@@ -255,9 +268,8 @@ class MultimodalPromptModel(nn.Module):
                 self.image_pos_embed.requires_grad = False
 
         if freeze_text_encoder:
-            for module in [self.text_embeddings, self.text_blocks, self.text_norm]:
-                for param in module.parameters():
-                    param.requires_grad = False
+            for param in self.text_encoder.parameters():
+                param.requires_grad = False
 
     def _prepare_attention_mask(self, attention_mask, input_shape):
         # 创建4D注意力掩码 [batch_size, 1, seq_len, seq_len]
@@ -473,7 +485,7 @@ class MultimodalPromptModel(nn.Module):
         # 提取原始特征用于重建（确保即使模态缺失也有完整特征）
 
         # 处理模态（包括缺失模态的生成）
-        image_embed, text_embed, attention_mask, original_features,(generated_features, reconstructed_features) \
+        image_embed, text_embed, attention_mask, original_features, (generated_features, reconstructed_features) \
             = (self._process_modalities
             (
             image_embed, text_embed, attention_mask, missing_type
@@ -538,9 +550,8 @@ class MultimodalPromptModel(nn.Module):
                 # 从当前层特征更新提示
                 # image_prompt = self.cross_modal_layer[i](image_prompt, text_embed)
                 # text_prompt = self.cross_modal_layer[i](text_prompt, image_embed)
-                image_prompt = self.image_InterPrompt_layer[i](image_prompt,image_embed)
-                text_prompt = self.text_InterPrompt_layer[i](text_prompt,text_embed)
-
+                image_prompt = self.image_InterPrompt_layer[i](image_prompt, image_embed)
+                text_prompt = self.text_InterPrompt_layer[i](text_prompt, text_embed)
 
         # 继续处理剩余的Transformer层
         for i in range(self.prompt_depth, len(self.image_blocks)):
@@ -610,16 +621,20 @@ class MultimodalPromptModel(nn.Module):
 # 修改create_multimodal_prompt_model函数以支持不同的image_size和patch_size
 def create_multimodal_prompt_model(
         image_model_name='vit_base_patch16_224',
-        text_model_name='openai/clip-vit-base-patch16',
+        clip_model_name='ViT-B/16',
         image_prompt_len=5,
         text_prompt_len=5,
         prompt_depth=6,
         fusion_dim=512,
-        num_classes=101,
+        num_classes=23,
         freeze_image_encoder=False,
         freeze_text_encoder=False,
         use_quality_prompt=True,
         use_cross_modal_prompt=True,
+        use_modality_generator=True,
+        max_text_length=1024,
+        device="cpu",
+        download_root=None,
         image_size=224,
         patch_size=16
 ):
@@ -642,7 +657,7 @@ def create_multimodal_prompt_model(
     # 创建并返回完整的多模态模型
     return MultimodalPromptModel(
         image_encoder_backbone=vit_base,
-        text_encoder_name=text_model_name,
+        text_encoder_name=clip_model_name,
         image_prompt_len=image_prompt_len,
         text_prompt_len=text_prompt_len,
         prompt_depth=prompt_depth,
@@ -651,5 +666,9 @@ def create_multimodal_prompt_model(
         freeze_image_encoder=freeze_image_encoder,
         freeze_text_encoder=freeze_text_encoder,
         use_quality_prompt=use_quality_prompt,
-        use_cross_modal_prompt=use_cross_modal_prompt
+        use_cross_modal_prompt=use_cross_modal_prompt,
+        use_modality_generator=use_modality_generator,
+        max_text_length=max_text_length,
+        device=device,
+        download_root=download_root
     )

@@ -1,5 +1,5 @@
 # 实验配置
-experiment_name: "mmimdb_patch16_test_0501_exp1"
+experiment_name: "mmimdb_patch16_test_0501_customEncoder_exp3"
 
 # Model Configuration
 image_model_name: "vit_base_patch16_224"
@@ -13,14 +13,16 @@ freeze_text_encoder: True
 use_quality_prompt: True
 use_cross_modal_prompt: True
 reconstruction_weight: 0.8
+final_reconstruction_weight: 0.4
 
 # Training Configuration
-epochs: 100
-batch_size: 16
+epochs: 40
+batch_size: 32
 num_workers: 4
 image_size: 224
+max_length: 1024
 patch_size: 16
-lr: 0.0001
+lr: 0.01
 weight_decay: 0.005
 warmup_percent: 0.5
 min_lr: 0.000001

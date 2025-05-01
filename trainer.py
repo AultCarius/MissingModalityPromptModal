@@ -403,8 +403,8 @@ class Trainer:
 
                     # Total loss with weighted reconstruction loss
                     # recon_weight = self.config.get("reconstruction_weight", 0.1)
-                    initial_recon_weight = 0.1
-                    final_recon_weight = 0.01
+                    initial_recon_weight = self.config.get("reconstruction_weight", 0.1)
+                    final_recon_weight = self.config.get("final_reconstruction_weight", 0.1)
                     recon_weight = initial_recon_weight * (1 - current_epoch / max_epochs) + final_recon_weight * (
                                 current_epoch / max_epochs)
                     total_batch_loss = classification_loss + recon_weight * reconstruction_loss
