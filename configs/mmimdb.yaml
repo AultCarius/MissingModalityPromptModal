@@ -4,8 +4,8 @@ experiment_name: "mmimdb_patch16_test_0501_exp4"
 # Model Configuration
 image_model_name: "vit_base_patch16_224"
 text_model_name: "roberta-base"
-image_prompt_len: 32
-text_prompt_len: 32
+image_prompt_len: 36
+text_prompt_len: 36
 prompt_depth: 4
 fusion_dim: 512
 freeze_image_encoder: True
@@ -17,14 +17,14 @@ final_recon_weight: 0.1
 max_length: 512
 
 # Training Configuration
-epochs: 50
-batch_size: 16
+epochs: 100
+batch_size: 32
 num_workers: 4
 image_size: 224
 patch_size: 16
 lr: 0.001
 weight_decay: 0.005
-warmup_percent: 0.4
+warmup_percent: 0.2
 min_lr: 0.000001
 seed: 66666
 save_every_epochs: 20
