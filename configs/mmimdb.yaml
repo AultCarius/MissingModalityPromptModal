@@ -4,9 +4,9 @@ experiment_name: "mmimdb_patch16_test_0501_exp4"
 # Model Configuration
 image_model_name: "vit_base_patch16_224"
 text_model_name: "roberta-base"
-image_prompt_len: 36
-text_prompt_len: 36
-prompt_depth: 4
+image_prompt_len: 32
+text_prompt_len: 32
+prompt_depth: 6
 fusion_dim: 512
 freeze_image_encoder: True
 freeze_text_encoder: True
