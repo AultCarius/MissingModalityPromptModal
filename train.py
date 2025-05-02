@@ -1,3 +1,4 @@
+import torch
 import yaml
 import os
 from trainer import Trainer
@@ -8,8 +9,8 @@ from models.multimodal_model import create_multimodal_prompt_model
 # Load configuration
 if __name__ == '__main__':
 
-    # config_path = "configs/default.yaml"
-    config_path = "/kaggle/working/MissingModalityPromptModal/configs/mmimdb.yaml"
+    config_path = "configs/mmimdb.yaml"
+    # config_path = "/kaggle/working/MissingModalityPromptModal/configs/mmimdb.yaml"
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
 
@@ -82,6 +83,8 @@ if __name__ == '__main__':
         use_cross_modal_prompt=config.get("use_cross_modal_prompt", False),
         max_length=config.get("max_length",512)
     )
+
+    # model = torch.nn.DataParallel(model)
 
     # Initialize trainer
     trainer = Trainer(model, train_loader, val_loader, config=config)

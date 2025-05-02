@@ -120,21 +120,23 @@ class Trainer:
             self.logger.info("Training results email sent successfully")
         else:
             self.logger.warning("Failed to send training results email")
+
     def _setup_experiment_directories(self):
-        """创建实验相关的目录结构"""
+        """创建实验相关的目录结构，支持在 Kaggle 上持久化保存"""
+        if "KAGGLE_KERNEL_RUN_TYPE" in os.environ:
+            # 在 Kaggle 上运行，持久化目录为 /kaggle/output
+            base_root = "/kaggle/output"
+        else:
+            # 本地或服务器上运行
+            base_root = "experiments"
+
         # 基础目录
-        self.base_dir = os.path.join("experiments", self.experiment_name)
+        self.base_dir = os.path.join(base_root, self.experiment_name)
 
-        # 检查点目录
+        # 各子目录
         self.save_path = os.path.join(self.base_dir, "checkpoints")
-
-        # 日志目录
         self.log_dir = os.path.join(self.base_dir, "logs")
-
-        # Tensorboard目录
         self.tb_dir = os.path.join(self.log_dir, "tb")
-
-        # 配置和代码保存目录
         self.code_dir = os.path.join(self.base_dir, "code_snapshot")
 
         # 创建所有目录
