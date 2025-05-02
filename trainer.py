@@ -309,7 +309,7 @@ class Trainer:
         focal_alpha = self.config.get("focal_alpha", 0.5)
         focal_max_gamma = self.config.get("focal_gamma", 2.0)
         gamma_ramp_epochs = self.config.get("gamma_ramp_epochs", 5)
-
+        focal_weight = self.config.get("focal_weight",0.3)
 
         for epoch in range(self.start_epoch, num_epochs):
 
@@ -347,7 +347,9 @@ class Trainer:
                     if use_focal_loss and epoch >= focal_start_epoch:
                         progress = min(1.0, (epoch - focal_start_epoch + 1) / gamma_ramp_epochs)
                         gamma = focal_max_gamma * progress
-                        classification_loss = self.focal_loss(logits, label, alpha=focal_alpha, gamma=gamma)
+                        bce_loss = F.binary_cross_entropy_with_logits(logits, label, pos_weight=self.class_weights)
+                        focal = self.focal_loss(logits, label, alpha=focal_alpha, gamma=gamma)
+                        classification_loss = bce_loss + focal_weight * focal
                     else:
                         classification_loss = F.binary_cross_entropy_with_logits(
                             logits, label, pos_weight=self.class_weights

@@ -17,7 +17,7 @@ final_recon_weight: 0.1
 max_length: 512
 
 # Training Configuration
-epochs: 100
+epochs: 50
 batch_size: 32
 num_workers: 4
 image_size: 224
@@ -34,6 +34,7 @@ focal_start_epoch: 4
 focal_gamma: 2.0
 gamma_ramp_epochs: 5
 focal_alpha: 0.5
+focal_weight: 0.3
 
 
 
