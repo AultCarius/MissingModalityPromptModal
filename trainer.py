@@ -313,6 +313,13 @@ class Trainer:
         gamma_ramp_epochs = self.config.get("gamma_ramp_epochs", 5)
         focal_weight = self.config.get("focal_weight",0.3)
 
+        use_asymmetric_loss = self.config.get("use_asymmetric_loss", True)
+        asl_start_epoch = self.config.get("asl_start_epoch", 3)
+        asl_gamma_pos = self.config.get("asl_gamma_pos", 0.0)
+        asl_gamma_neg = self.config.get("asl_gamma_neg", 4.0)
+        asl_ramp_epochs = self.config.get("asl_ramp_epochs", 3)
+        asl_clip = self.config.get("asl_clip", 0.05)
+
         for epoch in range(self.start_epoch, num_epochs):
 
             current_epoch = epoch
@@ -345,8 +352,15 @@ class Trainer:
                     logits, additional_info = output
 
                     # Calculate classification loss
-                    # classification_loss = self.focal_loss(logits, label)
-                    if use_focal_loss and epoch >= focal_start_epoch:
+                    if use_asymmetric_loss and epoch >= asl_start_epoch:
+                        progress = min(1.0, (epoch - asl_start_epoch + 1) / asl_ramp_epochs)
+                        gamma_pos = asl_gamma_pos * progress
+                        gamma_neg = asl_gamma_neg * progress
+                        classification_loss = self.asymmetric_loss_with_logits(
+                            logits, label,
+                            gamma_pos=gamma_pos, gamma_neg=gamma_neg, clip=asl_clip
+                        )
+                    elif use_focal_loss and epoch >= focal_start_epoch:
                         progress = min(1.0, (epoch - focal_start_epoch + 1) / gamma_ramp_epochs)
                         gamma = focal_max_gamma * progress
                         bce_loss = F.binary_cross_entropy_with_logits(logits, label, pos_weight=self.class_weights)
@@ -356,6 +370,7 @@ class Trainer:
                         classification_loss = F.binary_cross_entropy_with_logits(
                             logits, label, pos_weight=self.class_weights
                         )
+
 
                     # Initialize reconstruction loss
                     reconstruction_loss = 0.0
@@ -552,6 +567,26 @@ class Trainer:
                 self._save_checkpoint(epoch, metrics=val_metrics, is_best=True)
                 self.logger.info(
                     f"New best model saved with {self.primary_metric} = {val_metrics[self.primary_metric]:.4f}")
+
+            with torch.no_grad():
+                mean_logit = logits.mean().item()
+                std_logit = logits.std().item()
+                mean_pred = (torch.sigmoid(logits) > 0.5).float().sum(dim=1).mean().item()
+                sigmoid_probs = torch.sigmoid(logits)
+                predictions_per_sample = (sigmoid_probs > 0.5).float().sum(dim=1).mean().item()
+
+            if self.writer:
+                self.writer.add_scalar("Debug/mean_logit", mean_logit, epoch)
+                self.writer.add_scalar("Debug/std_logit", std_logit, epoch)
+                self.writer.add_scalar("Debug/predictions_per_sample", mean_pred, epoch)
+
+            if self.writer:
+                self.writer.add_scalar("Debug/predictions_per_sample", predictions_per_sample, epoch)
+                self.writer.add_scalar("Debug/mean_logit", mean_logit, epoch)
+                self.writer.add_scalar("Debug/std_logit", std_logit, epoch)
+                if use_asymmetric_loss and epoch >= asl_start_epoch:
+                    self.writer.add_scalar("Debug/asl_gamma_neg", gamma_neg, epoch)
+                    self.writer.add_scalar("Debug/asl_gamma_pos", gamma_pos, epoch)
 
         # Training completed
         self.logger.info(
@@ -981,6 +1016,7 @@ class Trainer:
 
         return loss_x1_x2 + loss_x2_x1
 
+
     def focal_loss(self, logits, targets, alpha=0.5, gamma=2.0, eps=1e-8):
         probs = torch.sigmoid(logits)
         pt = probs * targets + (1 - probs) * (1 - targets)
@@ -988,4 +1024,32 @@ class Trainer:
         loss = -w * ((1 - pt) ** gamma) * torch.log(pt + eps)
         return loss.mean()
 
+    def asymmetric_loss_with_logits(
+            self, logits, targets, gamma_pos=0.0, gamma_neg=4.0, clip=0.05, eps=1e-8
+    ):
+        """Asymmetric Loss (BCE-style) for Multi-label Classification."""
+        targets = targets.type_as(logits)
+        anti_targets = 1 - targets
+
+        # probabilities
+        probas = torch.sigmoid(logits)
+        log_probs = torch.log(probas + eps)
+        log_anti = torch.log(1.0 - probas + eps)
+
+        # asymmetric clipping of negative predictions
+        if clip is not None and clip > 0:
+            log_anti = torch.clamp(log_anti, min=torch.log(torch.tensor(clip)).item())
+
+        # positive loss
+        pos_loss = targets * log_probs
+        neg_loss = anti_targets * log_anti
+
+        # asymmetric focusing (focal-style modulation)
+        if gamma_pos > 0:
+            pos_loss *= (1 - probas) ** gamma_pos
+        if gamma_neg > 0:
+            neg_loss *= probas ** gamma_neg
+
+        loss = - (pos_loss + neg_loss)
+        return loss.mean()
 
