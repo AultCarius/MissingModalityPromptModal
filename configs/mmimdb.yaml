@@ -4,21 +4,21 @@ experiment_name: "mmimdb_patch16_test_0502_2_aslloss"
 # Model Configuration
 image_model_name: "vit_base_patch16_224"
 text_model_name: "roberta-base"
-image_prompt_len: 32
-text_prompt_len: 32
+image_prompt_len: 16
+text_prompt_len: 16
 prompt_depth: 6
 fusion_dim: 512
 freeze_image_encoder: True
 freeze_text_encoder: True
 use_quality_prompt: True
 use_cross_modal_prompt: True
-initial_recon_weight: 1
+initial_recon_weight: 2
 final_recon_weight: 0.1
 max_length: 512
 
 # Training Configuration
 epochs: 50
-batch_size: 16
+batch_size: 32
 num_workers: 4
 image_size: 224
 patch_size: 16
@@ -37,7 +37,7 @@ focal_alpha: 0.1
 focal_weight: 0.q
 
 use_asymmetric_loss: true
-asl_start_epoch: 3
+asl_start_epoch: 5
 asl_gamma_pos: 0.0
 asl_gamma_neg: 4.0
 asl_ramp_epochs: 3
