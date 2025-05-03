@@ -293,8 +293,12 @@ def send_email_with_results(config, log_paths, plot_paths, best_metrics):
 
     # Try to send email
     try:
-        server = smtplib.SMTP(email_config["smtp_server"], email_config["smtp_port"])
-        server.starttls()
+        if email_config["smtp_port"] == 465:
+            server = smtplib.SMTP_SSL(email_config["smtp_server"], email_config["smtp_port"])
+        else:
+            server = smtplib.SMTP(email_config["smtp_server"], email_config["smtp_port"])
+            server.starttls()
+
         server.login(email_config["sender_email"], email_config["sender_password"])
         server.send_message(msg)
         server.quit()

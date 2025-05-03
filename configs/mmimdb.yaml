@@ -1,11 +1,11 @@
 # 实验配置
-experiment_name: "mmimdb_patch16_test_0502_2_aslloss"
+experiment_name: "mmimdb_patch16_test_0503_1_bceloss"
 
 # Model Configuration
 image_model_name: "vit_base_patch16_224"
 text_model_name: "roberta-base"
-image_prompt_len: 16
-text_prompt_len: 16
+image_prompt_len: 36
+text_prompt_len: 36
 prompt_depth: 6
 fusion_dim: 512
 freeze_image_encoder: True
@@ -24,7 +24,7 @@ image_size: 224
 patch_size: 16
 lr: 0.001
 weight_decay: 0.005
-warmup_percent: 0.2
+warmup_percent: 0.1
 min_lr: 0.000001
 seed: 66666
 save_every_epochs: 20
@@ -42,8 +42,6 @@ asl_gamma_pos: 0.0
 asl_gamma_neg: 4.0
 asl_ramp_epochs: 3
 asl_clip: 0.05
-
-
 
 
 # Data Configuration
