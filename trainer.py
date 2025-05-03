@@ -324,8 +324,24 @@ class Trainer:
         final_recon_weight = self.config.get("final_recon_weight", 0.01)
 
         for epoch in range(self.start_epoch, num_epochs):
-
             current_epoch = epoch
+
+            # In the train method, at the beginning of each epoch (around line 256)
+            # Add right after the epoch loop starts:
+
+            # Apply curriculum learning for missing probability if enabled
+            # At the beginning of each epoch in the train method
+            if hasattr(self, 'use_curriculum') and self.use_curriculum:
+                # Calculate current missing probability
+                progress = min(1.0, epoch / self.missing_prob_ramp_epochs)
+                current_missing_prob = self.initial_missing_prob + progress * (
+                            self.final_missing_prob - self.initial_missing_prob)
+
+                # Simple direct update
+                if self.update_missing_probability(current_missing_prob):
+                    self.logger.info(f"Epoch {epoch}: Missing probability set to {current_missing_prob:.3f}")
+
+
             self.model.train()
             total_loss = 0
             cls_loss = 0
@@ -344,6 +360,8 @@ class Trainer:
                               desc=f"Epoch {epoch + 1}/{num_epochs}",
                               dynamic_ncols=True,
                               leave=False)
+
+
 
             for batch_idx, batch in enumerate(self.train_loader):
                 image, input_ids, attention_mask, label, missing_type = [x.to(self.device) for x in batch]
@@ -427,27 +445,41 @@ class Trainer:
                                 current_epoch / max_epochs)
                     total_batch_loss = classification_loss + recon_weight * reconstruction_loss
 
-                    if is_image_missing.any() and recon_features['image'] is not None and orig_features[
-                        'image'] is not None:
-                        # 获取缺失图像的生成特征和原始特征
-                        missing_img_recon = recon_features['image'][is_image_missing]
-                        missing_img_orig = orig_features['image'][is_image_missing]
+                    # After calculating the classification loss
+                    contrastive_weight = 0.1  # Start with a small weight
 
-                        if len(missing_img_recon) > 1:  # 需要至少两个样本计算对比损失
-                            contra_img_loss = self.contrastive_loss(missing_img_recon, missing_img_orig)
-                            # 添加到总损失，使用较小的权重
-                            reconstruction_loss += 0.05 * contra_img_loss
+                    # Calculate contrastive loss between real modalities (only for samples with both modalities)
+                    if 'quality_scores' in additional_info:
+                        # Get samples with both modalities (missing_type == 0)
+                        both_modalities = (missing_type == 0)
+                        if both_modalities.any():
+                            # Get features for samples with both modalities
+                            if 'original_features' in additional_info:
+                                orig_img_feat = additional_info['original_features']['image']
+                                orig_txt_feat = additional_info['original_features']['text']
 
-                    if is_text_missing.any() and recon_features['text'] is not None and orig_features[
-                        'text'] is not None:
-                        # 获取缺失文本的生成特征和原始特征
-                        missing_txt_recon = recon_features['text'][is_text_missing]
-                        missing_txt_orig = orig_features['text'][is_text_missing]
+                                if orig_img_feat is not None and orig_txt_feat is not None:
+                                    # Extract features only for samples with both modalities
+                                    img_feat_both = orig_img_feat[both_modalities]
+                                    txt_feat_both = orig_txt_feat[both_modalities]
 
-                        if len(missing_txt_recon) > 1:  # 需要至少两个样本计算对比损失
-                            contra_txt_loss = self.contrastive_loss(missing_txt_recon, missing_txt_orig)
-                            # 添加到总损失，使用较小的权重
-                            reconstruction_loss += 0.05 * contra_txt_loss
+                                    if len(img_feat_both) > 1:  # Need at least 2 samples for contrastive loss
+                                        # Calculate contrastive loss
+                                        contra_loss = self.modality_contrastive_loss(img_feat_both, txt_feat_both)
+                                        # Add to total loss
+                                        total_batch_loss = total_batch_loss + contrastive_weight * contra_loss
+                                        # Track separately for logging
+                                        contra_loss_value = contra_loss.item()
+                                    else:
+                                        contra_loss_value = 0.0
+                                else:
+                                    contra_loss_value = 0.0
+                            else:
+                                contra_loss_value = 0.0
+                        else:
+                            contra_loss_value = 0.0
+                    else:
+                        contra_loss_value = 0.0
 
                     # Collect quality assessment data
                     if additional_info and 'quality_scores' in additional_info:
@@ -506,7 +538,6 @@ class Trainer:
                 all_preds.append(preds.cpu().detach())
                 all_labels.append(label.cpu().detach())
 
-
             batch_pbar.close()
 
             # Merge all batch predictions and labels
@@ -524,7 +555,18 @@ class Trainer:
             metrics_str = " | ".join([f"{k}={v:.4f}" for k, v in train_metrics.items()])
             self.logger.info(
                 f"Epoch {epoch}: Train Loss={avg_loss:.4f} | Cls Loss={avg_cls_loss:.4f} | Recon Loss={avg_recon_loss:.4f} | {metrics_str}")
+            # Track contrastive loss
+            contra_loss_sum = 0.0  # Initialize at the beginning of the epoch
+            contra_loss_sum += contra_loss_value  # Add in the batch loop
 
+            # In the logging section after the epoch
+            avg_contra_loss = contra_loss_sum / len(self.train_loader)
+            self.logger.info(
+                f"Epoch {epoch}: Train Loss={avg_loss:.4f} | Cls Loss={avg_cls_loss:.4f} | Recon Loss={avg_recon_loss:.4f} | Contra Loss={avg_contra_loss:.4f} | {metrics_str}")
+
+            # Update tensorboard logging
+            if self.writer:
+                self.writer.add_scalar("Loss/train_contra", avg_contra_loss, epoch)
             # Log quality assessment and fusion weight statistics
             if quality_stats['image'] and self.writer:
                 self.writer.add_scalar("Quality/image", np.mean(quality_stats['image']), epoch)
@@ -1016,6 +1058,41 @@ class Trainer:
 
         return loss_x1_x2 + loss_x2_x1
 
+    def modality_contrastive_loss(self, image_features, text_features, temperature=0.1):
+        """
+        Contrastive loss between modalities to improve feature alignment
+
+        Args:
+            image_features: Tensor of shape [batch_size, feature_dim]
+            text_features: Tensor of shape [batch_size, feature_dim]
+            temperature: Temperature parameter for scaling
+
+        Returns:
+            Contrastive loss value
+        """
+        # Flatten features if they have more than 2 dimensions
+        if image_features.dim() > 2:
+            image_features = image_features.view(image_features.size(0), -1)
+        if text_features.dim() > 2:
+            text_features = text_features.view(text_features.size(0), -1)
+
+        batch_size = image_features.size(0)
+
+        # Normalize features
+        image_features = F.normalize(image_features, p=2, dim=1)
+        text_features = F.normalize(text_features, p=2, dim=1)
+
+        # Calculate cosine similarity
+        logits = torch.matmul(image_features, text_features.t()) / temperature
+
+        # Labels are the diagonal elements (matching pairs)
+        labels = torch.arange(batch_size, device=image_features.device)
+
+        # Calculate loss in both directions
+        loss_i2t = F.cross_entropy(logits, labels)
+        loss_t2i = F.cross_entropy(logits.t(), labels)
+
+        return (loss_i2t + loss_t2i) / 2.0
 
     def focal_loss(self, logits, targets, alpha=0.5, gamma=2.0, eps=1e-8):
         probs = torch.sigmoid(logits)
@@ -1053,3 +1130,27 @@ class Trainer:
         loss = - (pos_loss + neg_loss)
         return loss.mean()
 
+    # Add this method to the Trainer class
+    def setup_curriculum_learning(self, initial_missing_prob, final_missing_prob, ramp_epochs):
+        """
+        Set up curriculum learning for modality missing rate.
+
+        Args:
+            initial_missing_prob: Starting missing probability
+            final_missing_prob: Final missing probability
+            ramp_epochs: Number of epochs to ramp up the missing probability
+        """
+        self.use_curriculum = True
+        self.initial_missing_prob = initial_missing_prob
+        self.final_missing_prob = final_missing_prob
+        self.missing_prob_ramp_epochs = ramp_epochs
+        self.logger.info(
+            f"Curriculum learning enabled: missing prob from {initial_missing_prob} to {final_missing_prob} over {ramp_epochs} epochs")
+
+    # Add a simple method to update the dataset missing probability
+    def update_missing_probability(self, new_prob):
+        """Update missing probability in the training dataset"""
+        if hasattr(self.train_loader.dataset, 'missing_prob'):
+            self.train_loader.dataset.missing_prob = new_prob
+            return True
+        return False

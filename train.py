@@ -40,7 +40,7 @@ if __name__ == '__main__':
             batch_size=config.get("batch_size", 32),
             num_workers=config.get("num_workers", 4),
             missing_strategy=config.get("missing_strategy", "none"),  # 直接读缺失策略
-            missing_prob=config.get("missing_prob", 0.0),  # 单独的缺失率
+            missing_prob=config.get("initial_missing_prob", config.get("missing_prob", 0.7)),  # Use initial value if available
             val_missing_strategy=config.get("val_missing_strategy", "none"),  # 验证集策略
             val_missing_prob=config.get("val_missing_prob", 0.0),  # 验证集缺失率
             test_missing_strategy=config.get("test_missing_strategy", "none"),  # 测试集策略
@@ -90,6 +90,17 @@ if __name__ == '__main__':
     trainer = Trainer(model, train_loader, val_loader, config=config)
 
     trainer.class_weights = datamodule.get_class_weights().to(trainer.device)
+
+    # Add this right after creating the trainer instance (around line 95)
+    # After this line: trainer = Trainer(model, train_loader, val_loader, config=config)
+
+    # Set up curriculum learning if the config has the required parameters
+    if config.get("initial_missing_prob") is not None and config.get("final_missing_prob") is not None:
+        trainer.setup_curriculum_learning(
+            initial_missing_prob=config.get("initial_missing_prob"),
+            final_missing_prob=config.get("final_missing_prob"),
+            ramp_epochs=config.get("missing_prob_ramp_epochs", 10)
+        )
 
     # Start training
     trainer.train()

@@ -41,6 +41,7 @@ class MMIMDBDataset(Dataset):
         self.tokenizer = tokenizer or RobertaTokenizer.from_pretrained("roberta-base")
         self.max_length = max_length
         self.missing_strategy = missing_strategy
+        self.missing_prob = 0.7
 
     def __len__(self):
         return len(self.sample_list)
@@ -106,8 +107,8 @@ class MMIMDBDataset(Dataset):
         if self.missing_strategy == "none":
             return "none"
 
-        # 默认缺失率η=70%
-        eta = 0.7
+        # 使用实例变量的缺失率
+        eta = self.missing_prob
 
         # 如果是float类型，使用指定的缺失率
         if isinstance(self.missing_strategy, float):
@@ -139,6 +140,11 @@ class MMIMDBDataset(Dataset):
         # 默认不缺失
         return "none"
 
+    # Add this method to the MMIMDBDataset class
+    def update_missing_prob(self, new_prob):
+        """Update the missing probability for this dataset"""
+        self.missing_prob = new_prob
+        return self
 
 class mmimdbDataModule(BaseDataModule):
     def __init__(self, data_dir="./data/mmimdb", batch_size=32, num_workers=4,
@@ -224,6 +230,8 @@ class mmimdbDataModule(BaseDataModule):
 
     def _build_dataset(self, split):
         pass  # 未使用
+
+
 
     def default_transform(self, image_size):
         return transforms.Compose([

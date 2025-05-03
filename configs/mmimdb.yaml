@@ -1,5 +1,5 @@
 # 实验配置
-experiment_name: "mmimdb_patch16_test_0503_1_bceloss"
+experiment_name: "mmimdb_patch16_test_0503_2_reduce_guonihe"
 
 # Model Configuration
 image_model_name: "vit_base_patch16_224"
@@ -18,11 +18,11 @@ max_length: 512
 
 # Training Configuration
 epochs: 20
-batch_size: 32
+batch_size: 16
 num_workers: 4
 image_size: 224
 patch_size: 16
-lr: 0.001
+lr: 0.00005
 weight_decay: 0.005
 warmup_percent: 0.1
 min_lr: 0.000001
@@ -34,9 +34,9 @@ focal_start_epoch: 3
 focal_gamma: 0.5
 gamma_ramp_epochs: 5
 focal_alpha: 0.1
-focal_weight: 0.q
+focal_weight: 0.3
 
-use_asymmetric_loss: true
+use_asymmetric_loss: false
 asl_start_epoch: 5
 asl_gamma_pos: 0.0
 asl_gamma_neg: 4.0
@@ -54,6 +54,11 @@ val_missing_strategy: "both"
 val_missing_prob: 0.7
 test_missing_strategy: "both"
 test_missing_prob: 0.7
+
+# Add after missing_prob line
+initial_missing_prob: 0.2
+final_missing_prob: 0.7
+missing_prob_ramp_epochs: 10
 
 # 评估指标设置
 metrics: ["accuracy", "macro_f1", "micro_f1"]
