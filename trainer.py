@@ -123,13 +123,13 @@ class Trainer:
 
     def _setup_experiment_directories(self):
         """创建实验相关的目录结构，支持在 Kaggle 上持久化保存"""
-        if "KAGGLE_KERNEL_RUN_TYPE" in os.environ:
-            # 在 Kaggle 上运行，持久化目录为 /kaggle/output
-            base_root = "/kaggle/output"
-        else:
-            # 本地或服务器上运行
-            base_root = "experiments"
-
+        # if "KAGGLE_KERNEL_RUN_TYPE" in os.environ:
+        #     # 在 Kaggle 上运行，持久化目录为 /kaggle/output
+        #     base_root = "/kaggle/output"
+        # else:
+        #     # 本地或服务器上运行
+        #     base_root = "experiments"
+        base_root = "experiments"
         # 基础目录
         self.base_dir = os.path.join(base_root, self.experiment_name)
 
