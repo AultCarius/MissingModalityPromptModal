@@ -68,6 +68,8 @@ class Trainer:
         if config.get("resume_path"):
             self._load_checkpoint(config["resume_path"])
 
+        self.batch_size = config.get("batch_size",8)
+
     def send_training_results_email(self):
         """Send training results and logs via email"""
         if not self.config.get("email", {}).get("send_email", False):
@@ -481,6 +483,63 @@ class Trainer:
                     else:
                         contra_loss_value = 0.0
 
+                    # Quality prediction loss (when both modalities are available)
+                    quality_pred_loss = 0.0
+                    if both_modalities.any() and 'quality_scores' in additional_info:
+                        # Extract features for samples with both real modalities
+                        real_img_feat = orig_img_feat[both_modalities]
+                        real_txt_feat = orig_txt_feat[both_modalities]
+
+                        # For real samples, create pseudo ground truth quality scores
+                        # We assume real samples have high quality (0.9) and high consistency (0.9)
+                        target_img_quality = torch.full((len(real_img_feat), 1), 0.9, device=self.device)
+                        target_txt_quality = torch.full((len(real_txt_feat), 1), 0.9, device=self.device)
+                        target_consistency = torch.full((len(real_img_feat), 1), 0.9, device=self.device)
+
+                        # Get actual quality predictions
+                        real_quality_scores = {
+                            'image': {'final_score': additional_info['quality_scores']['image']['final_score'][
+                                both_modalities]},
+                            'text': {'final_score': additional_info['quality_scores']['text']['final_score'][
+                                both_modalities]},
+                            'cross_consistency': additional_info['quality_scores']['cross_consistency'][both_modalities]
+                        }
+
+                        # Calculate quality prediction loss (MSE)
+                        img_quality_loss = F.mse_loss(real_quality_scores['image']['final_score'], target_img_quality)
+                        txt_quality_loss = F.mse_loss(real_quality_scores['text']['final_score'], target_txt_quality)
+                        consistency_loss = F.mse_loss(real_quality_scores['cross_consistency'], target_consistency)
+
+                        # Combined quality prediction loss
+                        quality_pred_loss = img_quality_loss + txt_quality_loss + consistency_loss
+
+                        # Add to total loss with small weight
+                        quality_weight = 0.05
+                        total_batch_loss = total_batch_loss + quality_weight * quality_pred_loss
+
+                    if 'quality_scores' in additional_info:
+                        # Get samples where only one modality is missing
+                        only_img_missing = is_image_missing & ~is_text_missing
+                        only_txt_missing = is_text_missing & ~is_image_missing
+
+                        if only_img_missing.any() or only_txt_missing.any():
+                            # Target: real features should get high scores, generated low scores
+                            adv_targets = torch.zeros(self.batch_size, 2, device=self.device)  # [image_real, text_real]
+                            adv_targets[~is_image_missing, 0] = 1.0  # Real image = 1
+                            adv_targets[~is_text_missing, 1] = 1.0  # Real text = 1
+
+                            # Actual quality scores
+                            pred_quality = torch.zeros(self.batch_size, 2, device=self.device)
+                            pred_quality[:, 0] = additional_info['quality_scores']['image']['final_score'].squeeze()
+                            pred_quality[:, 1] = additional_info['quality_scores']['text']['final_score'].squeeze()
+
+                            # Adversarial loss (binary cross entropy)
+                            adv_loss = F.binary_cross_entropy(pred_quality, adv_targets)
+
+                            # Add to total loss
+                            adv_weight = 0.1
+                            total_batch_loss = total_batch_loss + adv_weight * adv_loss
+
                     # Collect quality assessment data
                     if additional_info and 'quality_scores' in additional_info:
                         quality_scores = additional_info['quality_scores']
@@ -699,6 +758,17 @@ class Trainer:
             'both': {'preds': [], 'labels': [], 'logits': []}
         }
 
+        # 收集质量评分数据
+        quality_data = {
+            'image_quality': [],
+            'text_quality': [],
+            'image_dims': [],
+            'text_dims': [],
+            'consistency': [],
+            'missing_types': [],
+            'fusion_weights': []
+        }
+
         with torch.no_grad():
             for batch in self.val_loader:
                 image, input_ids, attention_mask, label, missing_type = [x.to(self.device) for x in batch]
@@ -706,7 +776,27 @@ class Trainer:
 
                 # 确保我们只使用logits而不是额外信息
                 if isinstance(output, tuple):
-                    logits = output[0]
+                    logits, additional_info = output
+
+                    # 收集质量评分数据
+                    if additional_info and 'quality_scores' in additional_info:
+                        quality_scores = additional_info['quality_scores']
+                        quality_data['image_quality'].append(quality_scores['image']['final_score'].cpu())
+                        quality_data['text_quality'].append(quality_scores['text']['final_score'].cpu())
+
+                        # 收集详细质量维度（如果存在）
+                        if 'quality' in quality_scores['image']:
+                            quality_data['image_dims'].append(quality_scores['image']['quality'].cpu())
+                        if 'quality' in quality_scores['text']:
+                            quality_data['text_dims'].append(quality_scores['text']['quality'].cpu())
+
+                        quality_data['consistency'].append(quality_scores['cross_consistency'].cpu())
+                        quality_data['missing_types'].append(missing_type.cpu())
+
+                    # 收集融合权重
+                    if additional_info and 'fusion_weights' in additional_info and additional_info[
+                        'fusion_weights'] is not None:
+                        quality_data['fusion_weights'].append(additional_info['fusion_weights'].cpu())
                 else:
                     logits = output
 
@@ -750,6 +840,153 @@ class Trainer:
                 # 为每种缺失类型记录详细统计信息
                 self._detailed_statistics(mt_logits, mt_labels, mt_preds, f"Missing: {mt_name}")
 
+        # 处理收集的质量评分数据
+        if quality_data['image_quality']:
+            # 合并所有批次的质量数据
+            quality_data['image_quality'] = torch.cat(quality_data['image_quality'], dim=0)
+            quality_data['text_quality'] = torch.cat(quality_data['text_quality'], dim=0)
+            quality_data['consistency'] = torch.cat(quality_data['consistency'], dim=0)
+            quality_data['missing_types'] = torch.cat(quality_data['missing_types'], dim=0)
+
+            if quality_data['image_dims']:
+                quality_data['image_dims'] = torch.cat(quality_data['image_dims'], dim=0)
+                quality_data['text_dims'] = torch.cat(quality_data['text_dims'], dim=0)
+
+            if quality_data['fusion_weights']:
+                quality_data['fusion_weights'] = torch.cat(quality_data['fusion_weights'], dim=0)
+
+            # 可视化质量评分
+            if self.writer and epoch is not None:
+                self.visualize_quality_scores(
+                    epoch,
+                    {
+                        'image': {
+                            'final_score': quality_data['image_quality'],
+                            'quality': quality_data['image_dims'] if quality_data['image_dims'] else None
+                        },
+                        'text': {
+                            'final_score': quality_data['text_quality'],
+                            'quality': quality_data['text_dims'] if quality_data['text_dims'] else None
+                        },
+                        'cross_consistency': quality_data['consistency']
+                    },
+                    quality_data['missing_types']
+                )
+
+                # 可视化融合权重
+                if quality_data['fusion_weights']:
+                    self.visualize_fusion_weights(epoch, quality_data['fusion_weights'], quality_data['missing_types'])
+
+            # 按质量分数分层分析性能
+            img_quality = quality_data['image_quality'].squeeze()
+            txt_quality = quality_data['text_quality'].squeeze()
+
+            # 图像质量分组
+            img_high_mask = img_quality > 0.7
+            img_med_mask = (img_quality > 0.4) & (img_quality <= 0.7)
+            img_low_mask = img_quality <= 0.4
+
+            # 文本质量分组
+            txt_high_mask = txt_quality > 0.7
+            txt_med_mask = (txt_quality > 0.4) & (txt_quality <= 0.7)
+            txt_low_mask = txt_quality <= 0.4
+
+            # 计算各组性能
+            quality_group_metrics = {}
+
+            # 记录日志
+            self.logger.info("\nPerformance by quality group:")
+
+            # 图像质量分组性能
+            for name, mask in [
+                ('img_high', img_high_mask),
+                ('img_med', img_med_mask),
+                ('img_low', img_low_mask),
+                ('txt_high', txt_high_mask),
+                ('txt_med', txt_med_mask),
+                ('txt_low', txt_low_mask)
+            ]:
+                if mask.sum() > 10:  # 至少10个样本才计算指标
+                    group_preds = all_preds[mask]
+                    group_labels = all_labels[mask]
+                    group_metrics = self._compute_metrics(group_preds, group_labels)
+                    quality_group_metrics[name] = group_metrics
+
+                    # 记录日志
+                    self.logger.info(f"  - {name} quality group ({mask.sum()} samples):")
+                    metrics_str = " | ".join([f"{k}={v:.4f}" for k, v in group_metrics.items()])
+                    self.logger.info(f"    {metrics_str}")
+
+                    # 写入TensorBoard
+                    if self.writer and epoch is not None:
+                        for k, v in group_metrics.items():
+                            self.writer.add_scalar(f"{k}/{name}", v, epoch)
+
+            # 分析质量评估器的校准情况
+            self.logger.info("\nQuality calibration analysis:")
+
+            # 按图像质量四等分，检验分数与性能的相关性
+            try:
+                from sklearn.model_selection import KFold
+                import numpy as np
+
+                # 转换为NumPy数组
+                img_quality_np = img_quality.numpy()
+                txt_quality_np = txt_quality.numpy()
+
+                # 按质量分数排序的索引
+                img_sorted_idx = np.argsort(img_quality_np)
+                txt_sorted_idx = np.argsort(txt_quality_np)
+
+                # 等分成4组
+                img_quartiles = np.array_split(img_sorted_idx, 4)
+                txt_quartiles = np.array_split(txt_sorted_idx, 4)
+
+                # 图像质量校准
+                self.logger.info("  Image quality calibration:")
+                for i, indices in enumerate(img_quartiles):
+                    group_preds = all_preds[indices]
+                    group_labels = all_labels[indices]
+                    group_metrics = self._compute_metrics(group_preds, group_labels)
+                    group_quality = img_quality_np[indices].mean()
+
+                    metrics_str = " | ".join([f"{k}={v:.4f}" for k, v in group_metrics.items()])
+                    self.logger.info(f"    Quartile {i + 1} - Avg Quality: {group_quality:.4f} | {metrics_str}")
+
+                # 文本质量校准
+                self.logger.info("  Text quality calibration:")
+                for i, indices in enumerate(txt_quartiles):
+                    group_preds = all_preds[indices]
+                    group_labels = all_labels[indices]
+                    group_metrics = self._compute_metrics(group_preds, group_labels)
+                    group_quality = txt_quality_np[indices].mean()
+
+                    metrics_str = " | ".join([f"{k}={v:.4f}" for k, v in group_metrics.items()])
+                    self.logger.info(f"    Quartile {i + 1} - Avg Quality: {group_quality:.4f} | {metrics_str}")
+
+            except Exception as e:
+                self.logger.warning(f"Failed to perform quality calibration analysis: {str(e)}")
+
+            # 分析每种缺失类型的质量分数和性能
+            missing_types = quality_data['missing_types']
+
+            self.logger.info("\nQuality and performance by missing type:")
+            for mt, mt_name in enumerate(['none', 'image', 'text', 'both']):
+                mask = (missing_types == mt)
+                if mask.sum() > 0:
+                    # 获取该缺失类型的质量分数
+                    mt_img_quality = quality_data['image_quality'][mask].mean().item()
+                    mt_txt_quality = quality_data['text_quality'][mask].mean().item()
+                    mt_consistency = quality_data['consistency'][mask].mean().item()
+
+                    self.logger.info(f"  - {mt_name} missing type ({mask.sum().item()} samples):")
+                    self.logger.info(
+                        f"    Quality - Image: {mt_img_quality:.4f} | Text: {mt_txt_quality:.4f} | Consistency: {mt_consistency:.4f}")
+
+                    if mt_name in missing_type_results:
+                        metrics_str = " | ".join([f"{k}={v:.4f}" for k, v in missing_type_results[mt_name].items()])
+                        self.logger.info(f"    Performance - {metrics_str}")
+
         # 记录缺失类型的性能
         if self.writer and epoch is not None:
             for mt_name, mt_metrics in missing_type_results.items():
@@ -775,6 +1012,155 @@ class Trainer:
                 self.writer.add_scalar(f"{k}/val", v, epoch)
 
         return metrics
+
+    def visualize_quality_scores(self, epoch, quality_scores, missing_types):
+        """可视化不同缺失类型的质量分数"""
+        if not self.writer:
+            return
+
+        # 将张量转换为NumPy数组
+        img_quality = quality_scores['image']['final_score'].cpu().numpy()
+        txt_quality = quality_scores['text']['final_score'].cpu().numpy()
+        consistency = quality_scores['cross_consistency'].cpu().numpy()
+        missing = missing_types.cpu().numpy()
+
+        # 计算不同缺失类型的平均分数
+        missing_labels = ['none', 'image', 'text', 'both']
+        img_by_missing = [img_quality[missing == i].mean() if (missing == i).any() else 0 for i in range(4)]
+        txt_by_missing = [txt_quality[missing == i].mean() if (missing == i).any() else 0 for i in range(4)]
+        cons_by_missing = [consistency[missing == i].mean() if (missing == i).any() else 0 for i in range(4)]
+
+        # 创建图表
+        try:
+            import matplotlib.pyplot as plt
+            import numpy as np
+
+            fig, ax = plt.subplots(figsize=(10, 6))
+
+            x = np.arange(4)
+            width = 0.25
+
+            ax.bar(x - width, img_by_missing, width, label='Image Quality')
+            ax.bar(x, txt_by_missing, width, label='Text Quality')
+            ax.bar(x + width, cons_by_missing, width, label='Consistency')
+
+            ax.set_xticks(x)
+            ax.set_xticklabels(missing_labels)
+            ax.set_ylabel('Quality Score')
+            ax.set_title(f'Quality Scores by Missing Type (Epoch {epoch})')
+            ax.legend()
+
+            # 添加到TensorBoard
+            self.writer.add_figure('quality/by_missing_type', fig, epoch)
+            plt.close(fig)
+
+            # 记录平均分数
+            self.writer.add_scalars('quality/avg_scores', {
+                'image': img_quality.mean(),
+                'text': txt_quality.mean(),
+                'consistency': consistency.mean()
+            }, epoch)
+
+            # 创建质量分数直方图
+            fig, axs = plt.subplots(1, 3, figsize=(15, 5))
+
+            axs[0].hist(img_quality.flatten(), bins=20, range=(0, 1))
+            axs[0].set_title('Image Quality Distribution')
+            axs[0].set_xlabel('Quality Score')
+
+            axs[1].hist(txt_quality.flatten(), bins=20, range=(0, 1))
+            axs[1].set_title('Text Quality Distribution')
+            axs[1].set_xlabel('Quality Score')
+
+            axs[2].hist(consistency.flatten(), bins=20, range=(0, 1))
+            axs[2].set_title('Consistency Distribution')
+            axs[2].set_xlabel('Consistency Score')
+
+            fig.tight_layout()
+            self.writer.add_figure('quality/distributions', fig, epoch)
+            plt.close(fig)
+
+            # 如果有详细质量维度，也可视化它们
+            if 'quality' in quality_scores['image'] and quality_scores['image']['quality'] is not None:
+                img_dims = quality_scores['image']['quality'].cpu().numpy()
+                txt_dims = quality_scores['text']['quality'].cpu().numpy()
+
+                # 计算各维度的均值
+                img_dim_means = img_dims.mean(axis=0)
+                txt_dim_means = txt_dims.mean(axis=0)
+
+                # 可视化质量维度
+                fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+
+                dim_names_img = ['Clarity', 'Completeness', 'Informativeness', 'Confidence', 'Detail'][
+                                :img_dims.shape[1]]
+                dim_names_txt = ['Coherence', 'Relevance', 'Informativeness', 'Confidence', 'Detail'][
+                                :txt_dims.shape[1]]
+
+                ax1.bar(range(len(img_dim_means)), img_dim_means)
+                ax1.set_xticks(range(len(img_dim_means)))
+                ax1.set_xticklabels(dim_names_img, rotation=45)
+                ax1.set_title('Image Quality Dimensions')
+
+                ax2.bar(range(len(txt_dim_means)), txt_dim_means)
+                ax2.set_xticks(range(len(txt_dim_means)))
+                ax2.set_xticklabels(dim_names_txt, rotation=45)
+                ax2.set_title('Text Quality Dimensions')
+
+                fig.tight_layout()
+                self.writer.add_figure('quality/dimensions', fig, epoch)
+                plt.close(fig)
+        except Exception as e:
+            self.logger.warning(f"Failed to create quality visualization: {str(e)}")
+
+    def visualize_fusion_weights(self, epoch, fusion_weights, missing_types):
+        """可视化不同缺失类型的融合权重"""
+        if not self.writer:
+            return
+
+        try:
+            import matplotlib.pyplot as plt
+            import numpy as np
+
+            # 将张量转换为NumPy数组
+            weights = fusion_weights.cpu().numpy()
+            missing = missing_types.cpu().numpy()
+
+            # 平均融合权重
+            avg_weights = weights.mean(axis=0)
+
+            # 按缺失类型计算平均权重
+            missing_labels = ['none', 'image', 'text', 'both']
+            weights_by_missing = [
+                weights[missing == i].mean(axis=0) if (missing == i).any() else np.zeros_like(avg_weights) for i in
+                range(4)]
+
+            # 创建图表
+            fig, ax = plt.subplots(figsize=(10, 6))
+
+            x = np.arange(len(avg_weights))
+            width = 0.2
+
+            # 绘制各缺失类型的权重
+            for i, (mt_name, mt_weights) in enumerate(zip(missing_labels, weights_by_missing)):
+                offset = (i - 1.5) * width
+                ax.bar(x + offset, mt_weights, width, label=mt_name)
+
+            ax.set_xticks(x)
+            ax.set_xticklabels([f'Weight {i + 1}' for i in range(len(avg_weights))])
+            ax.set_ylabel('Weight Value')
+            ax.set_title(f'Fusion Weights by Missing Type (Epoch {epoch})')
+            ax.legend()
+
+            # 添加到TensorBoard
+            self.writer.add_figure('fusion/weights_by_missing_type', fig, epoch)
+            plt.close(fig)
+
+            # 记录平均融合权重
+            for i, w in enumerate(avg_weights):
+                self.writer.add_scalar(f'fusion/weight_{i + 1}', w, epoch)
+        except Exception as e:
+            self.logger.warning(f"Failed to create fusion weights visualization: {str(e)}")
 
     def _detailed_statistics(self, logits, labels, preds, prefix=""):
         """计算并打印详细的预测统计信息"""
@@ -1154,3 +1540,68 @@ class Trainer:
             self.train_loader.dataset.missing_prob = new_prob
             return True
         return False
+
+    def visualize_quality_scores(self, epoch, quality_scores, missing_types, prefix='train'):
+        """可视化不同缺失类型的质量分数"""
+        if not self.writer:
+            return
+
+        # 转换为numpy以便处理
+        img_quality = quality_scores['image']['final_score'].cpu().numpy()
+        txt_quality = quality_scores['text']['final_score'].cpu().numpy()
+        consistency = quality_scores['cross_consistency'].cpu().numpy()
+        missing = missing_types.cpu().numpy()
+
+        # 按缺失类型计算平均分数
+        missing_labels = ['none', 'image', 'text', 'both']
+        img_by_missing = [img_quality[missing == i].mean() if (missing == i).any() else 0 for i in range(4)]
+        txt_by_missing = [txt_quality[missing == i].mean() if (missing == i).any() else 0 for i in range(4)]
+        cons_by_missing = [consistency[missing == i].mean() if (missing == i).any() else 0 for i in range(4)]
+
+        # 创建图表
+        import matplotlib.pyplot as plt
+        fig, ax = plt.subplots(figsize=(10, 6))
+
+        x = np.arange(4)
+        width = 0.25
+
+        ax.bar(x - width, img_by_missing, width, label='Image Quality')
+        ax.bar(x, txt_by_missing, width, label='Text Quality')
+        ax.bar(x + width, cons_by_missing, width, label='Consistency')
+
+        ax.set_xticks(x)
+        ax.set_xticklabels(missing_labels)
+        ax.set_ylabel('Quality Score')
+        ax.set_title(f'{prefix.capitalize()} Quality Scores by Missing Type (Epoch {epoch})')
+        ax.legend()
+
+        # 添加到tensorboard
+        self.writer.add_figure(f'quality/{prefix}_by_missing_type', fig, epoch)
+        plt.close(fig)
+
+        # 同时记录随时间变化的平均分数
+        self.writer.add_scalars(f'quality/{prefix}_avg_scores', {
+            'image': img_quality.mean(),
+            'text': txt_quality.mean(),
+            'consistency': consistency.mean()
+        }, epoch)
+
+        # 创建质量分数分布直方图
+        fig, axs = plt.subplots(1, 3, figsize=(15, 5))
+
+        axs[0].hist(img_quality, bins=20, alpha=0.7)
+        axs[0].set_title('Image Quality Distribution')
+        axs[0].set_xlabel('Quality Score')
+        axs[0].set_ylabel('Count')
+
+        axs[1].hist(txt_quality, bins=20, alpha=0.7)
+        axs[1].set_title('Text Quality Distribution')
+        axs[1].set_xlabel('Quality Score')
+
+        axs[2].hist(consistency, bins=20, alpha=0.7)
+        axs[2].set_title('Consistency Distribution')
+        axs[2].set_xlabel('Consistency Score')
+
+        plt.tight_layout()
+        self.writer.add_figure(f'quality/{prefix}_distributions', fig, epoch)
+        plt.close(fig)

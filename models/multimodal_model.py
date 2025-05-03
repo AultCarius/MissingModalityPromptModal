@@ -6,7 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from models.quality_aware_prompting import EnhancedModalityQualityEstimator, \
-    QualityGuidedFeatureFusion
+    QualityAwareFeatureFusion
 
 from .modality_generator import CycleGenerationModel, CrossModalGenerator
 
@@ -217,13 +217,7 @@ class MultimodalPromptModel(nn.Module):
         if use_quality_prompt:
             self.quality_estimator = EnhancedModalityQualityEstimator(self.image_dim, self.text_dim)
 
-        # 使用质量引导的特征融合替换跨模态提示
-        if use_cross_modal_prompt:
-            self.feature_fusion = QualityGuidedFeatureFusion(
-                self.image_dim,
-                self.text_dim,
-                fusion_dim
-            )
+
 
         # 模态内层间提示
         self.cross_modal_layer = nn.ModuleList([
@@ -243,7 +237,15 @@ class MultimodalPromptModel(nn.Module):
         # 融合和分类层
         fusion_input_dim = self.image_dim + self.text_dim + 4  # 基础特征 + 缺失类型
         if use_quality_prompt:
-            fusion_input_dim += 9  # 增加质量评分（2个基础分+3个详细评分）
+            fusion_input_dim += 13  # 增加质量评分（2个基础分+3个详细评分）
+
+        # 使用质量引导的特征融合替换跨模态提示
+        if use_cross_modal_prompt:
+            self.feature_fusion = QualityAwareFeatureFusion(
+                self.image_dim,
+                self.text_dim,
+                fusion_dim
+            )
 
         print("fusion_input_dim=", fusion_input_dim)
         self.fusion = nn.Sequential(
@@ -511,11 +513,21 @@ class MultimodalPromptModel(nn.Module):
 
         # 计算模态质量（如果启用）
         quality_scores = None
-        if self.use_quality_prompt:
-            # 使用CLS token进行质量评估
+        # if self.use_quality_prompt:
+        #     # 使用CLS token进行质量评估
+        #     img_cls_feat = temp_img[:, 0]  # [B, D_img]
+        #     txt_cls_feat = temp_txt[:, 0]  # [B, D_txt]
+        #     quality_scores = self.quality_estimator(img_cls_feat, txt_cls_feat, missing_type)
+
+        if self.use_quality_prompt and self.training:
+            # Update reference statistics when training
             img_cls_feat = temp_img[:, 0]  # [B, D_img]
             txt_cls_feat = temp_txt[:, 0]  # [B, D_txt]
             quality_scores = self.quality_estimator(img_cls_feat, txt_cls_feat, missing_type)
+            self.quality_estimator.update_reference_statistics(
+                image_embed[:, 0] if image_embed is not None else None,
+                text_embed[:, 0] if text_embed is not None else None
+            )
 
         # 跨层处理
         for i in range(self.prompt_depth):
@@ -573,14 +585,14 @@ class MultimodalPromptModel(nn.Module):
 
         # 质量引导的特征融合（如果启用）
         fusion_weights = None
+        quality_guided_feat = None
         if self.use_quality_prompt and self.use_cross_modal_prompt:
-            # print("image_feat.shape：",image_feat.shape,"text_feat.shape：",text_feat.shape,"image_quality_scores: ", quality_scores["image"]["final_score"].shape)
             quality_guided_feat, fusion_weights = self.feature_fusion(image_feat, text_feat, quality_scores)
 
-        # 特征融合与分类
+        # Prepare features for concatenation
         features_to_concat = [image_feat, text_feat, F.one_hot(missing_type, num_classes=4).float()]
 
-        # 添加质量评分特征
+        # Add quality scores if enabled
         if self.use_quality_prompt:
             features_to_concat.extend([
                 quality_scores['image']['final_score'],
@@ -589,15 +601,14 @@ class MultimodalPromptModel(nn.Module):
                 quality_scores['text']['quality'],
                 quality_scores['cross_consistency']
             ])
-        # # 打印 features_to_concat 里每个元素的 shape
-        # for i, feature in enumerate(features_to_concat):
-        #     try:
-        #         print(f"features_to_concat 中第 {i} 个元素的 shape: {feature.shape}")
-        #     except AttributeError:
-        #         print(f"features_to_concat 中第 {i} 个元素没有 shape 属性，可能不是 PyTorch 张量。")
 
+        # Concatenate all features
         fused = torch.cat(features_to_concat, dim=1)
-        hidden = self.fusion(fused)
+        base_hidden = self.fusion(fused)
+        hidden = None
+        if quality_guided_feat is not None:
+            alpha = 0.5  # Fixed weight or learnable parameter
+            hidden = alpha * base_hidden + (1 - alpha) * quality_guided_feat
         logits = self.classifier(hidden)
 
         # 返回额外信息用于分析和损失计算
