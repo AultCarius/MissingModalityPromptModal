@@ -1,5 +1,5 @@
 # 实验配置
-experiment_name: "mmimdb_patch16_test_0503_3_reduce_guonihe"
+experiment_name: "mmimdb_patch16_test_0503_3_reduce_continue"
 
 # Model Configuration
 image_model_name: "vit_base_patch16_224"
@@ -81,4 +81,4 @@ email:
 device: "cuda"  # "cuda" or "cpu"
 
 # Resuming (optional)
-# resume_path: "./checkpoints/model_epochX.pt"
+resume_path: "./checkpoints/best_model.pt"
