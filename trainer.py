@@ -1278,7 +1278,7 @@ class Trainer:
         if model_path is not None:
             self.logger.info(f"Loading model from {model_path}")
             checkpoint = torch.load(model_path, map_location=self.device)
-            self.model.load_state_dict(checkpoint['model_state_dict'])
+            self.model.load_state_dict(checkpoint['model'])
 
         self.model.eval()
         all_preds, all_labels = [], []
