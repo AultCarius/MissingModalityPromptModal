@@ -28,7 +28,8 @@ datamodule = mmimdbDataModule(
 num_classes = 23
 datamodule.setup()
 test_loader = datamodule.test_dataloader()  # 获取测试数据加载器
-
+train_loader = datamodule.train_dataloader()
+val_loader = datamodule.val_dataloader()
 # 3. 创建模型 - 必须与训练时使用的模型结构完全一致
 model = create_multimodal_prompt_model(
     image_model_name=config.get("image_model_name", "vit_base_patch16_224"),
@@ -46,7 +47,7 @@ model = create_multimodal_prompt_model(
 )
 
 # 4. 初始化Trainer
-trainer = Trainer(model, None, None, config=config)  # 测试时可以不需要训练和验证数据加载器
+trainer = Trainer(model, train_loader, val_loader, config=config)  # 测试时可以不需要训练和验证数据加载器
 
 # 5. 加载最佳模型并运行测试
 best_model_path = "/kaggle/input/best_model/transformers/default/1/best_model.pt"  # 替换为你的模型路径
