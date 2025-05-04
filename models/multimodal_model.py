@@ -519,7 +519,7 @@ class MultimodalPromptModel(nn.Module):
         #     txt_cls_feat = temp_txt[:, 0]  # [B, D_txt]
         #     quality_scores = self.quality_estimator(img_cls_feat, txt_cls_feat, missing_type)
 
-        if self.use_quality_prompt and self.training:
+        if self.use_quality_prompt:
             # Update reference statistics when training
             img_cls_feat = temp_img[:, 0]  # [B, D_img]
             txt_cls_feat = temp_txt[:, 0]  # [B, D_txt]
@@ -622,9 +622,10 @@ class MultimodalPromptModel(nn.Module):
             'original_features': original_features,  # 原始特征（用于重建损失）
             'generated_features': generated_features,  # 生成的特征
             'reconstructed_features': reconstructed_features  # 重建的特征
-        } if self.training else None
+        }
 
-        return logits if not self.training else (logits, additional_info)
+        return (logits, additional_info)
+        # return logits if not self.training else (logits, additional_info)
 
 
 # Create a factory function to initialize the model

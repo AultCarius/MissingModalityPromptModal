@@ -152,10 +152,10 @@ class mmimdbDataModule(BaseDataModule):
                  missing_strategy="none", missing_prob=0.7,  # 新增missing_prob
                  val_missing_strategy="none", val_missing_prob=0.0,  # 验证集也支持
                  test_missing_strategy="none", test_missing_prob=0.0,  # 新增测试集配置
-                 image_size=224, patch_size=16):
+                 image_size=224, patch_size=16,seed=42):
         super().__init__(batch_size, num_workers)
 
-        self.seed = 42
+        self.seed = seed
 
         self.data_dir = data_dir
         self.image_size = image_size

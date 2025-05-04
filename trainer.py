@@ -363,8 +363,6 @@ class Trainer:
                               dynamic_ncols=True,
                               leave=False)
 
-
-
             for batch_idx, batch in enumerate(self.train_loader):
                 image, input_ids, attention_mask, label, missing_type = [x.to(self.device) for x in batch]
                 is_image_missing = (missing_type == 1) | (missing_type == 3)
@@ -861,21 +859,25 @@ class Trainer:
                     epoch,
                     {
                         'image': {
-                            'final_score': quality_data['image_quality'],
-                            'quality': quality_data['image_dims'] if quality_data['image_dims'] else None
+                            'final_score': quality_data['image_quality'] if 'image_quality' in quality_data else None,
+                            'quality': quality_data['image_dims'] if 'image_dims' in quality_data and quality_data[
+                                'image_dims'] is not None else None
                         },
                         'text': {
-                            'final_score': quality_data['text_quality'],
-                            'quality': quality_data['text_dims'] if quality_data['text_dims'] else None
+                            'final_score': quality_data['text_quality'] if 'text_quality' in quality_data else None,
+                            'quality': quality_data['text_dims'] if 'text_dims' in quality_data and quality_data[
+                                'text_dims'] is not None else None
                         },
-                        'cross_consistency': quality_data['consistency']
+                        'cross_consistency': quality_data['consistency'] if 'consistency' in quality_data else None
                     },
-                    quality_data['missing_types']
+                    quality_data['missing_types'] if 'missing_types' in quality_data else None
                 )
 
-                # 可视化融合权重
-                if quality_data['fusion_weights']:
-                    self.visualize_fusion_weights(epoch, quality_data['fusion_weights'], quality_data['missing_types'])
+                # Visualize fusion weights if available
+                if 'fusion_weights' in quality_data and quality_data['fusion_weights'] is not None:
+                    self.visualize_fusion_weights(epoch, quality_data['fusion_weights'],
+                                                  quality_data[
+                                                      'missing_types'] if 'missing_types' in quality_data else None)
 
             # 按质量分数分层分析性能
             img_quality = quality_data['image_quality'].squeeze()

@@ -47,7 +47,8 @@ if __name__ == '__main__':
             test_missing_prob=config.get("test_missing_prob", 0.0),             # 测试集缺失率
             max_length=config.get("max_length", 77),
             image_size=config.get("image_size", 224),
-            patch_size=config.get("patch_size", 16)
+            patch_size=config.get("patch_size", 16),
+            seed=config.get("seed",42)
         )
         num_classes = 23
 
