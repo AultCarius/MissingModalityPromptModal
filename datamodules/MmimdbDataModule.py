@@ -36,9 +36,12 @@ class MMIMDBDataset(Dataset):
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.5] * 3, std=[0.5] * 3)
         ])
-        # Replace CLIP tokenizer with RoBERTa tokenizer
-        from transformers import RobertaTokenizer
-        self.tokenizer = tokenizer or RobertaTokenizer.from_pretrained("roberta-base")
+        # # Replace CLIP tokenizer with RoBERTa tokenizer
+        # from transformers import RobertaTokenizer
+        # self.tokenizer = tokenizer or RobertaTokenizer.from_pretrained("roberta-base")
+
+        self.tokenizer = tokenizer or CLIPTokenizer.from_pretrained("openai/clip-vit-base-patch16")
+
         self.max_length = max_length
         self.missing_strategy = missing_strategy
         self.missing_prob = 0.7
@@ -80,8 +83,8 @@ class MMIMDBDataset(Dataset):
         # original_attention_mask = attention_mask.clone()
 
         # 标记缺失模态（但不清零原始数据）
-        is_image_missing = missing_type in ["image", "both"]
-        is_text_missing = missing_type in ["text", "both"]
+        # is_image_missing = missing_type in ["image", "both"]
+        # is_text_missing = missing_type in ["text", "both"]
 
         missing_type_tensor = torch.tensor({
                                                "none": 0, "image": 1, "text": 2, "both": 3
@@ -254,4 +257,6 @@ class mmimdbDataModule(BaseDataModule):
         weights = max_count / class_counts
         return weights
 
+    def get_num_classes(self):
+        return 23
 

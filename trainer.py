@@ -16,6 +16,7 @@ from scripts.emailsender import (
     create_training_plots,
     send_email_with_results
 )
+import torch.nn as nn
 from tqdm import tqdm
 
 
@@ -1446,25 +1447,45 @@ class Trainer:
 
         return loss_x1_x2 + loss_x2_x1
 
+    # In trainer.py
+
     def modality_contrastive_loss(self, image_features, text_features, temperature=0.1):
         """
-        Contrastive loss between modalities to improve feature alignment
-
-        Args:
-            image_features: Tensor of shape [batch_size, feature_dim]
-            text_features: Tensor of shape [batch_size, feature_dim]
-            temperature: Temperature parameter for scaling
-
-        Returns:
-            Contrastive loss value
+        Contrastive loss between modalities with dimension handling
         """
-        # Flatten features if they have more than 2 dimensions
+        # Handle multi-dimensional features (like multiple tokens)
         if image_features.dim() > 2:
-            image_features = image_features.view(image_features.size(0), -1)
+            # If we have [batch, tokens, dim], average across tokens
+            image_features = image_features.mean(dim=1)
         if text_features.dim() > 2:
-            text_features = text_features.view(text_features.size(0), -1)
+            # If we have [batch, tokens, dim], average across tokens
+            text_features = text_features.mean(dim=1)
 
+        # Get dimensions
+        img_dim = image_features.size(-1)
+        txt_dim = text_features.size(-1)
         batch_size = image_features.size(0)
+
+        # Project features to same dimension if needed
+        if img_dim != txt_dim:
+            # Instead of trying to reshape, create simple projection layers on the fly
+            if not hasattr(self,
+                           'img_projection') or self.img_projection.in_features != img_dim or self.img_projection.out_features != txt_dim:
+                # Create a projection for image features
+                common_dim = min(img_dim, txt_dim)
+                self.img_projection = nn.Linear(img_dim, common_dim).to(image_features.device)
+                self.txt_projection = nn.Linear(txt_dim, common_dim).to(text_features.device)
+
+                # Initialize the weights to average the features
+                with torch.no_grad():
+                    self.img_projection.weight.fill_(1.0 / img_dim)
+                    self.img_projection.bias.fill_(0.0)
+                    self.txt_projection.weight.fill_(1.0 / txt_dim)
+                    self.txt_projection.bias.fill_(0.0)
+
+            # Apply projections
+            image_features = self.img_projection(image_features)
+            text_features = self.txt_projection(text_features)
 
         # Normalize features
         image_features = F.normalize(image_features, p=2, dim=1)
@@ -1543,67 +1564,3 @@ class Trainer:
             return True
         return False
 
-    def visualize_quality_scores(self, epoch, quality_scores, missing_types, prefix='train'):
-        """可视化不同缺失类型的质量分数"""
-        if not self.writer:
-            return
-
-        # 转换为numpy以便处理
-        img_quality = quality_scores['image']['final_score'].cpu().numpy()
-        txt_quality = quality_scores['text']['final_score'].cpu().numpy()
-        consistency = quality_scores['cross_consistency'].cpu().numpy()
-        missing = missing_types.cpu().numpy()
-
-        # 按缺失类型计算平均分数
-        missing_labels = ['none', 'image', 'text', 'both']
-        img_by_missing = [img_quality[missing == i].mean() if (missing == i).any() else 0 for i in range(4)]
-        txt_by_missing = [txt_quality[missing == i].mean() if (missing == i).any() else 0 for i in range(4)]
-        cons_by_missing = [consistency[missing == i].mean() if (missing == i).any() else 0 for i in range(4)]
-
-        # 创建图表
-        import matplotlib.pyplot as plt
-        fig, ax = plt.subplots(figsize=(10, 6))
-
-        x = np.arange(4)
-        width = 0.25
-
-        ax.bar(x - width, img_by_missing, width, label='Image Quality')
-        ax.bar(x, txt_by_missing, width, label='Text Quality')
-        ax.bar(x + width, cons_by_missing, width, label='Consistency')
-
-        ax.set_xticks(x)
-        ax.set_xticklabels(missing_labels)
-        ax.set_ylabel('Quality Score')
-        ax.set_title(f'{prefix.capitalize()} Quality Scores by Missing Type (Epoch {epoch})')
-        ax.legend()
-
-        # 添加到tensorboard
-        self.writer.add_figure(f'quality/{prefix}_by_missing_type', fig, epoch)
-        plt.close(fig)
-
-        # 同时记录随时间变化的平均分数
-        self.writer.add_scalars(f'quality/{prefix}_avg_scores', {
-            'image': img_quality.mean(),
-            'text': txt_quality.mean(),
-            'consistency': consistency.mean()
-        }, epoch)
-
-        # 创建质量分数分布直方图
-        fig, axs = plt.subplots(1, 3, figsize=(15, 5))
-
-        axs[0].hist(img_quality, bins=20, alpha=0.7)
-        axs[0].set_title('Image Quality Distribution')
-        axs[0].set_xlabel('Quality Score')
-        axs[0].set_ylabel('Count')
-
-        axs[1].hist(txt_quality, bins=20, alpha=0.7)
-        axs[1].set_title('Text Quality Distribution')
-        axs[1].set_xlabel('Quality Score')
-
-        axs[2].hist(consistency, bins=20, alpha=0.7)
-        axs[2].set_title('Consistency Distribution')
-        axs[2].set_xlabel('Consistency Score')
-
-        plt.tight_layout()
-        self.writer.add_figure(f'quality/{prefix}_distributions', fig, epoch)
-        plt.close(fig)
