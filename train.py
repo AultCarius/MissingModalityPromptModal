@@ -29,8 +29,8 @@ if __name__ == '__main__':
     print(f"Starting experiment: {config['experiment_name']}")
 
 
-    # tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-base-patch16")
-    tokenizer = RobertaTokenizer.from_pretrained("roberta-base")
+    tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-base-patch16")
+    # tokenizer = RobertaTokenizer.from_pretrained("roberta-base")
 
     # Set up data module
     if config.get("dataset", "mmimdb") == "food101":
