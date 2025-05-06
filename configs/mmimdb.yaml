@@ -1,9 +1,10 @@
 # 实验配置
-experiment_name: "mmimdb_patch16_test_0503_1_bceloss"
+experiment_name: "mmimdb_patch16_test_0506_nocurlearn_missprob0.7"
 
 # Model Configuration
 image_model_name: "vit_base_patch16_224"
-text_model_name: "roberta-base"
+text_model_name: "openai/clip-vit-base-patch16"
+encoder_type: "clip"  # or "roberta"
 image_prompt_len: 36
 text_prompt_len: 36
 prompt_depth: 6
@@ -12,19 +13,19 @@ freeze_image_encoder: True
 freeze_text_encoder: True
 use_quality_prompt: True
 use_cross_modal_prompt: True
-initial_recon_weight: 2
+initial_recon_weight: 1
 final_recon_weight: 0.1
-max_length: 512
+max_length: 77
 
 # Training Configuration
 epochs: 20
-batch_size: 32
+batch_size: 16
 num_workers: 4
 image_size: 224
 patch_size: 16
-lr: 0.001
+lr: 0.0001
 weight_decay: 0.005
-warmup_percent: 0.1
+warmup_percent: 0.2
 min_lr: 0.000001
 seed: 66666
 save_every_epochs: 20
@@ -34,9 +35,9 @@ focal_start_epoch: 3
 focal_gamma: 0.5
 gamma_ramp_epochs: 5
 focal_alpha: 0.1
-focal_weight: 0.q
+focal_weight: 0.3
 
-use_asymmetric_loss: true
+use_asymmetric_loss: false
 asl_start_epoch: 5
 asl_gamma_pos: 0.0
 asl_gamma_neg: 4.0
@@ -54,6 +55,11 @@ val_missing_strategy: "both"
 val_missing_prob: 0.7
 test_missing_strategy: "both"
 test_missing_prob: 0.7
+
+# Add after missing_prob line
+initial_missing_prob: 0.7
+final_missing_prob: 0.7
+missing_prob_ramp_epochs: 10
 
 # 评估指标设置
 metrics: ["accuracy", "macro_f1", "micro_f1"]
@@ -76,4 +82,4 @@ email:
 device: "cuda"  # "cuda" or "cpu"
 
 # Resuming (optional)
-# resume_path: "./checkpoints/model_epochX.pt"
+#resume_path: "./checkpoints/best_model.pt"

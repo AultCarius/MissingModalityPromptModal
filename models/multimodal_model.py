@@ -4,9 +4,9 @@ import torch
 from transformers import AutoModel
 import torch.nn as nn
 import torch.nn.functional as F
-
+from transformers import RobertaModel
 from models.quality_aware_prompting import EnhancedModalityQualityEstimator, \
-    QualityGuidedFeatureFusion
+    QualityAwareFeatureFusion
 
 from .modality_generator import CycleGenerationModel, CrossModalGenerator
 
@@ -162,22 +162,36 @@ class MultimodalPromptModel(nn.Module):
             use_quality_prompt=True,
             use_cross_modal_prompt=True,
             use_modality_generator=True,  # 添加参数以启用/禁用模态生成器
-            max_length=512  # Add this parameter
+            max_length=512,  # Add this parameter
+            encoder_type='clip'
     ):
         super().__init__()
         self.max_length = max_length
+        self.encoder_type = encoder_type.lower()
         self.image_encoder = image_encoder_backbone
 
-        # self.text_encoder = CLIPTextModel.from_pretrained(text_encoder_name)
-        #
-        # self.image_dim = self.image_encoder.embed_dim
-        # self.text_dim = self.text_encoder.config.hidden_size
+        if self.encoder_type == 'clip':
+            self.text_encoder = CLIPTextModel.from_pretrained(text_encoder_name)
+            self.text_dim = self.text_encoder.config.hidden_size
+            # CLip
+            self.text_embeddings = self.text_encoder.text_model.embeddings
+            self.text_blocks = self.text_encoder.text_model.encoder.layers
+            self.text_norm = self.text_encoder.text_model.final_layer_norm
 
-        from transformers import RobertaModel
-        self.text_encoder = RobertaModel.from_pretrained(text_encoder_name)
+        elif self.encoder_type == 'roberta':
+            self.text_encoder = RobertaModel.from_pretrained(text_encoder_name)
+            self.text_dim = self.text_encoder.config.hidden_size
+            # RoBERTa
+            self.text_embeddings = self.text_encoder.embeddings
+            self.text_blocks = self.text_encoder.encoder.layer  # RoBERTa uses 'layer' instead of 'layers'
+            self.text_norm = self.text_encoder.encoder.layer[-1].output.LayerNorm  # Use the last layer's normalization
+
+        else:
+            raise ValueError(f"Unsupported encoder type: {encoder_type}. Choose 'clip' or 'roberta'")
+
 
         self.image_dim = self.image_encoder.embed_dim
-        self.text_dim = self.text_encoder.config.hidden_size  # RoBERTa hidden size
+
 
         print("image_dim:",self.image_dim," text_dim: ",self.text_dim)
 
@@ -194,10 +208,7 @@ class MultimodalPromptModel(nn.Module):
         self.image_blocks = self.image_encoder.blocks
         self.image_norm = self.image_encoder.norm
 
-        self.text_embeddings = self.text_encoder.embeddings
-        self.text_blocks = self.text_encoder.encoder.layer  # RoBERTa uses 'layer' instead of 'layers'
-        # self.text_norm = self.text_encoder.pooler  # RoBERTa uses a different final layer structure
-        self.text_norm = self.text_encoder.encoder.layer[-1].output.LayerNorm  # Use the last layer's normalization
+
 
         # 初始提示参数
         self.image_prompt_len = image_prompt_len
@@ -217,13 +228,7 @@ class MultimodalPromptModel(nn.Module):
         if use_quality_prompt:
             self.quality_estimator = EnhancedModalityQualityEstimator(self.image_dim, self.text_dim)
 
-        # 使用质量引导的特征融合替换跨模态提示
-        if use_cross_modal_prompt:
-            self.feature_fusion = QualityGuidedFeatureFusion(
-                self.image_dim,
-                self.text_dim,
-                fusion_dim
-            )
+
 
         # 模态内层间提示
         self.cross_modal_layer = nn.ModuleList([
@@ -243,7 +248,15 @@ class MultimodalPromptModel(nn.Module):
         # 融合和分类层
         fusion_input_dim = self.image_dim + self.text_dim + 4  # 基础特征 + 缺失类型
         if use_quality_prompt:
-            fusion_input_dim += 9  # 增加质量评分（2个基础分+3个详细评分）
+            fusion_input_dim += 13  # 增加质量评分（2个基础分+3个详细评分）
+
+        # 使用质量引导的特征融合替换跨模态提示
+        if use_cross_modal_prompt:
+            self.feature_fusion = QualityAwareFeatureFusion(
+                self.image_dim,
+                self.text_dim,
+                fusion_dim
+            )
 
         print("fusion_input_dim=", fusion_input_dim)
         self.fusion = nn.Sequential(
@@ -302,13 +315,27 @@ class MultimodalPromptModel(nn.Module):
         """处理模态，包括模态缺失的情况，并使用原始特征进行重建"""
         batch_size = image_embed.size(0) if image_embed is not None else text_embed.size(0)
         device = next(self.parameters()).device
+        missing_type = missing_type.to(device)
+        # Ensure missing_type is the correct shape and on the right device
+        if missing_type is None:
+            # Default to no missing modalities if not specified
+            missing_type = torch.zeros(batch_size, dtype=torch.long, device=device)
+        elif isinstance(missing_type, int):
+            # If it's a single integer, expand to batch size
+            missing_type = torch.full((batch_size,), missing_type, dtype=torch.long, device=device)
+        elif missing_type.size(0) != batch_size:
+            # If batch size doesn't match, this is a critical error
+            raise ValueError(
+                f"missing_type batch size ({missing_type.size(0)}) doesn't match data batch size ({batch_size})")
+
+        # Make sure missing_type is on the same device as the model
 
         # 检测缺失的模态
         is_image_missing = (missing_type == 1) | (missing_type == 3)
         is_text_missing = (missing_type == 2) | (missing_type == 3)
 
         # 提取原始特征的tokens用于重建损失计算
-        token_count = 5  # 每个模态使用的token数量
+        token_count = 5 # 每个模态使用的token数量
 
         original_features = {
             'image': None if image_embed is None else image_embed[:, :token_count].reshape(batch_size, token_count,
@@ -409,7 +436,11 @@ class MultimodalPromptModel(nn.Module):
                         else:  # 带batch维度 [1, token_count, dim]
                             reconstructed_features[mod][b] = sample_recon[mod].squeeze(0)
 
-        # 使用生成的特征替换缺失的模态
+        # # print(f"generated_features['image'].shape: {generated_features['image'].shape}")
+        # # print(f"image_embed.shape: {image_embed.shape}")
+        # # print(f"token_count: {token_count}")
+        #
+        # # 使用生成的特征替换缺失的模态
         if is_image_missing.any() and generated_features['image'] is not None:
             # 如果image_embed为None，创建新的
             if image_embed is None:
@@ -419,11 +450,15 @@ class MultimodalPromptModel(nn.Module):
             # 将生成的特征复制到适当的token位置
             for b in range(batch_size):
                 if is_image_missing[b]:
-                    token_count = min(generated_features['image'].size(1), token_count)
+                    # token_count = min(generated_features['image'].size(1), token_count)
                     # 将生成的前N个token替换到image_embed中
-                    for t in range(token_count):
+                    tokens_available = generated_features['image'].size(1)
+                    max_tokens_to_copy = min(tokens_available, image_embed.size(1))
+
+                    for t in range(max_tokens_to_copy):
                         if t < image_embed.size(1):  # 确保不超出范围
                             image_embed[b, t] = generated_features['image'][b, t]
+        # 使用生成的特征替换缺失的模态
 
         if is_text_missing.any() and generated_features['text'] is not None:
             # 如果text_embed为None，创建新的
@@ -439,14 +474,18 @@ class MultimodalPromptModel(nn.Module):
             # 将生成的特征复制到适当的token位置
             for b in range(batch_size):
                 if is_text_missing[b]:
-                    token_count = min(generated_features['text'].size(1), token_count)
+                    # token_count = min(generated_features['text'].size(1), token_count)
                     # 将生成的前N个token替换到text_embed中
-                    for t in range(token_count):
+                    tokens_available = generated_features['text'].size(1)
+                    max_tokens_to_copy = min(tokens_available, text_embed.size(1))
+
+                    for t in range(max_tokens_to_copy):
                         if t < text_embed.size(1):  # 确保不超出范围
                             text_embed[b, t] = generated_features['text'][b, t]
                             # 确保注意力掩码中对应token是有效的
                             if attention_mask is not None:
                                 attention_mask[b, t] = 1
+
 
         return image_embed, text_embed, attention_mask, original_features, \
             (generated_features, reconstructed_features) if self.use_modality_generator else (None, None)
@@ -502,20 +541,38 @@ class MultimodalPromptModel(nn.Module):
 
             # 处理文本的注意力掩码
             extended_attention_mask = self._prepare_attention_mask(attention_mask, text_embed.shape[1])
-            temp_txt = self.text_blocks[i](
-                temp_txt,
-                attention_mask=extended_attention_mask,
-                # causal_attention_mask=None,
-                # output_attentions=False
-            )[0]
+
+            if self.encoder_type == 'clip':
+                temp_txt = self.text_blocks[i](
+                    temp_txt,
+                    attention_mask=extended_attention_mask,
+                    causal_attention_mask=None,
+                    output_attentions=False
+                )[0]
+            elif self.encoder_type == 'roberta':
+                temp_txt = self.text_blocks[i](
+                    temp_txt,
+                    attention_mask=extended_attention_mask
+                )[0]
+
 
         # 计算模态质量（如果启用）
         quality_scores = None
+        # if self.use_quality_prompt:
+        #     # 使用CLS token进行质量评估
+        #     img_cls_feat = temp_img[:, 0]  # [B, D_img]
+        #     txt_cls_feat = temp_txt[:, 0]  # [B, D_txt]
+        #     quality_scores = self.quality_estimator(img_cls_feat, txt_cls_feat, missing_type)
+
         if self.use_quality_prompt:
-            # 使用CLS token进行质量评估
+            # Update reference statistics when training
             img_cls_feat = temp_img[:, 0]  # [B, D_img]
             txt_cls_feat = temp_txt[:, 0]  # [B, D_txt]
             quality_scores = self.quality_estimator(img_cls_feat, txt_cls_feat, missing_type)
+            self.quality_estimator.update_reference_statistics(
+                image_embed[:, 0] if image_embed is not None else None,
+                text_embed[:, 0] if text_embed is not None else None
+            )
 
         # 跨层处理
         for i in range(self.prompt_depth):
@@ -533,12 +590,19 @@ class MultimodalPromptModel(nn.Module):
             ], dim=1)
             extended_attention_mask = self._prepare_attention_mask(extended_mask, txt_with_prompt.shape[1])
 
-            txt_with_prompt = self.text_blocks[i](
-                txt_with_prompt,
-                attention_mask=extended_attention_mask,
-                # RoBERTa doesn't use causal attention mask
-                # Remove causal_attention_mask parameter
-            )[0]
+            if self.encoder_type == 'clip':
+                txt_with_prompt = self.text_blocks[i](
+                    txt_with_prompt,
+                    attention_mask=extended_attention_mask,
+                    causal_attention_mask=None,
+                    output_attentions=False
+                )[0]
+            elif self.encoder_type == 'roberta':
+                txt_with_prompt = self.text_blocks[i](
+                    txt_with_prompt,
+                    attention_mask=extended_attention_mask
+                )[0]
+
             text_prompt, text_embed = txt_with_prompt[:, :self.text_prompt_len], txt_with_prompt[:,
                                                                                  self.text_prompt_len:]
 
@@ -555,12 +619,19 @@ class MultimodalPromptModel(nn.Module):
             image_embed = self.image_blocks[i](image_embed)
 
             extended_attention_mask = self._prepare_attention_mask(attention_mask, text_embed.shape[1])
-            text_embed = self.text_blocks[i](
-                text_embed,
-                attention_mask=extended_attention_mask
-                # causal_attention_mask=None,
-                # output_attentions=False
-            )[0]
+            if self.encoder_type == 'clip':
+                text_embed = self.text_blocks[i](
+                    text_embed,
+                    attention_mask=extended_attention_mask,
+                    causal_attention_mask=None,
+                    output_attentions=False
+                )[0]
+            elif self.encoder_type == 'roberta':
+                text_embed = self.text_blocks[i](
+                    text_embed,
+                    attention_mask=extended_attention_mask
+                )[0]
+
 
         # 应用最终的层归一化
         image_embed = self.image_norm(image_embed)
@@ -573,14 +644,14 @@ class MultimodalPromptModel(nn.Module):
 
         # 质量引导的特征融合（如果启用）
         fusion_weights = None
+        quality_guided_feat = None
         if self.use_quality_prompt and self.use_cross_modal_prompt:
-            # print("image_feat.shape：",image_feat.shape,"text_feat.shape：",text_feat.shape,"image_quality_scores: ", quality_scores["image"]["final_score"].shape)
             quality_guided_feat, fusion_weights = self.feature_fusion(image_feat, text_feat, quality_scores)
 
-        # 特征融合与分类
+        # Prepare features for concatenation
         features_to_concat = [image_feat, text_feat, F.one_hot(missing_type, num_classes=4).float()]
 
-        # 添加质量评分特征
+        # Add quality scores if enabled
         if self.use_quality_prompt:
             features_to_concat.extend([
                 quality_scores['image']['final_score'],
@@ -589,15 +660,14 @@ class MultimodalPromptModel(nn.Module):
                 quality_scores['text']['quality'],
                 quality_scores['cross_consistency']
             ])
-        # # 打印 features_to_concat 里每个元素的 shape
-        # for i, feature in enumerate(features_to_concat):
-        #     try:
-        #         print(f"features_to_concat 中第 {i} 个元素的 shape: {feature.shape}")
-        #     except AttributeError:
-        #         print(f"features_to_concat 中第 {i} 个元素没有 shape 属性，可能不是 PyTorch 张量。")
 
+        # Concatenate all features
         fused = torch.cat(features_to_concat, dim=1)
-        hidden = self.fusion(fused)
+        base_hidden = self.fusion(fused)
+        hidden = None
+        if quality_guided_feat is not None:
+            alpha = 0.5  # Fixed weight or learnable parameter
+            hidden = alpha * base_hidden + (1 - alpha) * quality_guided_feat
         logits = self.classifier(hidden)
 
         # 返回额外信息用于分析和损失计算
@@ -611,9 +681,10 @@ class MultimodalPromptModel(nn.Module):
             'original_features': original_features,  # 原始特征（用于重建损失）
             'generated_features': generated_features,  # 生成的特征
             'reconstructed_features': reconstructed_features  # 重建的特征
-        } if self.training else None
+        }
 
-        return logits if not self.training else (logits, additional_info)
+        return (logits, additional_info)
+        # return logits if not self.training else (logits, additional_info)
 
 
 # Create a factory function to initialize the model
@@ -632,7 +703,8 @@ def create_multimodal_prompt_model(
         use_cross_modal_prompt=True,
         image_size=224,
         patch_size=16,
-        max_length=512
+        max_length=512,
+        encoder_type='clip'
 ):
     # 从配置名称中提取实际的模型名称和patch_size
     if "patch" in image_model_name:
@@ -663,5 +735,6 @@ def create_multimodal_prompt_model(
         freeze_text_encoder=freeze_text_encoder,
         use_quality_prompt=use_quality_prompt,
         use_cross_modal_prompt=use_cross_modal_prompt,
-        max_length=max_length
+        max_length=max_length,
+        encoder_type=encoder_type
     )

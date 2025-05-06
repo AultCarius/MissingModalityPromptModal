@@ -1,6 +1,9 @@
 import torch
 import yaml
 import os
+
+from transformers import CLIPTokenizer, RobertaTokenizer
+
 from trainer import Trainer
 from datamodules.Food101DataModule import Food101DataModule
 from datamodules.MmimdbDataModule import mmimdbDataModule
@@ -25,6 +28,10 @@ if __name__ == '__main__':
         config["experiment_name"] = f"{model_type}_fusion{fusion_dim}_miss{missing_prob}"
     print(f"Starting experiment: {config['experiment_name']}")
 
+
+    tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-base-patch16")
+    # tokenizer = RobertaTokenizer.from_pretrained("roberta-base")
+
     # Set up data module
     if config.get("dataset", "mmimdb") == "food101":
         datamodule = Food101DataModule(
@@ -37,19 +44,21 @@ if __name__ == '__main__':
     else:
         datamodule = mmimdbDataModule(
             data_dir=config.get("data_dir", "./data/mmimdb"),
+            tokenizer=tokenizer,
             batch_size=config.get("batch_size", 32),
             num_workers=config.get("num_workers", 4),
             missing_strategy=config.get("missing_strategy", "none"),  # 直接读缺失策略
-            missing_prob=config.get("missing_prob", 0.0),  # 单独的缺失率
+            missing_prob=config.get("initial_missing_prob", config.get("missing_prob", 0.7)),  # Use initial value if available
             val_missing_strategy=config.get("val_missing_strategy", "none"),  # 验证集策略
             val_missing_prob=config.get("val_missing_prob", 0.0),  # 验证集缺失率
             test_missing_strategy=config.get("test_missing_strategy", "none"),  # 测试集策略
             test_missing_prob=config.get("test_missing_prob", 0.0),             # 测试集缺失率
             max_length=config.get("max_length", 77),
             image_size=config.get("image_size", 224),
-            patch_size=config.get("patch_size", 16)
+            patch_size=config.get("patch_size", 16),
+            seed=config.get("seed",42)
         )
-        num_classes = 23
+
 
     datamodule.setup()
 
@@ -76,12 +85,13 @@ if __name__ == '__main__':
         text_prompt_len=config.get("text_prompt_len", 5),
         prompt_depth=config.get("prompt_depth", 6),
         fusion_dim=config.get("fusion_dim", 512),
-        num_classes=num_classes,
+        num_classes=datamodule.get_num_classes(),
         freeze_image_encoder=config.get("freeze_image_encoder", False),
         freeze_text_encoder=config.get("freeze_text_encoder", False),
         use_quality_prompt=config.get("use_quality_prompt", False),
         use_cross_modal_prompt=config.get("use_cross_modal_prompt", False),
-        max_length=config.get("max_length",512)
+        max_length=config.get("max_length",512),
+        encoder_type=config.get("encoder_type", "clip")
     )
 
     # model = torch.nn.DataParallel(model)
@@ -90,6 +100,17 @@ if __name__ == '__main__':
     trainer = Trainer(model, train_loader, val_loader, config=config)
 
     trainer.class_weights = datamodule.get_class_weights().to(trainer.device)
+
+    # Add this right after creating the trainer instance (around line 95)
+    # After this line: trainer = Trainer(model, train_loader, val_loader, config=config)
+
+    # Set up curriculum learning if the config has the required parameters
+    if config.get("initial_missing_prob") is not None and config.get("final_missing_prob") is not None:
+        trainer.setup_curriculum_learning(
+            initial_missing_prob=config.get("initial_missing_prob"),
+            final_missing_prob=config.get("final_missing_prob"),
+            ramp_epochs=config.get("missing_prob_ramp_epochs", 10)
+        )
 
     # Start training
     trainer.train()
