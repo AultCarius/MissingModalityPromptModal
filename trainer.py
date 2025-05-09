@@ -1,3 +1,4 @@
+import json
 import os
 import yaml
 import torch
@@ -18,7 +19,7 @@ from scripts.emailsender import (
 )
 import torch.nn as nn
 from tqdm import tqdm
-
+from scipy.special import softmax
 
 # torch.autograd.set_detect_anomaly(True)
 GENRE_CLASS = [
@@ -70,6 +71,8 @@ class Trainer:
             self._load_checkpoint(config["resume_path"])
 
         self.batch_size = config.get("batch_size",8)
+
+        self.is_single_label = False
 
     def send_training_results_email(self):
         """Send training results and logs via email"""
@@ -326,6 +329,18 @@ class Trainer:
         initial_recon_weight = self.config.get("initial_recon_weight", 0.1)
         final_recon_weight = self.config.get("final_recon_weight", 0.01)
 
+        # 判断数据集类型
+        dataset_type = self.config.get("dataset", "mmimdb")
+        self.is_single_label = dataset_type == "food101"
+
+        # 首个批次标签检查（调试用）
+        with torch.no_grad():
+            for batch in self.train_loader:
+                _, _, _, label, _ = [x.to(self.device) for x in batch]
+                self.logger.info(f"Label shape: {label.shape}")
+                self.logger.info(f"Label sum per sample: {label.sum(dim=1)[:10]}")  # 显示前10个样本的标签和
+                break
+
         for epoch in range(self.start_epoch, num_epochs):
             current_epoch = epoch
 
@@ -373,25 +388,31 @@ class Trainer:
                 if isinstance(output, tuple):
                     logits, additional_info = output
 
-                    # Calculate classification loss
-                    if use_asymmetric_loss and epoch >= asl_start_epoch:
-                        progress = min(1.0, (epoch - asl_start_epoch + 1) / asl_ramp_epochs)
-                        gamma_pos = asl_gamma_pos * progress
-                        gamma_neg = asl_gamma_neg * progress
-                        classification_loss = self.asymmetric_loss_with_logits(
-                            logits, label,
-                            gamma_pos=gamma_pos, gamma_neg=gamma_neg, clip=asl_clip
-                        )
-                    elif use_focal_loss and epoch >= focal_start_epoch:
-                        progress = min(1.0, (epoch - focal_start_epoch + 1) / gamma_ramp_epochs)
-                        gamma = focal_max_gamma * progress
-                        bce_loss = F.binary_cross_entropy_with_logits(logits, label, pos_weight=self.class_weights)
-                        focal = self.focal_loss(logits, label, alpha=focal_alpha, gamma=gamma)
-                        classification_loss = bce_loss + focal_weight * focal
+                    if self.is_single_label:
+                        # 单标签分类 - 使用交叉熵损失
+                        targets = label.argmax(dim=1)  # 转换为类别索引
+                        classification_loss = F.cross_entropy(logits, targets)
                     else:
-                        classification_loss = F.binary_cross_entropy_with_logits(
-                            logits, label, pos_weight=self.class_weights
-                        )
+
+                        # 多标签分类 - 使用二元交叉熵损失
+                        if use_asymmetric_loss and epoch >= asl_start_epoch:
+                            progress = min(1.0, (epoch - asl_start_epoch + 1) / asl_ramp_epochs)
+                            gamma_pos = asl_gamma_pos * progress
+                            gamma_neg = asl_gamma_neg * progress
+                            classification_loss = self.asymmetric_loss_with_logits(
+                                logits, label,
+                                gamma_pos=gamma_pos, gamma_neg=gamma_neg, clip=asl_clip
+                            )
+                        elif use_focal_loss and epoch >= focal_start_epoch:
+                            progress = min(1.0, (epoch - focal_start_epoch + 1) / gamma_ramp_epochs)
+                            gamma = focal_max_gamma * progress
+                            bce_loss = F.binary_cross_entropy_with_logits(logits, label, pos_weight=self.class_weights)
+                            focal = self.focal_loss(logits, label, alpha=focal_alpha, gamma=gamma)
+                            classification_loss = bce_loss + focal_weight * focal
+                        else:
+                            classification_loss = F.binary_cross_entropy_with_logits(
+                                logits, label, pos_weight=self.class_weights
+                            )
 
                     # Initialize reconstruction loss
                     reconstruction_loss = 0.0
@@ -450,9 +471,10 @@ class Trainer:
                     contrastive_weight = 0.1  # Start with a small weight
 
                     # Calculate contrastive loss between real modalities (only for samples with both modalities)
+                    both_modalities = (missing_type == 0)
                     if 'quality_scores' in additional_info:
                         # Get samples with both modalities (missing_type == 0)
-                        both_modalities = (missing_type == 0)
+
                         if both_modalities.any():
                             # Get features for samples with both modalities
                             if 'original_features' in additional_info:
@@ -524,8 +546,8 @@ class Trainer:
                         if only_img_missing.any() or only_txt_missing.any():
                             # Target: real features should get high scores, generated low scores
                             adv_targets = torch.zeros(self.batch_size, 2, device=self.device)  # [image_real, text_real]
-                            adv_targets[~is_image_missing, 0] = 1.0  # Real image = 1
-                            adv_targets[~is_text_missing, 1] = 1.0  # Real text = 1
+                            adv_targets[~is_image_missing, 0] = 0.9  # Real image = 1
+                            adv_targets[~is_text_missing, 1] = 0.9  # Real text = 1
 
                             # Actual quality scores
                             pred_quality = torch.zeros(self.batch_size, 2, device=self.device)
@@ -558,9 +580,14 @@ class Trainer:
                                                                            torch.Tensor) else reconstruction_loss
                 else:
                     logits = output
-                    classification_loss = F.binary_cross_entropy_with_logits(
-                        logits, label, pos_weight=self.class_weights
-                    )
+                    # 根据数据集类型计算分类损失
+                    if self.is_single_label:
+                        targets = label.argmax(dim=1)
+                        classification_loss = F.cross_entropy(logits, targets)
+                    else:
+                        classification_loss = F.binary_cross_entropy_with_logits(
+                            logits, label, pos_weight=self.class_weights
+                        )
                     total_batch_loss = classification_loss
                     cls_loss += classification_loss.item()
 
@@ -590,7 +617,16 @@ class Trainer:
                     self.writer.add_scalar("lr", current_lr, global_step)
 
                 total_loss += total_batch_loss.item()
-                preds = (logits > 0.5).float()
+                # 根据数据集类型计算预测
+                if self.is_single_label:
+                    # 单标签分类 - 使用argmax获取类别索引
+                    pred_indices = logits.argmax(dim=1)
+                    # 转换为one-hot向量以保持与多标签格式一致
+                    preds = torch.zeros_like(logits)
+                    preds.scatter_(1, pred_indices.unsqueeze(1), 1.0)
+                else:
+                    # 多标签分类 - 使用阈值
+                    preds = (logits > 0.5).float()
 
                 # Collect predictions and true labels for metrics
                 all_preds.append(preds.cpu().detach())
@@ -671,9 +707,16 @@ class Trainer:
             with torch.no_grad():
                 mean_logit = logits.mean().item()
                 std_logit = logits.std().item()
-                mean_pred = (torch.sigmoid(logits) > 0.5).float().sum(dim=1).mean().item()
-                sigmoid_probs = torch.sigmoid(logits)
-                predictions_per_sample = (sigmoid_probs > 0.5).float().sum(dim=1).mean().item()
+                if self.is_single_label:
+                    # 对于单标签分类，记录预测的分布
+                    pred_indices = logits.argmax(dim=1)
+                    mean_pred = pred_indices.float().mean().item()
+                    predictions_per_sample = 1.0  # 单标签始终预测一个类别
+                else:
+                    # 对于多标签分类，记录阈值后的预测数量
+                    mean_pred = (torch.sigmoid(logits) > 0.5).float().sum(dim=1).mean().item()
+                    sigmoid_probs = torch.sigmoid(logits)
+                    predictions_per_sample = (sigmoid_probs > 0.5).float().sum(dim=1).mean().item()
 
             if self.writer:
                 self.writer.add_scalar("Debug/mean_logit", mean_logit, epoch)
@@ -709,37 +752,65 @@ class Trainer:
         preds_np = preds.numpy()
         labels_np = labels.numpy()
 
-        # 计算要求的指标
-        if "accuracy" in self.metrics:
-            # 多标签情况下的准确率计算
-            correct = ((preds_np > 0.5) == (labels_np > 0.5)).sum()
-            total = labels_np.size
-            results["accuracy"] = correct / total
+        if self.is_single_label:
+            # 单标签分类 - 使用argmax获取类别索引
+            pred_classes = preds_np.argmax(axis=1)
+            true_classes = labels_np.argmax(axis=1)
 
-        if "macro_f1" in self.metrics:
-            # 多标签宏平均F1
-            # 对每个样本的每个类别计算是否预测正确
-            binary_preds = (preds_np > 0.5).astype(float)
+            # 计算准确率
+            results["accuracy"] = (pred_classes == true_classes).mean()
+
             try:
-                results["macro_f1"] = f1_score(labels_np, binary_preds, average='macro', zero_division=0)
-            except:
+                # 计算多类别F1分数
+                results["macro_f1"] = f1_score(true_classes, pred_classes, average='macro', zero_division=0)
+                results["micro_f1"] = f1_score(true_classes, pred_classes, average='micro', zero_division=0)
+                # 计算AUROC - 对于多类别使用OVR策略
+                if "auroc" in self.metrics:
+                    # 将预测转为概率
+                    # 对于softmax输出，使用原始logits计算每类概率
+                    probs = softmax(preds_np, axis=1)
+                    try:
+                        results["auroc"] = roc_auc_score(labels_np, probs, average='macro', multi_class='ovr')
+                    except:
+                        results["auroc"] = 0.5  # 随机猜测的AUC值
+            except Exception as e:
+                self.logger.warning(f"计算F1分数时出错: {str(e)}")
                 results["macro_f1"] = 0.0
-
-        if "micro_f1" in self.metrics:
-            # 多标签微平均F1
-            binary_preds = (preds_np > 0.5).astype(float)
-            try:
-                results["micro_f1"] = f1_score(labels_np, binary_preds, average='micro', zero_division=0)
-            except:
                 results["micro_f1"] = 0.0
-
-        if "auroc" in self.metrics:
-            # 多标签AUROC
-            try:
-                # 当有类别全为正或全为负时，这会失败
-                results["auroc"] = roc_auc_score(labels_np, preds_np, average='macro')
-            except:
                 results["auroc"] = 0.5  # 随机猜测的AUC值
+
+        else:
+            # 计算要求的指标
+            if "accuracy" in self.metrics:
+                # 多标签情况下的准确率计算
+                correct = ((preds_np > 0.5) == (labels_np > 0.5)).sum()
+                total = labels_np.size
+                results["accuracy"] = correct / total
+
+            if "macro_f1" in self.metrics:
+                # 多标签宏平均F1
+                # 对每个样本的每个类别计算是否预测正确
+                binary_preds = (preds_np > 0.5).astype(float)
+                try:
+                    results["macro_f1"] = f1_score(labels_np, binary_preds, average='macro', zero_division=0)
+                except:
+                    results["macro_f1"] = 0.0
+
+            if "micro_f1" in self.metrics:
+                # 多标签微平均F1
+                binary_preds = (preds_np > 0.5).astype(float)
+                try:
+                    results["micro_f1"] = f1_score(labels_np, binary_preds, average='micro', zero_division=0)
+                except:
+                    results["micro_f1"] = 0.0
+
+            if "auroc" in self.metrics:
+                # 多标签AUROC
+                try:
+                    # 当有类别全为正或全为负时，这会失败
+                    results["auroc"] = roc_auc_score(labels_np, preds_np, average='macro')
+                except:
+                    results["auroc"] = 0.5  # 随机猜测的AUC值
 
         return results
 
@@ -799,7 +870,16 @@ class Trainer:
                 else:
                     logits = output
 
-                preds = (logits > 0.5).float()
+                # 根据数据集类型计算预测
+                if self.is_single_label:
+                    # 单标签分类 - 使用argmax
+                    pred_indices = logits.argmax(dim=1)
+                    # 转换回one-hot格式以保持一致
+                    preds = torch.zeros_like(logits)
+                    preds.scatter_(1, pred_indices.unsqueeze(1), 1.0)
+                else:
+                    # 多标签分类 - 使用阈值
+                    preds = (logits > 0.5).float()
 
                 # 收集总体预测和标签
                 all_preds.append(preds.cpu())
@@ -824,7 +904,13 @@ class Trainer:
         metrics = self._compute_metrics(all_preds, all_labels)
 
         # 详细统计信息
-        self._detailed_statistics(all_logits, all_labels, all_preds, "Overall")
+        # self._detailed_statistics(all_logits, all_labels, all_preds, "Overall")
+        if self.is_single_label:
+            # 使用Food101的详细统计函数
+            self._detailed_statistics_food101(all_logits, all_labels, all_preds, "Overall")
+        else:
+            # 使用MMIMDB的详细统计函数
+            self._detailed_statistics(all_logits, all_labels, all_preds, "Overall")
 
         # 计算每种缺失类型的指标
         missing_type_results = {}
@@ -835,9 +921,12 @@ class Trainer:
                 mt_logits = torch.cat(data['logits'], dim=0)
                 mt_metrics = self._compute_metrics(mt_preds, mt_labels)
                 missing_type_results[mt_name] = mt_metrics
+                if self.is_single_label:
+                    # 为每种缺失类型记录详细统计信息
+                    self._detailed_statistics_food101(mt_logits, mt_labels, mt_preds, f"Missing: {mt_name}")
+                else:
+                    self._detailed_statistics(mt_logits, mt_labels, mt_preds, f"Missing: {mt_name}")
 
-                # 为每种缺失类型记录详细统计信息
-                self._detailed_statistics(mt_logits, mt_labels, mt_preds, f"Missing: {mt_name}")
 
         # 处理收集的质量评分数据
         if quality_data['image_quality']:
@@ -1256,6 +1345,136 @@ class Trainer:
         for i in range(min(5, int(max(pred_counts_per_sample))) + 1):
             count = (pred_counts_per_sample == i).sum()
             self.logger.info(f"样本有{i}个预测: {count}个 ({count / total_samples * 100:.2f}%)")
+
+    def _detailed_statistics_food101(self, logits, labels, preds, prefix=""):
+        """计算并打印Food101数据集的详细预测统计信息"""
+        # 转为numpy方便处理
+        logits_np = logits.numpy()
+        labels_np = labels.numpy()
+        preds_np = preds.numpy()
+
+        # 获取Food101类别名称
+        food_classes = self._get_food101_classes()
+
+        # 1. 每个类别的正样本数量
+        positive_counts = labels_np.sum(axis=0)
+        total_samples = labels_np.shape[0]
+
+        # 2. 每个类别的预测分布
+        pred_counts = preds_np.sum(axis=0)
+
+        # 3. 类别级别的准确率、精确率、召回率和F1
+        class_metrics = []
+
+        for i, food_class in enumerate(food_classes):
+            # 真正例数量
+            true_pos = ((preds_np[:, i] > 0.5) & (labels_np[:, i] > 0.5)).sum()
+            # 假正例数量
+            false_pos = ((preds_np[:, i] > 0.5) & (labels_np[:, i] <= 0.5)).sum()
+            # 假负例数量
+            false_neg = ((preds_np[:, i] <= 0.5) & (labels_np[:, i] > 0.5)).sum()
+            # 真负例数量
+            true_neg = ((preds_np[:, i] <= 0.5) & (labels_np[:, i] <= 0.5)).sum()
+
+            # 计算指标
+            precision = true_pos / (true_pos + false_pos) if (true_pos + false_pos) > 0 else 0
+            recall = true_pos / (true_pos + false_neg) if (true_pos + false_neg) > 0 else 0
+            f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+
+            # 平衡准确率 - 更有意义的单类准确率指标
+            tpr = recall  # 真正率 = 召回率
+            tnr = true_neg / (true_neg + false_pos) if (true_neg + false_pos) > 0 else 0  # 真负率
+            balanced_acc = (tpr + tnr) / 2
+
+            # 计算平均logit值
+            mean_logit = logits_np[:, i].mean()
+            pos_logit = logits_np[labels_np[:, i] > 0.5, i].mean() if (labels_np[:, i] > 0.5).any() else float('nan')
+            neg_logit = logits_np[labels_np[:, i] <= 0.5, i].mean() if (labels_np[:, i] <= 0.5).any() else float('nan')
+
+            class_metrics.append({
+                'food_class': food_class,
+                'pos_count': int(positive_counts[i]),
+                'pred_count': int(pred_counts[i]),
+                'avg_accuracy': balanced_acc,
+                'precision': precision,
+                'recall': recall,
+                'f1': f1,
+                'mean_logit': mean_logit,
+                'pos_logit': pos_logit,
+                'neg_logit': neg_logit
+            })
+
+        # 打印结果
+        self.logger.info(f"\n{prefix} Detailed Statistics:")
+        self.logger.info(f"Total samples: {total_samples}")
+        self.logger.info(f"Average labels per sample: {labels_np.sum() / total_samples:.2f}")
+        self.logger.info(f"Average predictions per sample: {preds_np.sum() / total_samples:.2f}")
+
+        # 打印类别级别统计 - 仅显示前20个类别以避免太长
+        self.logger.info(f"\nClass-level metrics (top 20) [{prefix}]:")
+        headers = ["Food Class", "Pos%", "PredCnt", "Acc", "Prec", "Rec", "F1", "AvgLog", "PosLog", "NegLog"]
+        format_row = "{:20} {:6} {:8} {:6} {:6} {:6} {:6} {:7} {:7} {:7}"
+
+        # 打印表头
+        self.logger.info(format_row.format(*headers))
+
+        # 按正样本数量排序并打印前20个
+        sorted_metrics = sorted(class_metrics, key=lambda x: x['pos_count'], reverse=True)
+        for cm in sorted_metrics[:20]:
+            pos_percent = cm['pos_count'] / total_samples * 100
+            self.logger.info(format_row.format(
+                cm['food_class'][:20],  # 截断长类名
+                f"{pos_percent:.1f}%",
+                cm['pred_count'],
+                f"{cm['avg_accuracy'] * 100:.2f}",
+                f"{cm['precision'] * 100:.2f}",
+                f"{cm['recall'] * 100:.2f}",
+                f"{cm['f1'] * 100:.2f}",
+                f"{cm['mean_logit']:.2f}",
+                f"{0 if np.isnan(cm['pos_logit']) else cm['pos_logit']:.2f}",
+                f"{0 if np.isnan(cm['neg_logit']) else cm['neg_logit']:.2f}",
+            ))
+
+        # 检查模型预测全为0或全为1的情况
+        zero_pred = (preds_np.sum(axis=1) == 0).sum()
+        if zero_pred > 0:
+            self.logger.info(f"\n警告: {zero_pred}个样本({zero_pred / total_samples * 100:.2f}%)没有任何正向预测!")
+
+        # 计算预测数量分布
+        pred_counts_per_sample = preds_np.sum(axis=1)
+        for i in range(min(5, int(max(pred_counts_per_sample))) + 1):
+            count = (pred_counts_per_sample == i).sum()
+            self.logger.info(f"样本有{i}个预测: {count}个 ({count / total_samples * 100:.2f}%)")
+
+    def _get_food101_classes(self):
+        """获取Food101数据集的类别名称"""
+        # 你可以从配置或数据集中读取类别名称
+        # 这里是一种简单的实现方式，实际使用时可能需要调整
+        try:
+            # 尝试从数据加载器获取类别名称
+            if hasattr(self.train_loader.dataset, 'class_to_idx'):
+                class_to_idx = self.train_loader.dataset.class_to_idx
+                # 按索引排序类别
+                classes = [None] * len(class_to_idx)
+                for cls, idx in class_to_idx.items():
+                    classes[idx] = cls
+                return classes
+
+            # 或者直接从数据集目录读取
+            if hasattr(self, 'config') and 'data_dir' in self.config:
+                class_idx_path = os.path.join(self.config['data_dir'], "class_idx.json")
+                if os.path.exists(class_idx_path):
+                    with open(class_idx_path, 'r') as f:
+                        class_to_idx = json.load(f)
+                    classes = [None] * len(class_to_idx)
+                    for cls, idx in class_to_idx.items():
+                        classes[idx] = cls
+                    return classes
+        except:
+            pass
+
+        # 如果无法获取实际类别名称，返回通用名称
+        return [f"Class_{i}" for i in range(101)]
 
     def test(self, test_loader=None, model_path=None):
         """

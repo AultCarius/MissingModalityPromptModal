@@ -19,12 +19,12 @@ class BaseDataModule(ABC):
 
     def train_dataloader(self):
         return DataLoader(self.train_dataset, batch_size=self.batch_size,
-                          shuffle=True, num_workers=self.num_workers, pin_memory=True)
+                          shuffle=True, num_workers=self.num_workers, pin_memory=True,drop_last=True)
 
     def val_dataloader(self):
         return DataLoader(self.val_dataset, batch_size=self.batch_size,
-                          shuffle=False, num_workers=self.num_workers, pin_memory=True)
+                          shuffle=False, num_workers=self.num_workers, pin_memory=True,drop_last=True)
 
     def test_dataloader(self):
         return DataLoader(self.test_dataset, batch_size=self.batch_size,
-                          shuffle=False, num_workers=self.num_workers, pin_memory=True)
+                          shuffle=False, num_workers=self.num_workers, pin_memory=True,drop_last=True)

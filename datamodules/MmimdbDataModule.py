@@ -67,6 +67,7 @@ class MMIMDBDataset(Dataset):
         plot = metadata["plot"][0] if isinstance(metadata["plot"], list) else metadata["plot"]
         encoded = self.tokenizer(plot, padding="max_length", truncation=True,
                                  max_length=self.max_length, return_tensors="pt")
+        # print("input_ids:",encoded["input_ids"].shape,"attention_mask",encoded["input_ids"].shape)
         input_ids = encoded["input_ids"].squeeze(0)
         attention_mask = encoded["attention_mask"].squeeze(0)
 

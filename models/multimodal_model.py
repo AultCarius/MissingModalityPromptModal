@@ -248,7 +248,7 @@ class MultimodalPromptModel(nn.Module):
         # 融合和分类层
         fusion_input_dim = self.image_dim + self.text_dim + 4  # 基础特征 + 缺失类型
         if use_quality_prompt:
-            fusion_input_dim += 13  # 增加质量评分（2个基础分+3个详细评分）
+            fusion_input_dim += 13  # 增加质量评分（2个质量特征5+3个详细评分1）
 
         # 使用质量引导的特征融合替换跨模态提示
         if use_cross_modal_prompt:
@@ -642,11 +642,22 @@ class MultimodalPromptModel(nn.Module):
         image_feat = image_embed[:, 0]  # [B, D_img]
         text_feat = text_embed[:, 0]  # [B, D_txt]
 
+        # 在应用质量引导的特征融合之前，打印维度信息
+        # print(f"DEBUG - Feature dimensions before fusion:")
+        # print(f"  image_feat shape: {image_feat.shape}")
+        # print(f"  text_feat shape: {text_feat.shape}")
+        # if quality_scores is not None:
+        #     print(f"  quality_scores image: {quality_scores['image']['final_score'].shape}")
+        #     print(f"  quality_scores text: {quality_scores['text']['final_score'].shape}")
+        #     print(f"  quality_scores consistency: {quality_scores['cross_consistency'].shape}")
+
         # 质量引导的特征融合（如果启用）
         fusion_weights = None
         quality_guided_feat = None
         if self.use_quality_prompt and self.use_cross_modal_prompt:
+            # print(f"  Calling feature_fusion with image_feat: {image_feat.shape}, text_feat: {text_feat.shape}")
             quality_guided_feat, fusion_weights = self.feature_fusion(image_feat, text_feat, quality_scores)
+            # print(f"  After fusion: quality_guided_feat: {quality_guided_feat.shape}, fusion_weights: {fusion_weights.shape}")
 
         # Prepare features for concatenation
         features_to_concat = [image_feat, text_feat, F.one_hot(missing_type, num_classes=4).float()]

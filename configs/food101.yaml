@@ -1,9 +1,9 @@
 # 实验配置
-experiment_name: "mmimdb_CrossmodalAttentionFusion"
+experiment_name: "food101_0508_roberta_test01_CrossmodalAttentionFusion"
 
 # Model Configuration
 image_model_name: "vit_base_patch16_224"
-text_model_name: "openai/clip-vit-base-patch16"
+text_model_name: "roberta-base" #" "
 encoder_type: "roberta"  # "clip" or "roberta"
 image_prompt_len: 36
 text_prompt_len: 36
@@ -13,8 +13,6 @@ freeze_image_encoder: True
 freeze_text_encoder: True
 use_quality_prompt: True
 use_cross_modal_prompt: True
-initial_recon_weight: 1
-final_recon_weight: 0.1
 max_length: 512
 
 # Training Configuration
@@ -30,6 +28,12 @@ min_lr: 0.000001
 seed: 66666
 save_every_epochs: 20
 
+# loss
+# Recon loss
+initial_recon_weight: 2
+final_recon_weight: 0.5
+
+# Cls loss
 use_focal_loss: false
 focal_start_epoch: 3
 focal_gamma: 0.5
@@ -46,8 +50,8 @@ asl_clip: 0.05
 
 
 # Data Configuration
-dataset: "mmimdb"
-data_dir: "./data/mmimdb"
+dataset: "food101"
+data_dir: "./data/food101"
 
 missing_strategy: "both"
 missing_prob: 0.7
@@ -59,11 +63,11 @@ test_missing_prob: 0.7
 # Add after missing_prob line
 initial_missing_prob: 0.1
 final_missing_prob: 0.7
-missing_prob_ramp_epochs: 10
+missing_prob_ramp_epochs: 5
 
 # 评估指标设置
 metrics: ["accuracy", "macro_f1", "micro_f1"]
-primary_metric: "macro_f1"
+primary_metric: "accuracy"
 
 # Logging Configuration
 use_tensorboard: true
@@ -76,7 +80,7 @@ email:
   sender_email: "1494032646@qq.com"
   sender_password: "gmhibktcmuggiiab"
   recipient_email: "aultcarius@163.com"
-  email_subject: "Training Results: MMIMDB Experiment"
+  email_subject: "Training Results: UPMC Food101 Experiment"
 
 # Device Configuration
 device: "cuda"  # "cuda" or "cpu"
