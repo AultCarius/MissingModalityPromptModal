@@ -1,10 +1,10 @@
 # 实验配置
-experiment_name: "mmimdb_CrossmodalAttentionFusion"
+experiment_name: "mmimdb_allclip"
 
 # Model Configuration
-image_model_name: "vit_base_patch16_224"
+image_model_name: "openai/clip-vit-base-patch16"
 text_model_name: "openai/clip-vit-base-patch16"
-encoder_type: "roberta"  # "clip" or "roberta"
+encoder_type: "clip"  # "clip" or "roberta"
 image_prompt_len: 36
 text_prompt_len: 36
 prompt_depth: 6
@@ -15,7 +15,7 @@ use_quality_prompt: True
 use_cross_modal_prompt: True
 initial_recon_weight: 1
 final_recon_weight: 0.1
-max_length: 512
+max_length: 77
 
 # Training Configuration
 epochs: 20
@@ -57,9 +57,9 @@ test_missing_strategy: "both"
 test_missing_prob: 0.7
 
 # Add after missing_prob line
-initial_missing_prob: 0.1
+initial_missing_prob: 0.7
 final_missing_prob: 0.7
-missing_prob_ramp_epochs: 10
+missing_prob_ramp_epochs: 5
 
 # 评估指标设置
 metrics: ["accuracy", "macro_f1", "micro_f1"]
