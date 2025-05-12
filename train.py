@@ -40,12 +40,12 @@ if __name__ == '__main__':
             tokenizer=tokenizer,
             batch_size=config.get("batch_size", 32),
             num_workers=config.get("num_workers", 4),
-            missing_strategy=config.get("missing_strategy", "none"),  # 直接读缺失策略
+            missing_strategy=config.get("missing_strategy", "both"),  # 直接读缺失策略
             missing_prob=config.get("initial_missing_prob", config.get("missing_prob", 0.7)),  # Use initial value if available
-            val_missing_strategy=config.get("val_missing_strategy", "none"),  # 验证集策略
-            val_missing_prob=config.get("val_missing_prob", 0.0),  # 验证集缺失率
-            test_missing_strategy=config.get("test_missing_strategy", "none"),  # 测试集策略
-            test_missing_prob=config.get("test_missing_prob", 0.0),             # 测试集缺失率
+            val_missing_strategy=config.get("val_missing_strategy", "both"),  # 验证集策略
+            val_missing_prob=config.get("val_missing_prob", 0.7),  # 验证集缺失率
+            test_missing_strategy=config.get("test_missing_strategy", "both"),  # 测试集策略
+            test_missing_prob=config.get("test_missing_prob", 0.7),             # 测试集缺失率
             max_length=config.get("max_length", 77),
             image_size=config.get("image_size", 224),
             patch_size=config.get("patch_size", 16),
