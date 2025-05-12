@@ -19,7 +19,7 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 class UPMCFood101Dataset(Dataset):
     def __init__(self, sample_list, data_dir, image_transform=None, tokenizer=None,
-                 max_length=128, missing_strategy="none"):
+                 max_length=128, missing_strategy="none",missing_prob=0.7):
         self.sample_list = sample_list
         self.data_dir = data_dir
         self.image_transform = image_transform or transforms.Compose([
@@ -31,7 +31,7 @@ class UPMCFood101Dataset(Dataset):
         self.tokenizer = tokenizer or CLIPTokenizer.from_pretrained("openai/clip-vit-base-patch16")
         self.max_length = max_length
         self.missing_strategy = missing_strategy
-        self.missing_prob = 0.7
+        self.missing_prob = missing_prob
 
         # Load class index mapping
         class_idx_path = os.path.join(data_dir, "class_idx.json")
@@ -208,7 +208,8 @@ class UPMCFood101DataModule(BaseDataModule):
             image_transform=self.image_transform,
             tokenizer=self.tokenizer,
             max_length=self.max_length,
-            missing_strategy=train_missing
+            missing_strategy=train_missing,
+            missing_prob=self.missing_prob
         )
 
         self.val_dataset = UPMCFood101Dataset(
@@ -216,7 +217,8 @@ class UPMCFood101DataModule(BaseDataModule):
             image_transform=self.image_transform,
             tokenizer=self.tokenizer,
             max_length=self.max_length,
-            missing_strategy=val_missing
+            missing_strategy=val_missing,
+            missing_prob=self.val_missing_prob
         )
 
         self.test_dataset = UPMCFood101Dataset(
@@ -224,7 +226,8 @@ class UPMCFood101DataModule(BaseDataModule):
             image_transform=self.image_transform,
             tokenizer=self.tokenizer,
             max_length=self.max_length,
-            missing_strategy=test_missing
+            missing_strategy=test_missing,
+            missing_prob=self.test_missing_prob
         )
 
     def _parse_missing_strategy(self, strategy, prob):
