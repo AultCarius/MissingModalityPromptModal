@@ -28,7 +28,7 @@ GENRE_CLASS_DICT = {genre: idx for idx, genre in enumerate(GENRE_CLASS)}
 
 class MMIMDBDataset(Dataset):
     def __init__(self, sample_list, data_dir, image_transform=None, tokenizer=None,
-                 max_length=128, missing_strategy="none"):
+                 max_length=128, missing_strategy="none",missing_prob=0.7):
         self.sample_list = sample_list
         self.data_dir = data_dir
         self.image_transform = image_transform or transforms.Compose([
@@ -44,7 +44,7 @@ class MMIMDBDataset(Dataset):
 
         self.max_length = max_length
         self.missing_strategy = missing_strategy
-        self.missing_prob = 0.7
+        self.missing_prob = missing_prob
 
     def __len__(self):
         return len(self.sample_list)
@@ -67,6 +67,7 @@ class MMIMDBDataset(Dataset):
         plot = metadata["plot"][0] if isinstance(metadata["plot"], list) else metadata["plot"]
         encoded = self.tokenizer(plot, padding="max_length", truncation=True,
                                  max_length=self.max_length, return_tensors="pt")
+        # print("input_ids:",encoded["input_ids"].shape,"attention_mask",encoded["input_ids"].shape)
         input_ids = encoded["input_ids"].squeeze(0)
         attention_mask = encoded["attention_mask"].squeeze(0)
 
@@ -197,7 +198,8 @@ class mmimdbDataModule(BaseDataModule):
             image_transform=self.image_transform,
             tokenizer=self.tokenizer,
             max_length=self.max_length,
-            missing_strategy=train_missing
+            missing_strategy=train_missing,
+            missing_prob=self.missing_prob
         )
 
         # 验证集缺失策略
@@ -208,7 +210,8 @@ class mmimdbDataModule(BaseDataModule):
             image_transform=self.image_transform,
             tokenizer=self.tokenizer,
             max_length=self.max_length,
-            missing_strategy=val_missing
+            missing_strategy=val_missing,
+            missing_prob=self.val_missing_prob
         )
         # 测试集缺失策略
         test_missing = self._parse_missing_strategy(self.test_missing_strategy, self.test_missing_prob)
@@ -218,7 +221,8 @@ class mmimdbDataModule(BaseDataModule):
             image_transform=self.image_transform,
             tokenizer=self.tokenizer,
             max_length=self.max_length,
-            missing_strategy=test_missing
+            missing_strategy=test_missing,
+            missing_prob = self.test_missing_prob
         )
 
 

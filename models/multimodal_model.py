@@ -1,3 +1,5 @@
+import inspect
+
 from timm import create_model
 from transformers import CLIPTextModel, CLIPTokenizer
 import torch
@@ -151,7 +153,7 @@ class MultimodalPromptModel(nn.Module):
     def __init__(
             self,
             image_encoder_backbone,
-            text_encoder_name='roberta-base',
+            text_encoder_backbone,  # 直接接收编码器实例
             image_prompt_len=5,
             text_prompt_len=5,
             prompt_depth=6,
@@ -161,56 +163,112 @@ class MultimodalPromptModel(nn.Module):
             freeze_text_encoder=False,
             use_quality_prompt=True,
             use_cross_modal_prompt=True,
-            use_modality_generator=True,  # 添加参数以启用/禁用模态生成器
-            max_length=512,  # Add this parameter
-            encoder_type='clip'
+            use_modality_generator=True,
+            max_length=512,
+            encoder_type='clip',
+            use_clip_encoders=False  # 标志是否使用CLIP编码器
     ):
         super().__init__()
         self.max_length = max_length
         self.encoder_type = encoder_type.lower()
-        self.image_encoder = image_encoder_backbone
+        self.use_clip_encoders = use_clip_encoders
 
-        if self.encoder_type == 'clip':
-            self.text_encoder = CLIPTextModel.from_pretrained(text_encoder_name)
+        # 保存编码器
+        self.image_encoder = image_encoder_backbone
+        self.text_encoder = text_encoder_backbone
+
+        # 处理CLIP模式
+        # 处理CLIP模式
+        if use_clip_encoders:
+            # 获取维度信息
+            self.image_dim = self.image_encoder.config.hidden_size
             self.text_dim = self.text_encoder.config.hidden_size
-            # CLip
+
+            print(f"Using CLIP encoders - Image dim: {self.image_dim}, Text dim: {self.text_dim}")
+
+            # 根据CLIP模型的真实结构设置组件
+            # CLIP视觉模型
+            self.image_patch_embed = self.image_encoder.vision_model.embeddings  # 正确访问embeddings
+            self.image_blocks = self.image_encoder.vision_model.encoder.layers
+            self.image_norm = self.image_encoder.vision_model.post_layernorm
+
+            # CLIP文本模型
             self.text_embeddings = self.text_encoder.text_model.embeddings
             self.text_blocks = self.text_encoder.text_model.encoder.layers
             self.text_norm = self.text_encoder.text_model.final_layer_norm
 
-        elif self.encoder_type == 'roberta':
-            self.text_encoder = RobertaModel.from_pretrained(text_encoder_name)
-            self.text_dim = self.text_encoder.config.hidden_size
-            # RoBERTa
-            self.text_embeddings = self.text_encoder.embeddings
-            self.text_blocks = self.text_encoder.encoder.layer  # RoBERTa uses 'layer' instead of 'layers'
-            self.text_norm = self.text_encoder.encoder.layer[-1].output.LayerNorm  # Use the last layer's normalization
+            # 创建兼容接口
+            self.image_cls_token = nn.Parameter(torch.zeros(1, 1, self.image_dim))
+            self.image_pos_embed = nn.Parameter(torch.zeros(1, 197, self.image_dim))  # 仅作为占位符
+            self.image_pos_drop = nn.Dropout(0.0)
 
         else:
-            raise ValueError(f"Unsupported encoder type: {encoder_type}. Choose 'clip' or 'roberta'")
+            # 处理常规编码器
+            # 检查是否为CLIP视觉模型
+            if hasattr(self.image_encoder, 'config') and hasattr(self.image_encoder.config, 'hidden_size'):
+                # CLIP视觉模型
+                self.image_dim = self.image_encoder.config.hidden_size
 
+                # 正确访问CLIP视觉模型的组件
+                if hasattr(self.image_encoder, 'vision_model'):
+                    self.image_patch_embed = self.image_encoder.vision_model.embeddings
+                    self.image_blocks = self.image_encoder.vision_model.encoder.layers
+                    self.image_norm = self.image_encoder.vision_model.post_layernorm
+                else:
+                    # 旧版本或不同结构的CLIP视觉模型
+                    vision_model = getattr(self.image_encoder, 'vision_model', self.image_encoder)
+                    self.image_patch_embed = vision_model.embeddings
+                    self.image_blocks = vision_model.encoder.layers
+                    self.image_norm = getattr(vision_model, 'post_layernorm',
+                                              getattr(vision_model, 'layer_norm', None))
 
-        self.image_dim = self.image_encoder.embed_dim
+                # 创建兼容接口
+                self.image_cls_token = nn.Parameter(torch.zeros(1, 1, self.image_dim))
+                self.image_pos_embed = nn.Parameter(torch.zeros(1, 197, self.image_dim))
+                self.image_pos_drop = nn.Dropout(0.0)
+            else:
+                # 标准ViT模型
+                self.image_dim = self.image_encoder.embed_dim
+                self.image_patch_embed = self.image_encoder.patch_embed
+                self.image_cls_token = self.image_encoder.cls_token
+                self.image_pos_embed = self.image_encoder.pos_embed
+                self.image_pos_drop = self.image_encoder.pos_drop
+                self.image_blocks = self.image_encoder.blocks
+                self.image_norm = self.image_encoder.norm
 
+            # 检查文本编码器类型
+            if hasattr(self.text_encoder, 'text_model'):
+                # CLIP文本模型
+                self.text_dim = self.text_encoder.config.hidden_size
+                self.text_embeddings = self.text_encoder.text_model.embeddings
+                self.text_blocks = self.text_encoder.text_model.encoder.layers
+                self.text_norm = self.text_encoder.text_model.final_layer_norm
+            elif hasattr(self.text_encoder, 'encoder') and hasattr(self.text_encoder.encoder, 'layer'):
+                # RoBERTa等Transformer模型
+                self.text_dim = self.text_encoder.config.hidden_size
+                self.text_embeddings = self.text_encoder.embeddings
+                self.text_blocks = self.text_encoder.encoder.layer
+                self.text_norm = self.text_encoder.encoder.layer[-1].output.LayerNorm
+            else:
+                # 其他类型的文本模型
+                self.text_dim = self.text_encoder.config.hidden_size
+                if hasattr(self.text_encoder, 'encoder') and hasattr(self.text_encoder.encoder, 'layers'):
+                    self.text_embeddings = self.text_encoder.embeddings
+                    self.text_blocks = self.text_encoder.encoder.layers
+                    self.text_norm = getattr(self.text_encoder, 'final_layer_norm',
+                                             getattr(self.text_encoder, 'layer_norm', None))
+                else:
+                    raise ValueError(f"Unsupported text encoder structure")
 
-        print("image_dim:",self.image_dim," text_dim: ",self.text_dim)
-
-        self.use_quality_prompt = use_quality_prompt
-        self.use_cross_modal_prompt = use_cross_modal_prompt
-        self.use_modality_generator = use_modality_generator
-        self.prompt_depth = prompt_depth
-
-        # 图像和文本的特征提取器
-        self.image_patch_embed = self.image_encoder.patch_embed
-        self.image_cls_token = self.image_encoder.cls_token
-        self.image_pos_embed = self.image_encoder.pos_embed
-        self.image_pos_drop = self.image_encoder.pos_drop
-        self.image_blocks = self.image_encoder.blocks
-        self.image_norm = self.image_encoder.norm
+        print("image_dim:", self.image_dim, " text_dim: ", self.text_dim)
 
 
 
         # 初始提示参数
+        self.use_quality_prompt = use_quality_prompt
+        self.use_cross_modal_prompt = use_cross_modal_prompt
+        self.use_modality_generator = use_modality_generator
+        self.prompt_depth = prompt_depth
         self.image_prompt_len = image_prompt_len
         self.text_prompt_len = text_prompt_len
         self.image_init_prompt = nn.Parameter(torch.randn(1, image_prompt_len, self.image_dim))
@@ -248,7 +306,7 @@ class MultimodalPromptModel(nn.Module):
         # 融合和分类层
         fusion_input_dim = self.image_dim + self.text_dim + 4  # 基础特征 + 缺失类型
         if use_quality_prompt:
-            fusion_input_dim += 13  # 增加质量评分（2个基础分+3个详细评分）
+            fusion_input_dim += 13  # 增加质量评分（2个质量特征5+3个详细评分1）
 
         # 使用质量引导的特征融合替换跨模态提示
         if use_cross_modal_prompt:
@@ -285,10 +343,45 @@ class MultimodalPromptModel(nn.Module):
                     param.requires_grad = False
 
     def _prepare_attention_mask(self, attention_mask, input_shape):
-        # RoBERTa attention mask handling
-        extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+        """准备用于Transformer层的注意力掩码"""
+        # 扩展维度以创建4D掩码
+        # [batch_size, 1, 1, seq_length] 或 [batch_size, 1, seq_length, seq_length]
+        if attention_mask.dim() == 2:
+            extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+        else:
+            # 已经是扩展形式
+            extended_attention_mask = attention_mask
+
+        # 将掩码转换为Transformer所需的格式
+        # (1.0 表示被掩码的位置，0.0 表示有效位置)
         extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
+
         return extended_attention_mask
+
+    def _prepare_clip_attention_mask(self, attention_mask):
+        """
+        为CLIP视觉模型准备注意力掩码
+
+        Args:
+            attention_mask: 形状为[batch_size, seq_len]的掩码
+
+        Returns:
+            形状为[batch_size, 1, seq_len, seq_len]的掩码，适用于CLIP注意力层
+        """
+        batch_size, seq_length = attention_mask.shape
+
+        # 创建一个方形的掩码矩阵，形状为[batch_size, seq_len, seq_len]
+        # 其中第i行第j列表示token_i是否可以关注token_j
+        # 在CLIP中，每个token都可以关注所有token，所以我们用全1矩阵
+        causal_mask = torch.ones((batch_size, seq_length, seq_length), device=attention_mask.device)
+
+        # 增加一个维度，得到形状[batch_size, 1, seq_len, seq_len]
+        causal_mask = causal_mask.unsqueeze(1)
+
+        # CLIP中，0表示被掩码的位置（被忽略），非0表示有效的注意力位置
+        # 因此不需要像某些模型那样进行(1.0 - mask) * -10000.0的变换
+
+        return causal_mask
 
     def _extract_features(self, image, input_ids, attention_mask):
         """提取图像和文本的原始特征"""
@@ -298,16 +391,63 @@ class MultimodalPromptModel(nn.Module):
         # 处理图像特征 (如果存在)
         image_embed = None
         if image is not None:
-            image_embed = self.image_patch_embed(image)  # [B, N, D_img]
-            image_cls = self.image_cls_token.expand(batch_size, -1, -1)  # [B, 1, D_img]
-            image_embed = torch.cat((image_cls, image_embed), dim=1)  # [B, N+1, D_img]
-            image_embed = image_embed + self.image_pos_embed[:, :image_embed.size(1), :]
-            image_embed = self.image_pos_drop(image_embed)
+            if self.use_clip_encoders:
+                # 对于CLIP视觉模型，我们直接使用embeddings方法
+                # 避免使用forward方法，因为我们想要自己控制Transformer层
+                try:
+                    # 尝试直接获取embeddings输出
+                    if hasattr(self.image_encoder, 'embeddings'):
+                        image_embed = self.image_encoder.embeddings(pixel_values=image)
+                    else:
+                        # 回退方案：运行模型一次，但禁用注意力层
+                        with torch.no_grad():
+                            # 简化：只获取embeddings的输出
+                            vision_outputs = self.image_encoder(
+                                pixel_values=image,
+                                output_hidden_states=True,
+                                output_attentions=False,
+                                return_dict=True
+                            )
+                            # 使用第一个隐藏状态（embeddings的输出）
+                            image_embed = vision_outputs.hidden_states[0] if hasattr(vision_outputs,
+                                                                                     'hidden_states') else None
+
+                    # 如果仍然无法获取embeddings输出，打印错误
+                    if image_embed is None:
+                        print("WARNING: Unable to get proper embeddings from CLIP vision model.")
+                        # 创建一个随机嵌入作为后备
+                        image_embed = torch.randn(batch_size, 197, self.image_dim, device=device)
+                except Exception as e:
+                    print(f"Error extracting CLIP vision embeddings: {e}")
+                    # 创建一个随机嵌入作为后备
+                    image_embed = torch.randn(batch_size, 197, self.image_dim, device=device)
+            else:
+                # 标准ViT模型
+                image_embed = self.image_patch_embed(image)  # [B, N, D_img]
+                image_cls = self.image_cls_token.expand(batch_size, -1, -1)  # [B, 1, D_img]
+                image_embed = torch.cat((image_cls, image_embed), dim=1)  # [B, N+1, D_img]
+                image_embed = image_embed + self.image_pos_embed[:, :image_embed.size(1), :]
+                image_embed = self.image_pos_drop(image_embed)
 
         # 处理文本特征 (如果存在)
         text_embed = None
         if input_ids is not None:
-            text_embed = self.text_embeddings(input_ids)  # [B, L, D_txt]
+            if self.use_clip_encoders:
+                # 对于CLIP文本模型，尝试直接使用embeddings
+                try:
+                    if hasattr(self.text_encoder, 'embeddings'):
+                        text_embed = self.text_encoder.embeddings(input_ids)
+                    else:
+                        # 回退方案：使用text_model的embeddings
+                        text_embed = self.text_embeddings(input_ids)
+                except Exception as e:
+                    print(f"Error extracting CLIP text embeddings: {e}")
+                    # 创建一个随机嵌入作为后备
+                    seq_len = input_ids.size(1)
+                    text_embed = torch.randn(batch_size, seq_len, self.text_dim, device=device)
+            else:
+                # 标准文本模型
+                text_embed = self.text_embeddings(input_ids)  # [B, L, D_txt]
 
         return image_embed, text_embed
 
@@ -436,15 +576,11 @@ class MultimodalPromptModel(nn.Module):
                         else:  # 带batch维度 [1, token_count, dim]
                             reconstructed_features[mod][b] = sample_recon[mod].squeeze(0)
 
-        # # print(f"generated_features['image'].shape: {generated_features['image'].shape}")
-        # # print(f"image_embed.shape: {image_embed.shape}")
-        # # print(f"token_count: {token_count}")
-        #
         # # 使用生成的特征替换缺失的模态
         if is_image_missing.any() and generated_features['image'] is not None:
             # 如果image_embed为None，创建新的
             if image_embed is None:
-                patch_count = 256  # 调整为您的实际patch数量
+                patch_count = 196  # 调整为您的实际patch数量
                 image_embed = torch.zeros(batch_size, 1 + patch_count, self.image_dim, device=device)
 
             # 将生成的特征复制到适当的token位置
@@ -537,12 +673,31 @@ class MultimodalPromptModel(nn.Module):
         temp_txt = text_embed.clone()
 
         for i in range(2):  # 使用前两层获取初步特征
-            temp_img = self.image_blocks[i](temp_img)
+            # 修改处理CLIP视觉层的部分（在forward方法中）
+            if self.use_clip_encoders:
+                # CLIP视觉模型需要特殊处理
+                # 为CLIP层创建适当的注意力掩码
+                img_seq_len = temp_img.shape[1]
+                # 创建一个二维形状的掩码 [batch_size, seq_len]
+                img_attention_mask = torch.ones((batch_size, img_seq_len), device=device)
+                # 将掩码转换为CLIP注意力层期望的格式
+                # 将形状为[batch_size, seq_len]的掩码转换为[batch_size, 1, seq_len, seq_len]
+                extended_img_mask = self._prepare_clip_attention_mask(img_attention_mask)
+                # CLIP的视觉层需要attention_mask和causal_attention_mask
+                temp_img = self.image_blocks[i](
+                    hidden_states=temp_img,
+                    attention_mask=extended_img_mask,
+                    causal_attention_mask=None,
+                    output_attentions=False
+                )[0]
+            else:
+                # 标准ViT层
+                temp_img = self.image_blocks[i](temp_img)
 
             # 处理文本的注意力掩码
             extended_attention_mask = self._prepare_attention_mask(attention_mask, text_embed.shape[1])
 
-            if self.encoder_type == 'clip':
+            if self.encoder_type == 'clip' or self.use_clip_encoders:
                 temp_txt = self.text_blocks[i](
                     temp_txt,
                     attention_mask=extended_attention_mask,
@@ -554,7 +709,6 @@ class MultimodalPromptModel(nn.Module):
                     temp_txt,
                     attention_mask=extended_attention_mask
                 )[0]
-
 
         # 计算模态质量（如果启用）
         quality_scores = None
@@ -578,7 +732,26 @@ class MultimodalPromptModel(nn.Module):
         for i in range(self.prompt_depth):
             # 图像：拼接提示并处理
             img_with_prompt = torch.cat([image_prompt, image_embed], dim=1)
-            img_with_prompt = self.image_blocks[i](img_with_prompt)
+            # 在forward方法中，修改两处处理CLIP视觉层的代码（i < prompt_depth的情况）
+            if self.use_clip_encoders:
+                # CLIP视觉模型需要特殊处理
+                # 为CLIP层创建适当的注意力掩码
+                img_seq_len = img_with_prompt.shape[1]
+
+                # 创建掩码并扩展维度
+                img_attention_mask = torch.ones((batch_size, img_seq_len), device=device)
+                extended_img_mask = self._prepare_clip_attention_mask(img_attention_mask)
+
+                # CLIP的视觉层需要attention_mask和causal_attention_mask
+                img_with_prompt = self.image_blocks[i](
+                    hidden_states=img_with_prompt,
+                    attention_mask=extended_img_mask,
+                    causal_attention_mask=None,
+                    output_attentions=False
+                )[0]
+            else:
+                # 标准ViT层
+                img_with_prompt = self.image_blocks[i](img_with_prompt)
             image_prompt, image_embed = img_with_prompt[:, :self.image_prompt_len], img_with_prompt[:,
                                                                                     self.image_prompt_len:]
 
@@ -616,7 +789,24 @@ class MultimodalPromptModel(nn.Module):
 
         # 继续处理剩余的Transformer层
         for i in range(self.prompt_depth, len(self.image_blocks)):
-            image_embed = self.image_blocks[i](image_embed)
+            if self.use_clip_encoders:
+                # CLIP视觉模型需要特殊处理
+                img_seq_len = image_embed.shape[1]
+
+                # 创建掩码并扩展维度
+                img_attention_mask = torch.ones((batch_size, img_seq_len), device=device)
+                extended_img_mask = self._prepare_clip_attention_mask(img_attention_mask)
+
+                # CLIP的视觉层需要attention_mask和causal_attention_mask
+                image_embed = self.image_blocks[i](
+                    hidden_states=image_embed,
+                    attention_mask=extended_img_mask,
+                    causal_attention_mask=None,
+                    output_attentions=False
+                )[0]
+            else:
+                # 标准ViT层
+                image_embed = self.image_blocks[i](image_embed)
 
             extended_attention_mask = self._prepare_attention_mask(attention_mask, text_embed.shape[1])
             if self.encoder_type == 'clip':
@@ -642,11 +832,22 @@ class MultimodalPromptModel(nn.Module):
         image_feat = image_embed[:, 0]  # [B, D_img]
         text_feat = text_embed[:, 0]  # [B, D_txt]
 
+        # 在应用质量引导的特征融合之前，打印维度信息
+        # print(f"DEBUG - Feature dimensions before fusion:")
+        # print(f"  image_feat shape: {image_feat.shape}")
+        # print(f"  text_feat shape: {text_feat.shape}")
+        # if quality_scores is not None:
+        #     print(f"  quality_scores image: {quality_scores['image']['final_score'].shape}")
+        #     print(f"  quality_scores text: {quality_scores['text']['final_score'].shape}")
+        #     print(f"  quality_scores consistency: {quality_scores['cross_consistency'].shape}")
+
         # 质量引导的特征融合（如果启用）
         fusion_weights = None
         quality_guided_feat = None
         if self.use_quality_prompt and self.use_cross_modal_prompt:
+            # print(f"  Calling feature_fusion with image_feat: {image_feat.shape}, text_feat: {text_feat.shape}")
             quality_guided_feat, fusion_weights = self.feature_fusion(image_feat, text_feat, quality_scores)
+            # print(f"  After fusion: quality_guided_feat: {quality_guided_feat.shape}, fusion_weights: {fusion_weights.shape}")
 
         # Prepare features for concatenation
         features_to_concat = [image_feat, text_feat, F.one_hot(missing_type, num_classes=4).float()]
@@ -687,6 +888,8 @@ class MultimodalPromptModel(nn.Module):
         # return logits if not self.training else (logits, additional_info)
 
 
+
+
 # Create a factory function to initialize the model
 # 修改create_multimodal_prompt_model函数以支持不同的image_size和patch_size
 def create_multimodal_prompt_model(
@@ -706,8 +909,44 @@ def create_multimodal_prompt_model(
         max_length=512,
         encoder_type='clip'
 ):
-    # 从配置名称中提取实际的模型名称和patch_size
-    if "patch" in image_model_name:
+    # 检查是否两个模型名称相同且包含"clip"关键字
+    use_clip_encoders = False
+
+    # CLIP模式 - 当图像和文本模型名称相同且包含"clip"
+    if "clip" in image_model_name.lower() and image_model_name == text_model_name:
+        use_clip_encoders = True
+        print(f"Detected matching CLIP model names. Using unified CLIP encoders: {image_model_name}")
+
+        from transformers import CLIPVisionModel, CLIPTextModel
+
+        # 加载CLIP模型组件
+        vision_encoder = CLIPVisionModel.from_pretrained(image_model_name)
+        text_encoder = CLIPTextModel.from_pretrained(text_model_name)
+
+        print("CLIP vision model:", vision_encoder.__class__.__name__)
+        print("CLIP text model:", text_encoder.__class__.__name__)
+
+        # 创建并返回使用CLIP编码器的模型
+        return MultimodalPromptModel(
+            image_encoder_backbone=vision_encoder,
+            text_encoder_backbone=text_encoder,
+            image_prompt_len=image_prompt_len,
+            text_prompt_len=text_prompt_len,
+            prompt_depth=prompt_depth,
+            fusion_dim=fusion_dim,
+            num_classes=num_classes,
+            freeze_image_encoder=freeze_image_encoder,
+            freeze_text_encoder=freeze_text_encoder,
+            use_quality_prompt=use_quality_prompt,
+            use_cross_modal_prompt=use_cross_modal_prompt,
+            max_length=max_length,
+            encoder_type=encoder_type,
+            use_clip_encoders=True
+        )
+    # 标准模式 - 不同的编码器
+    # 初始化图像编码器骨干网络
+    if "patch" in image_model_name and not "clip" in image_model_name.lower():
+        # 处理标准ViT模型
         base_name_parts = image_model_name.split("_")
         model_type = base_name_parts[0]  # vit
         model_size = base_name_parts[1]  # base
@@ -715,17 +954,33 @@ def create_multimodal_prompt_model(
 
         # 创建新的模型名称
         new_model_name = f"{model_type}_{model_size}_patch{patch_size}_{image_size}"
+        image_encoder = create_model(new_model_name, pretrained=True, num_classes=0)
+    elif "clip" in image_model_name.lower() and not use_clip_encoders:
+        # 单独使用CLIP视觉模型
+        from transformers import CLIPVisionModel
+        image_encoder = CLIPVisionModel.from_pretrained(image_model_name)
     else:
-        # 如果名称格式不符合预期，使用原始名称
-        new_model_name = image_model_name
+        # 其他类型的图像模型
+        image_encoder = create_model(image_model_name, pretrained=True, num_classes=0)
 
-    # 初始化图像编码器骨干网络
-    vit_base = create_model(new_model_name, pretrained=True, num_classes=0)
+    # 初始化文本编码器
+    if "clip" in text_model_name.lower() and not use_clip_encoders:
+        # 单独使用CLIP文本模型
+        from transformers import CLIPTextModel
+        text_encoder = CLIPTextModel.from_pretrained(text_model_name)
+    elif "roberta" in text_model_name.lower():
+        # RoBERTa模型
+        from transformers import RobertaModel
+        text_encoder = RobertaModel.from_pretrained(text_model_name)
+    else:
+        # 默认使用CLIPTextModel
+        from transformers import CLIPTextModel
+        text_encoder = CLIPTextModel.from_pretrained(text_model_name)
 
     # 创建并返回完整的多模态模型
     return MultimodalPromptModel(
-        image_encoder_backbone=vit_base,
-        text_encoder_name=text_model_name,
+        image_encoder_backbone=image_encoder,
+        text_encoder_backbone=text_encoder,
         image_prompt_len=image_prompt_len,
         text_prompt_len=text_prompt_len,
         prompt_depth=prompt_depth,
@@ -736,5 +991,6 @@ def create_multimodal_prompt_model(
         use_quality_prompt=use_quality_prompt,
         use_cross_modal_prompt=use_cross_modal_prompt,
         max_length=max_length,
-        encoder_type=encoder_type
+        encoder_type=encoder_type,
+        use_clip_encoders=use_clip_encoders
     )

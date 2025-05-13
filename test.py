@@ -1,18 +1,41 @@
 import torch
 import yaml
+from transformers import RobertaTokenizer
+
+from datamodules.UPMCFood101DataModule import UPMCFood101DataModule
 from trainer import Trainer
 from datamodules.MmimdbDataModule import mmimdbDataModule
 from models.multimodal_model import create_multimodal_prompt_model
 
 # 1. 加载配置
 if __name__ == '__main__':
-    config_path = "configs/mmimdb.yaml"
+    # config_path = "configs/mmimdb.yaml"
+    config_path = "configs/food101.yaml"
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
 
     # 2. 设置数据模块
-    datamodule = mmimdbDataModule(
-        data_dir=config.get("data_dir", "./data/mmimdb"),
+    # datamodule = mmimdbDataModule(
+    #     data_dir=config.get("data_dir", "./data/mmimdb"),
+    #     batch_size=config.get("batch_size", 32),
+    #     num_workers=config.get("num_workers", 4),
+    #     missing_strategy=config.get("missing_strategy", "none"),  # 直接读缺失策略
+    #     missing_prob=config.get("initial_missing_prob", config.get("missing_prob", 0.7)),
+    #     # Use initial value if available
+    #     val_missing_strategy=config.get("val_missing_strategy", "none"),  # 验证集策略
+    #     val_missing_prob=config.get("val_missing_prob", 0.0),  # 验证集缺失率
+    #     test_missing_strategy=config.get("test_missing_strategy", "none"),  # 测试集策略
+    #     test_missing_prob=config.get("test_missing_prob", 0.0),  # 测试集缺失率
+    #     max_length=config.get("max_length", 77),
+    #     image_size=config.get("image_size", 224),
+    #     patch_size=config.get("patch_size", 16),
+    #     seed=config.get("seed", 42)
+    # )
+    tokenizer = RobertaTokenizer.from_pretrained("roberta-base")
+    # num_classes = 23
+    datamodule = UPMCFood101DataModule(
+        data_dir=config.get("data_dir", "./data/food101"),
+        tokenizer=tokenizer,
         batch_size=config.get("batch_size", 32),
         num_workers=config.get("num_workers", 4),
         missing_strategy=config.get("missing_strategy", "none"),  # 直接读缺失策略
@@ -27,7 +50,7 @@ if __name__ == '__main__':
         patch_size=config.get("patch_size", 16),
         seed=config.get("seed", 42)
     )
-    num_classes = 23
+    num_classes = 101
     datamodule.setup()
     test_loader = datamodule.test_dataloader()  # 获取测试数据加载器
     train_loader = datamodule.train_dataloader()
@@ -45,14 +68,14 @@ if __name__ == '__main__':
         freeze_text_encoder=config.get("freeze_text_encoder", False),
         use_quality_prompt=config.get("use_quality_prompt", False),
         use_cross_modal_prompt=config.get("use_cross_modal_prompt", False),
-        max_length=config.get("max_length", 512)
+        max_length=config.get("max_length", 512),
+        encoder_type=config.get("encoder_type", "clip")
     )
 
     # 4. 初始化Trainer
     trainer = Trainer(model, train_loader, val_loader, config=config)  # 测试时可以不需要训练和验证数据加载器
-
     # 5. 加载最佳模型并运行测试
-    best_model_path = "experiments\mmimdb_patch16_test_0503_3_reduce_guonihe\checkpoints\\best_model.pt"  # 替换为你的模型路径
+    best_model_path = "experiments\\food101_0508_roberta_test01_CrossmodalAttentionFusion\\checkpoints\\best_model.pt"  # 替换为你的模型路径
     test_results = trainer.test(test_loader=test_loader, model_path=best_model_path)
 
     # 6. 打印测试结果

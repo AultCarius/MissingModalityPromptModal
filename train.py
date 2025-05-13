@@ -6,6 +6,7 @@ from transformers import CLIPTokenizer, RobertaTokenizer
 
 from trainer import Trainer
 from datamodules.Food101DataModule import Food101DataModule
+from datamodules.UPMCFood101DataModule import UPMCFood101DataModule
 from datamodules.MmimdbDataModule import mmimdbDataModule
 from models.multimodal_model import create_multimodal_prompt_model
 
@@ -34,11 +35,21 @@ if __name__ == '__main__':
 
     # Set up data module
     if config.get("dataset", "mmimdb") == "food101":
-        datamodule = Food101DataModule(
+        datamodule = UPMCFood101DataModule(
             data_dir=config.get("data_dir", "./data/food101"),
+            tokenizer=tokenizer,
             batch_size=config.get("batch_size", 32),
             num_workers=config.get("num_workers", 4),
-            image_size=config.get("image_size", 224)
+            missing_strategy=config.get("missing_strategy", "none"),  # 直接读缺失策略
+            missing_prob=config.get("initial_missing_prob", config.get("missing_prob", 0.7)),  # Use initial value if available
+            val_missing_strategy=config.get("val_missing_strategy", "none"),  # 验证集策略
+            val_missing_prob=config.get("val_missing_prob", 0.0),  # 验证集缺失率
+            test_missing_strategy=config.get("test_missing_strategy", "none"),  # 测试集策略
+            test_missing_prob=config.get("test_missing_prob", 0.0),             # 测试集缺失率
+            max_length=config.get("max_length", 77),
+            image_size=config.get("image_size", 224),
+            patch_size=config.get("patch_size", 16),
+            seed=config.get("seed",42)
         )
         num_classes = 101
     else:
@@ -66,7 +77,7 @@ if __name__ == '__main__':
     if isinstance(datamodule, mmimdbDataModule):
         config["metrics"] = config.get("metrics")
         config["primary_metric"] = config.get("primary_metric")  # MMIMDB主要使用micro_f1作为评估指标
-    elif isinstance(datamodule, Food101DataModule):
+    elif isinstance(datamodule, UPMCFood101DataModule):
         config["metrics"] = config.get("metrics")
         config["primary_metric"] = config.get("primary_metric")  # Food101使用accuracy
     else:
