@@ -205,6 +205,29 @@ class CycleGenerationModel(nn.Module):
         self.generator = CrossModalGenerator(modality_dims, fusion_hidden_dim)
         self.reconstructor = ModReconstructor(modality_dims)
 
+        # 创建更健壮的判别器
+        self.discriminators = nn.ModuleDict()
+        for mod_name, dim in modality_dims.items():
+            # 使用更多层和Dropout以增强稳定性
+            disc = nn.Sequential(
+                nn.LayerNorm(dim),  # 添加归一化
+                nn.Linear(dim, 128),
+                nn.LeakyReLU(0.2),
+                nn.Dropout(0.3),
+                nn.Linear(128, 64),
+                nn.LeakyReLU(0.2),
+                nn.Dropout(0.3),
+                nn.Linear(64, 1),
+                nn.Sigmoid()
+            )
+            self.discriminators[mod_name] = disc
+
+        # 在训练开始时打印判别器结构
+        print("初始化判别器:")
+        for mod_name, disc in self.discriminators.items():
+            print(f"模态: {mod_name}, 维度: {modality_dims[mod_name]}")
+            print(f"判别器结构: {disc}")
+
     def forward(self, features, missing_type):
         """
         前向传播，针对单个样本或批量样本进行模态生成和重建
@@ -222,17 +245,18 @@ class CycleGenerationModel(nn.Module):
         if not batch_mode:
             # 单样本处理
             missing_type = int(missing_type)
-            generated , reconstructed= self._generate_for_sample(features, missing_type)
-            # reconstructed = self.reconstructor(generated)
-            return generated, reconstructed
+            generated, reconstructed = self._generate_for_sample(features, missing_type)
+            cycle_features = self._apply_cycle_consistency(generated, missing_type)
+            return generated, reconstructed, cycle_features
         else:
-            # 批量处理，但逐个样本处理以避免批处理问题
+            # 批量处理
             batch_size = missing_type.size(0)
             device = missing_type.device
 
-            # 初始化输出
-            generated_features = {mod: None for mod in self.modality_dims.keys()}
-            reconstructed_features = {mod: None for mod in self.modality_dims.keys()}
+            # 初始化输出字典
+            generated_features = {mod: [] for mod in self.modality_dims.keys()}
+            reconstructed_features = {mod: [] for mod in self.modality_dims.keys()}
+            cycle_features = {mod: [] for mod in self.modality_dims.keys()}
 
             # 逐个样本处理
             for b in range(batch_size):
@@ -241,34 +265,244 @@ class CycleGenerationModel(nn.Module):
                 for mod in features:
                     if features[mod] is not None:
                         # 确保我们只取这个样本的特征
-                        sample_features[mod] = features[mod][b:b + 1]
+                        if features[mod].dim() == 3:  # [B, tokens, dim]
+                            sample_features[mod] = features[mod][b:b + 1]
+                        elif features[mod].dim() == 2:  # [B, dim]
+                            sample_features[mod] = features[mod][b:b + 1]
+                        else:
+                            # 处理其他可能的维度情况
+                            sample_features[mod] = features[mod][b:b + 1]
                     else:
                         sample_features[mod] = None
 
-                # 生成当前样本的特征
+                # 获取当前样本的缺失类型
                 mt = missing_type[b].item()
+
+                # 为当前样本生成特征
                 gen_sample, recon_sample = self._generate_for_sample(sample_features, mt)
 
-                # 合并到批结果中
-                for mod in gen_sample:
-                    if gen_sample[mod] is not None:
-                        if generated_features[mod] is None:
-                            # 首次分配空间
-                            generated_features[mod] = torch.zeros(
-                                batch_size, self.modality_dims[mod], device=device
-                            )
-                        generated_features[mod][b] = gen_sample[mod]
+                # 应用循环一致性
+                cycle_sample = self._apply_cycle_consistency(gen_sample, mt)
 
-                for mod in recon_sample:
-                    if recon_sample[mod] is not None:
-                        if reconstructed_features[mod] is None:
-                            # 首次分配空间
-                            reconstructed_features[mod] = torch.zeros(
-                                batch_size, self.modality_dims[mod], device=device
-                            )
-                        reconstructed_features[mod][b] = recon_sample[mod]
+                # 将结果添加到列表中
+                for mod in self.modality_dims.keys():
+                    # 处理生成的特征
+                    if mod in gen_sample and gen_sample[mod] is not None:
+                        generated_features[mod].append(gen_sample[mod])
+                    else:
+                        # 如果没有生成该模态，添加None占位符
+                        generated_features[mod].append(None)
 
-            return generated_features, reconstructed_features
+                    # 处理重建的特征
+                    if mod in recon_sample and recon_sample[mod] is not None:
+                        reconstructed_features[mod].append(recon_sample[mod])
+                    else:
+                        reconstructed_features[mod].append(None)
+
+                    # 处理循环一致性特征
+                    if mod in cycle_sample and cycle_sample[mod] is not None:
+                        cycle_features[mod].append(cycle_sample[mod])
+                    else:
+                        cycle_features[mod].append(None)
+
+            # 处理合并特征列表
+            for mod in self.modality_dims.keys():
+                # 检查是否有任何非None值
+                if any(x is not None for x in generated_features[mod]):
+                    # 提取形状信息用于创建张量
+                    non_none_samples = [x for x in generated_features[mod] if x is not None]
+                    if non_none_samples:
+                        first_sample = non_none_samples[0]
+
+                        # 根据第一个样本的维度创建适当的容器
+                        if first_sample.dim() == 1:  # [dim]
+                            gen_tensor = torch.zeros(batch_size, first_sample.size(0), device=device)
+                        elif first_sample.dim() == 2:  # [tokens, dim]
+                            gen_tensor = torch.zeros(batch_size, first_sample.size(0), first_sample.size(1),
+                                                     device=device)
+                        else:  # [1, tokens, dim] 或其他
+                            # 挤压批次维度 ([1, tokens, dim] -> [tokens, dim])
+                            first_sample = first_sample.squeeze(0)
+                            if first_sample.dim() == 1:
+                                gen_tensor = torch.zeros(batch_size, first_sample.size(0), device=device)
+                            else:
+                                gen_tensor = torch.zeros(batch_size, first_sample.size(0), first_sample.size(1),
+                                                         device=device)
+
+                        # 填充张量
+                        for i, feat in enumerate(generated_features[mod]):
+                            if feat is not None:
+                                if feat.dim() > 2:  # [1, tokens, dim]
+                                    feat = feat.squeeze(0)  # 移除批次维度
+                                gen_tensor[i] = feat
+
+                        generated_features[mod] = gen_tensor
+                    else:
+                        generated_features[mod] = None
+                else:
+                    generated_features[mod] = None
+
+                # 对重建特征做同样的处理
+                if any(x is not None for x in reconstructed_features[mod]):
+                    non_none_samples = [x for x in reconstructed_features[mod] if x is not None]
+                    if non_none_samples:
+                        first_sample = non_none_samples[0]
+
+                        if first_sample.dim() == 1:  # [dim]
+                            recon_tensor = torch.zeros(batch_size, first_sample.size(0), device=device)
+                        elif first_sample.dim() == 2:  # [tokens, dim]
+                            recon_tensor = torch.zeros(batch_size, first_sample.size(0), first_sample.size(1),
+                                                       device=device)
+                        else:  # [1, tokens, dim] 或其他
+                            first_sample = first_sample.squeeze(0)
+                            if first_sample.dim() == 1:
+                                recon_tensor = torch.zeros(batch_size, first_sample.size(0), device=device)
+                            else:
+                                recon_tensor = torch.zeros(batch_size, first_sample.size(0), first_sample.size(1),
+                                                           device=device)
+
+                        for i, feat in enumerate(reconstructed_features[mod]):
+                            if feat is not None:
+                                if feat.dim() > 2:  # [1, tokens, dim]
+                                    feat = feat.squeeze(0)  # 移除批次维度
+                                recon_tensor[i] = feat
+
+                        reconstructed_features[mod] = recon_tensor
+                    else:
+                        reconstructed_features[mod] = None
+                else:
+                    reconstructed_features[mod] = None
+
+                # 对循环一致性特征做同样的处理
+                if any(x is not None for x in cycle_features[mod]):
+                    non_none_samples = [x for x in cycle_features[mod] if x is not None]
+                    if non_none_samples:
+                        first_sample = non_none_samples[0]
+
+                        if first_sample.dim() == 1:  # [dim]
+                            cycle_tensor = torch.zeros(batch_size, first_sample.size(0), device=device)
+                        elif first_sample.dim() == 2:  # [tokens, dim]
+                            cycle_tensor = torch.zeros(batch_size, first_sample.size(0), first_sample.size(1),
+                                                       device=device)
+                        else:  # [1, tokens, dim] 或其他
+                            first_sample = first_sample.squeeze(0)
+                            if first_sample.dim() == 1:
+                                cycle_tensor = torch.zeros(batch_size, first_sample.size(0), device=device)
+                            else:
+                                cycle_tensor = torch.zeros(batch_size, first_sample.size(0), first_sample.size(1),
+                                                           device=device)
+
+                        for i, feat in enumerate(cycle_features[mod]):
+                            if feat is not None:
+                                if feat.dim() > 2:  # [1, tokens, dim]
+                                    feat = feat.squeeze(0)  # 移除批次维度
+                                cycle_tensor[i] = feat
+
+                        cycle_features[mod] = cycle_tensor
+                    else:
+                        cycle_features[mod] = None
+                else:
+                    cycle_features[mod] = None
+
+            return generated_features, reconstructed_features, cycle_features
+
+    def _apply_cycle_consistency(self, features, missing_type):
+        """应用循环一致性，为每个模态创建循环重建版本"""
+        cycle_features = {mod: None for mod in self.modality_dims.keys()}
+
+        # 对于图像缺失的情况，使用生成的图像生成文本，然后与原始文本比较
+        if missing_type == 1:  # 图像缺失
+            if features['image'] is not None and features['text'] is not None:
+                # 使用生成的图像生成文本
+                img_feat = features['image']  # 已经是生成的图像
+                encoded_img = self.generator.encode(img_feat, "image")
+                cycle_text = self.generator.generators["image_to_text"](encoded_img)
+                cycle_features['text'] = cycle_text
+
+        # 对于文本缺失的情况，使用生成的文本生成图像，然后与原始图像比较
+        elif missing_type == 2:  # 文本缺失
+            if features['image'] is not None and features['text'] is not None:
+                # 使用生成的文本生成图像
+                txt_feat = features['text']  # 已经是生成的文本
+                encoded_txt = self.generator.encode(txt_feat, "text")
+                cycle_image = self.generator.generators["text_to_image"](encoded_txt)
+                cycle_features['image'] = cycle_image
+
+        # 对于无缺失的情况，同时执行两个方向的循环生成
+        elif missing_type == 0:  # 无缺失
+            if features['image'] is not None and features['text'] is not None:
+                # 图像→文本→图像
+                img_feat = features['image']
+                encoded_img = self.generator.encode(img_feat, "image")
+                gen_text = self.generator.generators["image_to_text"](encoded_img)
+                encoded_gen_text = self.generator.encode(gen_text, "text")
+                cycle_image = self.generator.generators["text_to_image"](encoded_gen_text)
+                cycle_features['image'] = cycle_image
+
+                # 文本→图像→文本
+                txt_feat = features['text']
+                encoded_txt = self.generator.encode(txt_feat, "text")
+                gen_image = self.generator.generators["text_to_image"](encoded_txt)
+                encoded_gen_image = self.generator.encode(gen_image, "image")
+                cycle_text = self.generator.generators["image_to_text"](encoded_gen_image)
+                cycle_features['text'] = cycle_text
+
+        return cycle_features
+
+    def discriminate(self, features):
+        """使用判别器区分特征是否是真实的"""
+        results = {}
+        for mod, feat in features.items():
+            if feat is not None:
+                try:
+                    # 打印输入形状以便调试
+                    # print(f"判别器输入 ({mod}) 形状: {feat.shape}, 类型: {feat.dtype}")
+
+                    # 确保是浮点型张量
+                    if not feat.is_floating_point():
+                        feat = feat.float()
+
+                    # 创建输入特征的副本，但保留梯度
+                    feat_clone = feat.clone()  # 不使用detach()
+
+                    # 根据维度进行适当处理
+                    if feat_clone.dim() > 2:  # [batch, tokens, dim]
+                        # print(f"  处理多token特征: {feat_clone.shape}")
+                        # 对多token特征计算平均值
+                        feat_clone = feat_clone.mean(dim=1)  # [batch, dim]
+
+                    # 确保是2D张量 [batch, features]
+                    if feat_clone.dim() == 1:  # [dim]
+                        # print(f"  添加批次维度: {feat_clone.shape} -> [{feat_clone.shape[0]}, 1]")
+                        feat_clone = feat_clone.unsqueeze(0)  # [1, dim]
+
+                    # 检查判别器并打印维度信息
+                    if mod not in self.discriminators:
+                        print(f"  错误: 模态 '{mod}' 没有对应的判别器")
+                        continue
+
+                    # 应用判别器
+                    disc_output = self.discriminators[mod](feat_clone)
+                    results[mod] = disc_output
+                    # print(f"  判别器输出: {disc_output.shape}, 均值: {disc_output.mean().item():.4f}")
+                    # print(f"  判别器输出是否需要梯度: {disc_output.requires_grad}")
+
+                except Exception as e:
+                    print(f"判别器错误 ({mod}): {str(e)}")
+                    import traceback
+                    traceback.print_exc()
+                    # 创建一个默认结果并指定requires_grad=True
+                    batch_size = 1
+                    if feat is not None:
+                        if feat.dim() > 0:
+                            batch_size = feat.size(0) if feat.dim() > 1 else 1
+                    default_tensor = torch.ones(batch_size, 1, device=feat.device if feat is not None else next(
+                        self.parameters()).device) * 0.5
+                    default_tensor.requires_grad_(True)  # 确保需要梯度
+                    results[mod] = default_tensor
+                    print(f"  使用默认输出: {results[mod].shape}")
+
+        return results
 
     def _generate_for_sample(self, features, missing_type):
         """针对单个样本生成缺失模态特征"""
@@ -321,3 +555,4 @@ class CycleGenerationModel(nn.Module):
             generated["text"] = generated["text"] + torch.randn_like(generated["text"]) * 0.01
 
         return generated, self.reconstructor(generated)
+

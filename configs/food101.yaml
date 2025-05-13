@@ -1,5 +1,5 @@
 # 实验配置
-experiment_name: "food101_0509_clip_nocurrimlearn_mr0.7"
+experiment_name: "food101_clip_updategentrain_0513_1546"
 
 # Model Configuration
 image_model_name: "vit_base_patch16_224"

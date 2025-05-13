@@ -1,5 +1,5 @@
 # 实验配置
-experiment_name: "mmimdb_allclip"
+experiment_name: "mmimdb_allclip_0512"
 
 # Model Configuration
 image_model_name: "openai/clip-vit-base-patch16"

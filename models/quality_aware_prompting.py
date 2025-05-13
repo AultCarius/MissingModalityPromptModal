@@ -367,26 +367,27 @@ class ImprovedModalityQualityEstimator(nn.Module):
             self.update_reference_statistics(image_feat, text_feat, is_image_missing, is_text_missing)
 
         return results
+
+
 class EnhancedModalityQualityEstimator(nn.Module):
     def __init__(self, image_dim, text_dim, hidden_dim=256):
         super().__init__()
 
-        # 图像模态质量评估器
+        # 特征质量评估器
         self.image_quality = nn.Sequential(
             nn.LayerNorm(image_dim),
             nn.Linear(image_dim, hidden_dim),
             nn.GELU(),
             nn.Dropout(0.1),
-            nn.Linear(hidden_dim, 5)  # [清晰度、完整性、信息量、置信度、细节]
+            nn.Linear(hidden_dim, 5)  # [clarity, completeness, informativeness, confidence, detail]
         )
 
-        # 文本模态质量评估器
         self.text_quality = nn.Sequential(
             nn.LayerNorm(text_dim),
             nn.Linear(text_dim, hidden_dim),
             nn.GELU(),
             nn.Dropout(0.1),
-            nn.Linear(hidden_dim, 5)  # [连贯性、相关性、信息量、置信度、细节]
+            nn.Linear(hidden_dim, 5)  # [coherence, relevance, informativeness, confidence, detail]
         )
 
         # 跨模态一致性评估器
@@ -394,32 +395,25 @@ class EnhancedModalityQualityEstimator(nn.Module):
             nn.Linear(image_dim + text_dim, hidden_dim),
             nn.GELU(),
             nn.Dropout(0.1),
-            nn.Linear(hidden_dim, 3)  # [语义一致性、结构一致性、上下文一致性]
+            nn.Linear(hidden_dim, 3)  # [semantic_alignment, structural_alignment, contextual_alignment]
         )
 
-        # 可学习的参考特征统计量（用于标准化）
+        # 参考样本统计数据 - 用于特征归一化
         self.register_buffer('image_mean', torch.zeros(1, image_dim))
         self.register_buffer('image_std', torch.ones(1, image_dim))
         self.register_buffer('text_mean', torch.zeros(1, text_dim))
         self.register_buffer('text_std', torch.ones(1, text_dim))
 
-        # 可学习的模态质量维度权重
+        # 可学习的重要性权重
         self.image_weights = nn.Parameter(torch.ones(5) / 5)
         self.text_weights = nn.Parameter(torch.ones(5) / 5)
         self.consistency_weights = nn.Parameter(torch.ones(3) / 3)
 
-        # 生成质量预测器（估计生成图像和文本的可信度）
-        self.generation_quality = nn.Sequential(
-            nn.Linear(image_dim + text_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, 2)  # [图像置信度，文本置信度]
-        )
-
-        # 模态融合时的一致性权重（可学习）
-        self.fusion_weight = nn.Parameter(torch.tensor([0.5]))  # 控制单模态质量与跨模态一致性的平衡
+        # 质量预测校准因子
+        self.quality_calibration = nn.Parameter(torch.tensor([0.5, 0.5]))
 
     def update_reference_statistics(self, image_feats, text_feats):
-        """更新参考统计量（训练阶段调用，用于标准化）"""
+        """更新参考统计数据用于标准化(在训练期间调用)"""
         if image_feats is not None and len(image_feats) > 0:
             with torch.no_grad():
                 self.image_mean = image_feats.mean(0, keepdim=True).detach()
@@ -431,7 +425,7 @@ class EnhancedModalityQualityEstimator(nn.Module):
                 self.text_std = text_feats.std(0, keepdim=True).detach().clamp(min=1e-6)
 
     def normalize_features(self, image_feats, text_feats):
-        """使用存储的统计量对特征进行标准化"""
+        """使用存储的统计数据标准化特征"""
         norm_img_feats = None
         if image_feats is not None:
             norm_img_feats = (image_feats - self.image_mean) / self.image_std
@@ -443,23 +437,25 @@ class EnhancedModalityQualityEstimator(nn.Module):
         return norm_img_feats, norm_txt_feats
 
     def forward(self, image_feat, text_feat, missing_type=None):
-        # 获取批大小和设备信息
+        """
+        前向传播函数
+
+        Args:
+            image_feat: 图像特征 [B, D_img]
+            text_feat: 文本特征 [B, D_txt]
+            missing_type: 缺失类型张量 (none=0, image=1, text=2, both=3)
+
+        Returns:
+            包含质量评估结果的字典
+        """
         batch_size = max(image_feat.size(0) if image_feat is not None else 0,
                          text_feat.size(0) if text_feat is not None else 0)
         device = image_feat.device if image_feat is not None else text_feat.device
 
-        # 判断哪些模态为生成（缺失）模态
-        if missing_type is not None:
-            is_image_missing = (missing_type == 1) | (missing_type == 3)
-            is_text_missing = (missing_type == 2) | (missing_type == 3)
-        else:
-            is_image_missing = torch.zeros(batch_size, dtype=torch.bool, device=device)
-            is_text_missing = torch.zeros(batch_size, dtype=torch.bool, device=device)
-
-        # 对图像和文本特征进行标准化，提高质量估计稳定性
+        # 标准化特征以获得更稳定的质量评估
         norm_img, norm_txt = self.normalize_features(image_feat, text_feat)
 
-        # 初始化输出结果结构
+        # 初始化结果
         results = {
             'image': {
                 'quality': torch.zeros(batch_size, 5, device=device),
@@ -474,32 +470,23 @@ class EnhancedModalityQualityEstimator(nn.Module):
 
         # 图像质量评估
         if norm_img is not None:
+            # 获取质量维度
             img_quality = self.image_quality(norm_img)
 
-            # 对生成特征打折惩罚
-            if is_image_missing.any():
-                conf_mask = torch.ones(batch_size, 1, device=device)
-                conf_mask[is_image_missing] = 0.7  # 生成图像的得分降低
-                img_quality = img_quality * conf_mask
-
+            # 使用学习到的权重计算最终分数
             img_weights = F.softmax(self.image_weights, dim=0)
             img_final = torch.sigmoid(torch.sum(img_quality * img_weights, dim=1, keepdim=True))
 
             results['image']['quality'] = img_quality
             results['image']['final_score'] = img_final
         else:
-            # 缺失图像模态时设定为较低分数
+            # 缺失模态的默认低分
             results['image']['quality'] = torch.full((batch_size, 5), -1.0, device=device)
             results['image']['final_score'] = torch.full((batch_size, 1), 0.1, device=device)
 
-        # 文本质量评估（同上）
+        # 文本质量评估(类似方法)
         if norm_txt is not None:
             txt_quality = self.text_quality(norm_txt)
-
-            if is_text_missing.any():
-                conf_mask = torch.ones(batch_size, 1, device=device)
-                conf_mask[is_text_missing] = 0.7
-                txt_quality = txt_quality * conf_mask
 
             txt_weights = F.softmax(self.text_weights, dim=0)
             txt_final = torch.sigmoid(torch.sum(txt_quality * txt_weights, dim=1, keepdim=True))
@@ -515,152 +502,136 @@ class EnhancedModalityQualityEstimator(nn.Module):
             concat_feat = torch.cat([norm_img, norm_txt], dim=1)
             consistency_dims = self.cross_consistency(concat_feat)
 
-            # 处理生成模态影响
-            if is_image_missing.any() or is_text_missing.any():
-                both_generated = is_image_missing & is_text_missing
-                one_generated = (is_image_missing | is_text_missing) & ~both_generated
-
-                conf_mask = torch.ones(batch_size, 1, device=device)
-                conf_mask[one_generated] = 0.7
-                conf_mask[both_generated] = 0.5
-
-                consistency_dims = consistency_dims * conf_mask
-
+            # 计算最终一致性分数
             consistency_weights = F.softmax(self.consistency_weights, dim=0)
             consistency = torch.sigmoid(torch.sum(consistency_dims * consistency_weights, dim=1, keepdim=True))
 
             results['cross_consistency'] = consistency
         else:
-            # 若任一模态缺失，则一致性为中性值 0.5
             results['cross_consistency'] = torch.full((batch_size, 1), 0.5, device=device)
 
-        # 在训练阶段，根据一致性调整单模态评分
-        if self.training:
-            w = torch.sigmoid(self.fusion_weight)
-
-            if norm_img is not None and norm_txt is not None:
-                results['image']['final_score'] = (1 - w) * results['image']['final_score'] + w * results['cross_consistency']
-                results['text']['final_score'] = (1 - w) * results['text']['final_score'] + w * results['cross_consistency']
+        # 最终调整基于一致性的模态分数
+        if norm_img is not None and norm_txt is not None:
+            # 基于一致性调整分数
+            cal_factor = torch.sigmoid(self.quality_calibration)
+            results['image']['final_score'] = cal_factor[0] * results['image']['final_score'] + (1 - cal_factor[0]) * \
+                                              results['cross_consistency']
+            results['text']['final_score'] = cal_factor[1] * results['text']['final_score'] + (1 - cal_factor[1]) * \
+                                             results['cross_consistency']
 
         return results
 
-
-
-import torch
-import torch.nn as nn
 
 class QualityAwareFeatureFusion(nn.Module):
     def __init__(self, image_dim, text_dim, fusion_dim, num_heads=4):
         super().__init__()
 
-        # 质量加权的特征投影
+        # 特征投影
         self.image_proj = nn.Linear(image_dim, fusion_dim)
         self.text_proj = nn.Linear(text_dim, fusion_dim)
-        self.num_heads = num_heads
 
-        # 质量分数投影
-        self.quality_proj = nn.Sequential(
-            nn.Linear(2, 64),  # 简化处理：仅使用最终分数
-            nn.GELU(),
-            nn.Linear(64, num_heads)
+        # 质量感知的注意力
+        self.quality_attn_weights = nn.Sequential(
+            nn.Linear(2, num_heads),  # 从质量分数投影到注意力头权重
+            nn.Sigmoid()  # 确保权重为正
         )
 
-        # 用于质量感知跨模态融合的多头注意力机制
+        # 多头注意力以进行质量感知的跨模态融合
         self.cross_attn = nn.MultiheadAttention(
             embed_dim=fusion_dim,
             num_heads=num_heads,
             batch_first=True
         )
 
-        # 计算输出投影的输入维度
-        # 每个模态贡献 fusion_dim，并且有两个模态（原始 + 注意力后的）
-        output_input_dim = fusion_dim * 2 * 2  # 2 个模态 x 2（原始 + 注意力后）x fusion_dim
-
-        # 输出投影模块，输入维度已校正
+        # 融合后的输出投影
         self.output_proj = nn.Sequential(
-            nn.Linear(output_input_dim, fusion_dim),
+            nn.Linear(fusion_dim * 2, fusion_dim),
             nn.LayerNorm(fusion_dim),
             nn.GELU(),
             nn.Dropout(0.1),
             nn.Linear(fusion_dim, fusion_dim)
         )
 
-        # 当质量分数不可用时的默认权重
-        self.default_weights = nn.Parameter(torch.ones(1, 2) / 2)
+        # 用于质量感知的门控机制
+        self.quality_gate = nn.Sequential(
+            nn.Linear(2, 1),
+            nn.Sigmoid()
+        )
 
     def forward(self, image_feat, text_feat, quality_scores=None):
+        """
+        基于质量分数的前向传播函数
+
+        Args:
+            image_feat: 图像特征 [B, D_img]
+            text_feat: 文本特征 [B, D_txt]
+            quality_scores: 质量评估模块的输出
+
+        Returns:
+            融合特征和权重
+        """
         batch_size = image_feat.size(0)
         device = image_feat.device
-        fusion_dim = self.image_proj.out_features  # 获取融合维度
 
-        # 将图像和文本特征映射到融合空间
+        # 投影特征到融合空间
         img_proj = self.image_proj(image_feat)  # [B, fusion_dim]
-        txt_proj = self.text_proj(text_feat)    # [B, fusion_dim]
+        txt_proj = self.text_proj(text_feat)  # [B, fusion_dim]
 
-        # 如果质量分数不存在，使用默认加权
+        # 准备质量向量用于注意力调制
         if quality_scores is None or 'image' not in quality_scores or 'text' not in quality_scores:
-            attn_weights = self.default_weights.expand(batch_size, 2)
+            # 如果没有质量分数，使用均匀权重
+            quality_vector = torch.ones(batch_size, 2, device=device) * 0.5
         else:
-            # 检查质量分数
-            img_score = None
-            txt_score = None
+            # 使用质量分数
+            quality_vector = torch.cat([
+                quality_scores['image']['final_score'],
+                quality_scores['text']['final_score']
+            ], dim=1)  # [B, 2]
 
-            if 'final_score' in quality_scores['image']:
-                img_score = quality_scores['image']['final_score']
+        # 生成注意力权重
+        attn_weights = self.quality_attn_weights(quality_vector)  # [B, num_heads]
 
-            if 'final_score' in quality_scores['text']:
-                txt_score = quality_scores['text']['final_score']
-
-            if img_score is None or txt_score is None:
-                attn_weights = self.default_weights.expand(batch_size, 2)
-            else:
-                # 构建仅包含最终质量分数的简单质量向量
-                quality_vector = torch.cat([
-                    img_score,
-                    txt_score
-                ], dim=1)
-
-                # 将质量向量投影为注意力权重
-                attn_weights = torch.softmax(self.quality_proj(quality_vector), dim=1)
-
-        # 为多头注意力准备输入
-        # 将两个模态堆叠为序列：[img, txt]
+        # 堆叠特征作为序列 [img, txt]
         features = torch.stack([img_proj, txt_proj], dim=1)  # [B, 2, fusion_dim]
 
-        # 检查融合维度是否能被头数整除
-        if fusion_dim % self.cross_attn.num_heads != 0:
-            print(f"  WARNING: fusion_dim ({fusion_dim}) is not divisible by num_heads ({self.cross_attn.num_heads})")
-            print(f"  fusion_dim % num_heads = {fusion_dim % self.cross_attn.num_heads}")
+        # 应用质量感知的跨模态注意力
+        # 我们现在不需要修改原生的attention机制，而是在后处理中应用质量权重
+        attn_output, _ = self.cross_attn(
+            query=features,
+            key=features,
+            value=features
+        )  # [B, 2, fusion_dim]
 
-        # 应用跨模态注意力机制（带质量感知权重）
-        try:
-            attn_output, _ = self.cross_attn(
-                query=features,
-                key=features,
-                value=features,
-                need_weights=False
-            )
-        except Exception as e:
-            print(f"  ERROR in cross_attn: {str(e)}")
-            # 若注意力计算失败，使用原始特征作为备选
-            attn_output = features.clone()
+        # 提取各模态的表示
+        img_attn = attn_output[:, 0]  # [B, fusion_dim]
+        txt_attn = attn_output[:, 1]  # [B, fusion_dim]
 
-        # 拉平成特征以便后续连接
-        features_flat = features.reshape(batch_size, -1)        # [B, 2*fusion_dim]
-        attn_output_flat = attn_output.reshape(batch_size, -1)  # [B, 2*fusion_dim]
+        # 计算质量门控值
+        quality_gate = self.quality_gate(quality_vector)  # [B, 1]
 
-        # 将原始特征与注意力输出进行拼接
-        concat_features = torch.cat([features_flat, attn_output_flat], dim=1)  # [B, 4*fusion_dim]
+        # 基于质量的加权平均
+        weighted_img = img_proj * quality_scores['image']['final_score']
+        weighted_txt = txt_proj * quality_scores['text']['final_score']
 
-        # 最终投影，输出融合后的特征
-        fused_features = self.output_proj(concat_features)  # [B, fusion_dim]
+        # 计算质量加权的特征
+        quality_weighted = (weighted_img + weighted_txt) / (
+                quality_scores['image']['final_score'] + quality_scores['text']['final_score'] + 1e-8
+        )
 
-        # 构造简单的注意力权重返回（用于可视化或加权）
-        simple_weights = torch.zeros(batch_size, 2, device=device)
-        simple_weights[:, 0] = attn_weights.mean(dim=1)      # 图像的平均注意力权重
-        simple_weights[:, 1] = 1 - simple_weights[:, 0]      # 文本的注意力权重为剩余部分
+        # 注意力输出和质量加权之间的插值
+        attn_weighted = (img_attn + txt_attn) / 2
+        fused_features = quality_gate * quality_weighted + (1 - quality_gate) * attn_weighted
 
-        return fused_features, simple_weights
+        # 应用最终投影
+        output_features = self.output_proj(torch.cat([fused_features, attn_weighted], dim=1))
+
+        # 为可视化目的返回简单权重
+        simple_weights = torch.cat([
+            quality_scores['image']['final_score'],
+            quality_scores['text']['final_score']
+        ], dim=1)
+
+        return output_features, simple_weights
 
 
     # def forward(self, image_feat, text_feat, quality_scores=None):
