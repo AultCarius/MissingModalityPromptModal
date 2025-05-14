@@ -347,8 +347,15 @@ class EnhancedModalityQualityEstimator(nn.Module):
             is_image_missing = (missing_type == 1) | (missing_type == 3)
             is_text_missing = (missing_type == 2) | (missing_type == 3)
         else:
-            is_image_missing = torch.zeros(batch_size, dtype=torch.bool, device=device)
-            is_text_missing = torch.zeros(batch_size, dtype=torch.bool, device=device)
+            # 修改: 如果没有提供缺失类型，检测零填充特征
+            is_image_missing = torch.sum(torch.abs(image_feat),
+                                         dim=(1, 2)) < 1e-6 if image_feat is not None else torch.ones(batch_size,
+                                                                                                      dtype=torch.bool,
+                                                                                                      device=device)
+            is_text_missing = torch.sum(torch.abs(text_feat),
+                                        dim=(1, 2)) < 1e-6 if text_feat is not None else torch.ones(batch_size,
+                                                                                                    dtype=torch.bool,
+                                                                                                    device=device)
 
         # Normalize features for more stable quality estimation
         norm_img, norm_txt = self.normalize_features(image_feat, text_feat)

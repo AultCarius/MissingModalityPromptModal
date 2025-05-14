@@ -383,73 +383,97 @@ class MultimodalPromptModel(nn.Module):
 
         return causal_mask
 
-    def _extract_features(self, image, input_ids, attention_mask):
-        """提取图像和文本的原始特征"""
+    def _extract_features(self, image, input_ids, attention_mask, missing_type=None):
+        """提取图像和文本的原始特征，正确处理零填充的缺失模态"""
         batch_size = image.size(0) if image is not None else input_ids.size(0)
         device = next(self.parameters()).device
 
-        # 处理图像特征 (如果存在)
-        image_embed = None
-        if image is not None:
-            if self.use_clip_encoders:
-                # 对于CLIP视觉模型，我们直接使用embeddings方法
-                # 避免使用forward方法，因为我们想要自己控制Transformer层
-                try:
-                    # 尝试直接获取embeddings输出
-                    if hasattr(self.image_encoder, 'embeddings'):
-                        image_embed = self.image_encoder.embeddings(pixel_values=image)
-                    else:
-                        # 回退方案：运行模型一次，但禁用注意力层
-                        with torch.no_grad():
-                            # 简化：只获取embeddings的输出
-                            vision_outputs = self.image_encoder(
-                                pixel_values=image,
-                                output_hidden_states=True,
-                                output_attentions=False,
-                                return_dict=True
-                            )
-                            # 使用第一个隐藏状态（embeddings的输出）
-                            image_embed = vision_outputs.hidden_states[0] if hasattr(vision_outputs,
-                                                                                     'hidden_states') else None
+        # 检测缺失模态 - 基于missing_type参数和零填充检测
+        if missing_type is not None:
+            is_image_missing = (missing_type == 1) | (missing_type == 3)
+            is_text_missing = (missing_type == 2) | (missing_type == 3)
+        else:
+            # 如果未提供missing_type，通过检测零填充来识别缺失模态
+            is_image_missing = torch.zeros(batch_size, dtype=torch.bool, device=device)
+            is_text_missing = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
-                    # 如果仍然无法获取embeddings输出，打印错误
-                    if image_embed is None:
-                        print("WARNING: Unable to get proper embeddings from CLIP vision model.")
-                        # 创建一个随机嵌入作为后备
-                        image_embed = torch.randn(batch_size, 197, self.image_dim, device=device)
-                except Exception as e:
-                    print(f"Error extracting CLIP vision embeddings: {e}")
-                    # 创建一个随机嵌入作为后备
-                    image_embed = torch.randn(batch_size, 197, self.image_dim, device=device)
-            else:
-                # 标准ViT模型
-                image_embed = self.image_patch_embed(image)  # [B, N, D_img]
-                image_cls = self.image_cls_token.expand(batch_size, -1, -1)  # [B, 1, D_img]
-                image_embed = torch.cat((image_cls, image_embed), dim=1)  # [B, N+1, D_img]
-                image_embed = image_embed + self.image_pos_embed[:, :image_embed.size(1), :]
-                image_embed = self.image_pos_drop(image_embed)
+            if image is not None:
+                is_image_missing = torch.sum(torch.abs(image.view(batch_size, -1)), dim=1) < 1e-6
+            if input_ids is not None:
+                is_text_missing = torch.sum(torch.abs(input_ids.float()), dim=1) < 1e-6
 
-        # 处理文本特征 (如果存在)
+        # 处理图像特征 (如果存在且不是缺失的)
+        image_embed = torch.zeros(batch_size, 197, self.image_dim, device=device)  # 默认零嵌入
+        if image is not None and not is_image_missing.all():
+            # 只处理非缺失样本
+            non_missing = ~is_image_missing
+            if non_missing.any():
+                non_missing_images = image[non_missing]
+
+                if self.use_clip_encoders:
+                    try:
+                        # 尝试直接获取embeddings输出
+                        if hasattr(self.image_encoder, 'embeddings'):
+                            non_missing_embeds = self.image_encoder.embeddings(pixel_values=non_missing_images)
+                        else:
+                            # 回退方案
+                            with torch.no_grad():
+                                vision_outputs = self.image_encoder(
+                                    pixel_values=non_missing_images,
+                                    output_hidden_states=True,
+                                    output_attentions=False,
+                                    return_dict=True
+                                )
+                                non_missing_embeds = vision_outputs.hidden_states[0] if hasattr(vision_outputs,
+                                                                                                'hidden_states') else None
+
+                        if non_missing_embeds is None:
+                            print("WARNING: Unable to get proper embeddings from CLIP vision model.")
+                            non_missing_embeds = torch.randn(non_missing.sum(), 197, self.image_dim, device=device)
+                    except Exception as e:
+                        print(f"Error extracting CLIP vision embeddings: {e}")
+                        non_missing_embeds = torch.randn(non_missing.sum(), 197, self.image_dim, device=device)
+                else:
+                    # 标准ViT模型
+                    patch_embeds = self.image_patch_embed(non_missing_images)  # [B_non_missing, N, D_img]
+                    cls_token = self.image_cls_token.expand(non_missing.sum(), -1, -1)  # [B_non_missing, 1, D_img]
+                    non_missing_embeds = torch.cat((cls_token, patch_embeds), dim=1)  # [B_non_missing, N+1, D_img]
+                    non_missing_embeds = non_missing_embeds + self.image_pos_embed[:, :non_missing_embeds.size(1), :]
+                    non_missing_embeds = self.image_pos_drop(non_missing_embeds)
+
+                # 将非缺失样本的嵌入放回原始批次张量
+                image_embed[non_missing] = non_missing_embeds
+
+        # 处理文本特征 (如果存在且不是缺失的)
         text_embed = None
         if input_ids is not None:
-            if self.use_clip_encoders:
-                # 对于CLIP文本模型，尝试直接使用embeddings
-                try:
-                    if hasattr(self.text_encoder, 'embeddings'):
-                        text_embed = self.text_encoder.embeddings(input_ids)
-                    else:
-                        # 回退方案：使用text_model的embeddings
-                        text_embed = self.text_embeddings(input_ids)
-                except Exception as e:
-                    print(f"Error extracting CLIP text embeddings: {e}")
-                    # 创建一个随机嵌入作为后备
-                    seq_len = input_ids.size(1)
-                    text_embed = torch.randn(batch_size, seq_len, self.text_dim, device=device)
-            else:
-                # 标准文本模型
-                text_embed = self.text_embeddings(input_ids)  # [B, L, D_txt]
+            text_embed = torch.zeros(batch_size, input_ids.size(1), self.text_dim, device=device)  # 默认零嵌入
 
-        return image_embed, text_embed
+            # 只处理非缺失样本
+            non_missing = ~is_text_missing
+            if non_missing.any():
+                non_missing_ids = input_ids[non_missing]
+                non_missing_mask = attention_mask[non_missing] if attention_mask is not None else None
+
+                if self.use_clip_encoders:
+                    try:
+                        if hasattr(self.text_encoder, 'embeddings'):
+                            non_missing_embeds = self.text_encoder.embeddings(non_missing_ids)
+                        else:
+                            # 回退方案
+                            non_missing_embeds = self.text_embeddings(non_missing_ids)
+                    except Exception as e:
+                        print(f"Error extracting CLIP text embeddings: {e}")
+                        seq_len = non_missing_ids.size(1)
+                        non_missing_embeds = torch.randn(non_missing.sum(), seq_len, self.text_dim, device=device)
+                else:
+                    # 标准文本模型
+                    non_missing_embeds = self.text_embeddings(non_missing_ids)  # [B_non_missing, L, D_txt]
+
+                # 将非缺失样本的嵌入放回原始批次张量
+                text_embed[non_missing] = non_missing_embeds
+
+        return image_embed, text_embed, is_image_missing, is_text_missing
 
     def _process_modalities(self, image_embed, text_embed, attention_mask, missing_type):
         """处理模态，包括模态缺失的情况，并使用原始特征进行重建"""
@@ -477,11 +501,21 @@ class MultimodalPromptModel(nn.Module):
         # 提取原始特征的tokens用于重建损失计算
         token_count = 5 # 每个模态使用的token数量
 
+        # 修改: 使用零检测代替None检测
+        # 如果模态缺失，则相应的张量应该是零填充的，但仍然存在
+        image_is_zeros = (torch.sum(torch.abs(image_embed), dim=(1, 2)) < 1e-6)
+        text_is_zeros = (torch.sum(torch.abs(text_embed), dim=(1, 2)) < 1e-6)
+
+
+        # 保存原始特征用于重建损失
         original_features = {
-            'image': None if image_embed is None else image_embed[:, :token_count].reshape(batch_size, token_count,
-                                                                                           -1).detach(),
-            'text': None if text_embed is None else text_embed[:, :token_count].reshape(batch_size, token_count,
-                                                                                        -1).detach()
+            'image': image_embed[:, :token_count].reshape(batch_size, token_count, -1).detach(),
+            'text': text_embed[:, :token_count].reshape(batch_size, token_count, -1).detach()
+        }
+        # 创建掩码以跟踪哪些特征是真实的（非零）
+        original_features_mask = {
+            'image': ~image_is_zeros.unsqueeze(1).expand(-1, token_count),
+            'text': ~text_is_zeros.unsqueeze(1).expand(-1, token_count)
         }
 
         # 处理模态生成
@@ -578,6 +612,7 @@ class MultimodalPromptModel(nn.Module):
 
         # # 使用生成的特征替换缺失的模态
         if is_image_missing.any() and generated_features['image'] is not None:
+
             # 如果image_embed为None，创建新的
             if image_embed is None:
                 patch_count = 196  # 调整为您的实际patch数量
@@ -585,9 +620,11 @@ class MultimodalPromptModel(nn.Module):
 
             # 将生成的特征复制到适当的token位置
             for b in range(batch_size):
+
                 if is_image_missing[b]:
                     # token_count = min(generated_features['image'].size(1), token_count)
                     # 将生成的前N个token替换到image_embed中
+                    # print("生成了图像特征替换")
                     tokens_available = generated_features['image'].size(1)
                     max_tokens_to_copy = min(tokens_available, image_embed.size(1))
 
@@ -610,6 +647,7 @@ class MultimodalPromptModel(nn.Module):
             # 将生成的特征复制到适当的token位置
             for b in range(batch_size):
                 if is_text_missing[b]:
+                    # print("生成了文本特征替换")
                     # token_count = min(generated_features['text'].size(1), token_count)
                     # 将生成的前N个token替换到text_embed中
                     tokens_available = generated_features['text'].size(1)
@@ -622,7 +660,7 @@ class MultimodalPromptModel(nn.Module):
                             if attention_mask is not None:
                                 attention_mask[b, t] = 1
 
-
+        # print("一个batch解决")
         return image_embed, text_embed, attention_mask, original_features, \
             (generated_features, reconstructed_features) if self.use_modality_generator else (None, None)
 
@@ -650,7 +688,14 @@ class MultimodalPromptModel(nn.Module):
             raise ValueError("Both image and text inputs cannot be None simultaneously")
 
         # 提取原始特征（包括可见和不可见的模态）
-        image_embed, text_embed = self._extract_features(image, input_ids, attention_mask)
+        # 处理missing_type
+        if missing_type is None:
+            missing_type = torch.zeros(batch_size, dtype=torch.long, device=device)
+
+        # 提取特征，同时获取缺失掩码
+        image_embed, text_embed, is_image_missing, is_text_missing = self._extract_features(
+            image, input_ids, attention_mask, missing_type
+        )
 
         original_image_embed = image_embed.clone()
         original_text_embed = text_embed.clone()
@@ -718,6 +763,7 @@ class MultimodalPromptModel(nn.Module):
         #     txt_cls_feat = temp_txt[:, 0]  # [B, D_txt]
         #     quality_scores = self.quality_estimator(img_cls_feat, txt_cls_feat, missing_type)
 
+        # 这里多少有点问题
         if self.use_quality_prompt:
             # Update reference statistics when training
             img_cls_feat = temp_img[:, 0]  # [B, D_img]

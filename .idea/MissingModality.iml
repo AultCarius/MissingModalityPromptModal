@@ -8,14 +8,7 @@
       <excludeFolder url="file://$MODULE_DIR$/experiments" />
       <excludeFolder url="file://$MODULE_DIR$/results" />
     </content>
-    <orderEntry type="jdk" jdkName="multimodal" jdkType="Python SDK" />
+    <orderEntry type="jdk" jdkName="deeplearn" jdkType="Python SDK" />
     <orderEntry type="sourceFolder" forTests="false" />
-  </component>
-  <component name="PyNamespacePackagesService">
-    <option name="namespacePackageFolders">
-      <list>
-        <option value="$MODULE_DIR$/datasets" />
-      </list>
-    </option>
   </component>
 </module>

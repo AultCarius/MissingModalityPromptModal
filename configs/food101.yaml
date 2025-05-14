@@ -2,7 +2,7 @@
 experiment_name: "food101_0509_clip_nocurrimlearn_mr0.7"
 
 # Model Configuration
-image_model_name: "vit_base_patch16_224"
+image_model_name: "openai/clip-vit-base-patch16"
 text_model_name: "openai/clip-vit-base-patch16" #" "
 encoder_type: "clip"  # "clip" or "roberta"
 image_prompt_len: 36

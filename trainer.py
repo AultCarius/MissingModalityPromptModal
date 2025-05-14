@@ -310,15 +310,25 @@ class Trainer:
             self.logger.info(f"Saved checkpoint to {path}")
 
     def train(self):
+        """
+        训练模型的主函数
+        包含多种损失计算：分类损失、重建损失、对比损失和质量预测损失
+        支持缺失模态的处理和课程学习
+        添加了详细的调试语句来跟踪缺失模态的处理
+        """
+        # ===== 初始化配置参数 =====
         num_epochs = self.config.get("epochs", 10)
         max_epochs = num_epochs
+
+        # Focal Loss配置
         focal_start_epoch = self.config.get("focal_start_epoch", 3)
         use_focal_loss = self.config.get("use_focal_loss", True)
         focal_alpha = self.config.get("focal_alpha", 0.5)
         focal_max_gamma = self.config.get("focal_gamma", 2.0)
         gamma_ramp_epochs = self.config.get("gamma_ramp_epochs", 5)
-        focal_weight = self.config.get("focal_weight",0.3)
+        focal_weight = self.config.get("focal_weight", 0.3)
 
+        # 非对称损失(ASL)配置
         use_asymmetric_loss = self.config.get("use_asymmetric_loss", True)
         asl_start_epoch = self.config.get("asl_start_epoch", 3)
         asl_gamma_pos = self.config.get("asl_gamma_pos", 0.0)
@@ -326,76 +336,88 @@ class Trainer:
         asl_ramp_epochs = self.config.get("asl_ramp_epochs", 3)
         asl_clip = self.config.get("asl_clip", 0.05)
 
+        # 重建损失权重配置
         initial_recon_weight = self.config.get("initial_recon_weight", 0.1)
         final_recon_weight = self.config.get("final_recon_weight", 0.01)
 
-        # 判断数据集类型
+        # 判断数据集类型 (单标签或多标签)
         dataset_type = self.config.get("dataset", "mmimdb")
         self.is_single_label = dataset_type == "food101"
 
-        # 首个批次标签检查（调试用）
+        # Debug: 首个批次标签检查
         with torch.no_grad():
             for batch in self.train_loader:
                 _, _, _, label, _ = [x.to(self.device) for x in batch]
-                self.logger.info(f"Label shape: {label.shape}")
-                self.logger.info(f"Label sum per sample: {label.sum(dim=1)[:10]}")  # 显示前10个样本的标签和
+                self.logger.info(f"标签形状: {label.shape}")
+                self.logger.info(f"每个样本标签和: {label.sum(dim=1)[:10]}")  # 显示前10个样本的标签和
                 break
 
+        # ===== 开始训练循环 =====
         for epoch in range(self.start_epoch, num_epochs):
             current_epoch = epoch
 
-            # In the train method, at the beginning of each epoch (around line 256)
-            # Add right after the epoch loop starts:
-
-            # Apply curriculum learning for missing probability if enabled
-            # At the beginning of each epoch in the train method
+            # 应用缺失率课程学习（如果启用）
             if hasattr(self, 'use_curriculum') and self.use_curriculum:
-                # Calculate current missing probability
+                # 计算当前缺失概率
                 progress = min(1.0, epoch / self.missing_prob_ramp_epochs)
                 current_missing_prob = self.initial_missing_prob + progress * (
-                            self.final_missing_prob - self.initial_missing_prob)
+                        self.final_missing_prob - self.initial_missing_prob
+                )
 
-                # Simple direct update
+                # 更新数据加载器的缺失概率
                 if self.update_missing_probability(current_missing_prob):
-                    self.logger.info(f"Epoch {epoch}: Missing probability set to {current_missing_prob:.3f}")
+                    self.logger.info(f"Epoch {epoch}: 缺失概率更新为 {current_missing_prob:.3f}")
 
-
+            # 切换到训练模式
             self.model.train()
+
+            # 初始化度量指标统计
             total_loss = 0
             cls_loss = 0
             recon_loss = 0
+            contra_loss_sum = 0
+            quality_loss_sum = 0
+            adv_loss_sum = 0
+
             all_preds, all_labels = [], []
 
-            # Track quality assessment and fusion weights
+            # 质量评估和融合权重统计
             quality_stats = {'image': [], 'text': [], 'consistency': []}
             fusion_weights_stats = []
 
-            # Track modality generation performance
+            # 模态生成性能统计
             gen_stats = {'image': {'mse': [], 'count': 0}, 'text': {'mse': [], 'count': 0}}
 
-            self.logger.info(f"Epoch {epoch} start")
+            self.logger.info(f"第 {epoch} 轮训练开始")
+            # 创建进度条
             batch_pbar = tqdm(total=len(self.train_loader),
                               desc=f"Epoch {epoch + 1}/{num_epochs}",
                               dynamic_ncols=True,
                               leave=False)
 
+            # ===== 批次训练循环 =====
             for batch_idx, batch in enumerate(self.train_loader):
+                # 加载批次数据
                 image, input_ids, attention_mask, label, missing_type = [x.to(self.device) for x in batch]
                 is_image_missing = (missing_type == 1) | (missing_type == 3)
                 is_text_missing = (missing_type == 2) | (missing_type == 3)
+
+                # 前向传播
                 output = self.model(image, input_ids, attention_mask, missing_type)
 
+                # 处理模型输出(logits和额外信息)
                 if isinstance(output, tuple):
                     logits, additional_info = output
 
+                    # ===== 第1部分：分类损失计算 =====
                     if self.is_single_label:
                         # 单标签分类 - 使用交叉熵损失
                         targets = label.argmax(dim=1)  # 转换为类别索引
                         classification_loss = F.cross_entropy(logits, targets)
                     else:
-
-                        # 多标签分类 - 使用二元交叉熵损失
+                        # 多标签分类 - 可使用不同类型的损失函数
                         if use_asymmetric_loss and epoch >= asl_start_epoch:
+                            # 非对称损失(ASL) - 适合处理类别不平衡的多标签分类
                             progress = min(1.0, (epoch - asl_start_epoch + 1) / asl_ramp_epochs)
                             gamma_pos = asl_gamma_pos * progress
                             gamma_neg = asl_gamma_neg * progress
@@ -404,120 +426,131 @@ class Trainer:
                                 gamma_pos=gamma_pos, gamma_neg=gamma_neg, clip=asl_clip
                             )
                         elif use_focal_loss and epoch >= focal_start_epoch:
+                            # Focal Loss - 关注困难样本
                             progress = min(1.0, (epoch - focal_start_epoch + 1) / gamma_ramp_epochs)
                             gamma = focal_max_gamma * progress
                             bce_loss = F.binary_cross_entropy_with_logits(logits, label, pos_weight=self.class_weights)
                             focal = self.focal_loss(logits, label, alpha=focal_alpha, gamma=gamma)
                             classification_loss = bce_loss + focal_weight * focal
                         else:
+                            # 标准二元交叉熵损失
                             classification_loss = F.binary_cross_entropy_with_logits(
                                 logits, label, pos_weight=self.class_weights
                             )
 
-                    # Initialize reconstruction loss
+                    # ===== 第2部分：重建损失计算 =====
                     reconstruction_loss = 0.0
 
-                    # Calculate reconstruction loss if modality generator is used
+                    # 如果使用了模态生成器，计算重建损失
                     if additional_info and 'reconstructed_features' in additional_info and additional_info[
                         'reconstructed_features']:
                         generated_features = additional_info['generated_features']
                         recon_features = additional_info['reconstructed_features']
                         orig_features = additional_info['original_features']
 
-                        # Image reconstruction loss (if applicable)
-                        if 'image' in recon_features and orig_features['image'] is not None:
+                        # 图像重建损失计算
+                        if 'image' in recon_features and recon_features['image'] is not None:
                             if is_image_missing.any():
                                 missing_mask = is_image_missing
                                 missing_img_recon = recon_features['image'][missing_mask]
                                 missing_img_orig = orig_features['image'][missing_mask]
 
-                                if len(missing_img_recon) > 0:
-                                    # 调整形状以适应多token情况
+                                # 检查有效的非零特征
+                                valid_tokens = torch.sum(torch.abs(missing_img_orig), dim=-1) > 1e-6
+
+                                if valid_tokens.any():
+                                    # 只对有效的非零特征计算损失
                                     if missing_img_recon.dim() > 2:  # [batch, token_count, dim]
-                                        # 计算每个token位置的MSE损失并平均
-                                        img_recon_loss = F.mse_loss(missing_img_recon, missing_img_orig)
+                                        # 多token情况
+                                        img_recon_loss = F.mse_loss(
+                                            missing_img_recon[valid_tokens],
+                                            missing_img_orig[valid_tokens]
+                                        )
                                     else:  # 单token情况
-                                        img_recon_loss = F.mse_loss(missing_img_recon, missing_img_orig)
+                                        img_recon_loss = F.mse_loss(
+                                            missing_img_recon[valid_tokens],
+                                            missing_img_orig[valid_tokens]
+                                        )
 
                                     reconstruction_loss += img_recon_loss
                                     gen_stats['image']['mse'].append(img_recon_loss.item())
-                                    gen_stats['image']['count'] += len(missing_img_recon)
+                                    gen_stats['image']['count'] += valid_tokens.sum().item()
 
-                        # Text reconstruction loss (if applicable)
-                        if 'text' in recon_features and orig_features['text'] is not None:
+                        # 文本重建损失计算
+                        if 'text' in recon_features and recon_features['text'] is not None:
                             if is_text_missing.any():
                                 missing_mask = is_text_missing
                                 missing_txt_recon = recon_features['text'][missing_mask]
                                 missing_txt_orig = orig_features['text'][missing_mask]
 
-                                if len(missing_txt_recon) > 0:
-                                    # 调整形状以适应多token情况
+                                # 检查有效的非零特征
+                                valid_tokens = torch.sum(torch.abs(missing_txt_orig), dim=-1) > 1e-6
+
+                                if valid_tokens.any():
+                                    # 只对有效的非零特征计算损失
                                     if missing_txt_recon.dim() > 2:  # [batch, token_count, dim]
-                                        # 计算每个token位置的MSE损失并平均
-                                        txt_recon_loss = F.mse_loss(missing_txt_recon, missing_txt_orig)
+                                        # 多token情况
+                                        txt_recon_loss = F.mse_loss(
+                                            missing_txt_recon[valid_tokens],
+                                            missing_txt_orig[valid_tokens]
+                                        )
                                     else:  # 单token情况
-                                        txt_recon_loss = F.mse_loss(missing_txt_recon, missing_txt_orig)
+                                        txt_recon_loss = F.mse_loss(
+                                            missing_txt_recon[valid_tokens],
+                                            missing_txt_orig[valid_tokens]
+                                        )
 
                                     reconstruction_loss += txt_recon_loss
                                     gen_stats['text']['mse'].append(txt_recon_loss.item())
-                                    gen_stats['text']['count'] += len(missing_txt_recon)
+                                    gen_stats['text']['count'] += valid_tokens.sum().item()
 
-                    # Total loss with weighted reconstruction loss
+                    # 计算重建权重（从initial逐渐减小到final）
                     recon_weight = initial_recon_weight * (1 - current_epoch / max_epochs) + final_recon_weight * (
-                                current_epoch / max_epochs)
+                            current_epoch / max_epochs)
+
+                    # 结合分类损失和重建损失
                     total_batch_loss = classification_loss + recon_weight * reconstruction_loss
 
-                    # After calculating the classification loss
-                    contrastive_weight = 0.1  # Start with a small weight
+                    # ===== 第3部分：对比损失计算 =====
+                    contrastive_loss_value = 0.0
+                    contrastive_weight = 0.5  # 对比损失的权重（可调整）
 
-                    # Calculate contrastive loss between real modalities (only for samples with both modalities)
-                    both_modalities = (missing_type == 0)
-                    if 'quality_scores' in additional_info:
-                        # Get samples with both modalities (missing_type == 0)
+                    # 计算双模态样本之间的对比损失（促进模态间对齐）
+                    both_modalities = (missing_type == 0)  # 找出完整样本
+                    if 'quality_scores' in additional_info and both_modalities.any():
+                        # 获取完整样本的特征
+                        if 'original_features' in additional_info:
+                            orig_img_feat = additional_info['original_features']['image']
+                            orig_txt_feat = additional_info['original_features']['text']
 
-                        if both_modalities.any():
-                            # Get features for samples with both modalities
-                            if 'original_features' in additional_info:
-                                orig_img_feat = additional_info['original_features']['image']
-                                orig_txt_feat = additional_info['original_features']['text']
+                            if orig_img_feat is not None and orig_txt_feat is not None:
+                                # 提取只有完整样本的特征
+                                img_feat_both = orig_img_feat[both_modalities]
+                                txt_feat_both = orig_txt_feat[both_modalities]
 
-                                if orig_img_feat is not None and orig_txt_feat is not None:
-                                    # Extract features only for samples with both modalities
-                                    img_feat_both = orig_img_feat[both_modalities]
-                                    txt_feat_both = orig_txt_feat[both_modalities]
+                                if len(img_feat_both) > 1:  # 至少需要2个样本计算对比损失
+                                    # 计算对比损失
+                                    contra_loss = self.modality_contrastive_loss(img_feat_both, txt_feat_both)
+                                    # 添加到总损失
+                                    total_batch_loss = total_batch_loss + contrastive_weight * contra_loss
+                                    # 记录对比损失值
+                                    contrastive_loss_value = contra_loss.item()
 
-                                    if len(img_feat_both) > 1:  # Need at least 2 samples for contrastive loss
-                                        # Calculate contrastive loss
-                                        contra_loss = self.modality_contrastive_loss(img_feat_both, txt_feat_both)
-                                        # Add to total loss
-                                        total_batch_loss = total_batch_loss + contrastive_weight * contra_loss
-                                        # Track separately for logging
-                                        contra_loss_value = contra_loss.item()
-                                    else:
-                                        contra_loss_value = 0.0
-                                else:
-                                    contra_loss_value = 0.0
-                            else:
-                                contra_loss_value = 0.0
-                        else:
-                            contra_loss_value = 0.0
-                    else:
-                        contra_loss_value = 0.0
-
-                    # Quality prediction loss (when both modalities are available)
+                    # ===== 第4部分：质量预测损失计算 =====
                     quality_pred_loss = 0.0
+
+                    # 对完整样本计算质量预测损失
                     if both_modalities.any() and 'quality_scores' in additional_info:
-                        # Extract features for samples with both real modalities
+                        # 提取完整样本的特征
                         real_img_feat = orig_img_feat[both_modalities]
                         real_txt_feat = orig_txt_feat[both_modalities]
 
-                        # For real samples, create pseudo ground truth quality scores
-                        # We assume real samples have high quality (0.9) and high consistency (0.9)
+                        # 为真实样本创建高质量分数（作为目标）
                         target_img_quality = torch.full((len(real_img_feat), 1), 0.9, device=self.device)
                         target_txt_quality = torch.full((len(real_txt_feat), 1), 0.9, device=self.device)
                         target_consistency = torch.full((len(real_img_feat), 1), 0.9, device=self.device)
 
-                        # Get actual quality predictions
+                        # 获取实际质量预测
                         real_quality_scores = {
                             'image': {'final_score': additional_info['quality_scores']['image']['final_score'][
                                 both_modalities]},
@@ -526,59 +559,70 @@ class Trainer:
                             'cross_consistency': additional_info['quality_scores']['cross_consistency'][both_modalities]
                         }
 
-                        # Calculate quality prediction loss (MSE)
+                        # 计算质量预测损失(MSE)
                         img_quality_loss = F.mse_loss(real_quality_scores['image']['final_score'], target_img_quality)
                         txt_quality_loss = F.mse_loss(real_quality_scores['text']['final_score'], target_txt_quality)
                         consistency_loss = F.mse_loss(real_quality_scores['cross_consistency'], target_consistency)
 
-                        # Combined quality prediction loss
+                        # 合并质量预测损失
                         quality_pred_loss = img_quality_loss + txt_quality_loss + consistency_loss
 
-                        # Add to total loss with small weight
+                        # 添加到总损失（低权重）
                         quality_weight = 0.05
                         total_batch_loss = total_batch_loss + quality_weight * quality_pred_loss
+                        quality_loss_sum += quality_pred_loss.item()
 
+                    # ===== 第5部分：对抗损失计算 =====
+                    adv_loss_value = 0.0
+
+                    # 计算对抗损失（让质量评估器区分真实与生成模态）
                     if 'quality_scores' in additional_info:
-                        # Get samples where only one modality is missing
+                        # 获取只有一个模态缺失的样本
                         only_img_missing = is_image_missing & ~is_text_missing
                         only_txt_missing = is_text_missing & ~is_image_missing
 
                         if only_img_missing.any() or only_txt_missing.any():
-                            # Target: real features should get high scores, generated low scores
-                            adv_targets = torch.zeros(self.batch_size, 2, device=self.device)  # [image_real, text_real]
-                            adv_targets[~is_image_missing, 0] = 0.9  # Real image = 1
-                            adv_targets[~is_text_missing, 1] = 0.9  # Real text = 1
-
-                            # Actual quality scores
+                            # 目标：真实特征得高分，生成特征得低分
+                            adv_targets = torch.zeros(self.batch_size, 2, device=self.device)  # [图像真实, 文本真实]
+                            adv_targets[~is_image_missing, 0] = 0.9  # 真实图像 = 0.9
+                            adv_targets[~is_text_missing, 1] = 0.9  # 真实文本 = 0.9
+                            # 对生成的模态使用更适中的目标值(不是0而是0.3)
+                            adv_targets[is_image_missing, 0] = 0.3  # 生成图像不要太低
+                            adv_targets[is_text_missing, 1] = 0.3  # 生成文本不
+                            # 实际质量分数
                             pred_quality = torch.zeros(self.batch_size, 2, device=self.device)
                             pred_quality[:, 0] = additional_info['quality_scores']['image']['final_score'].squeeze()
                             pred_quality[:, 1] = additional_info['quality_scores']['text']['final_score'].squeeze()
 
-                            # Adversarial loss (binary cross entropy)
+                            # 对抗损失（二元交叉熵）
                             adv_loss = F.binary_cross_entropy(pred_quality, adv_targets)
 
-                            # Add to total loss
+                            # 添加到总损失
                             adv_weight = 0.1
                             total_batch_loss = total_batch_loss + adv_weight * adv_loss
+                            adv_loss_value = adv_loss.item()
 
-                    # Collect quality assessment data
+                    # ===== 收集质量评估数据 =====
                     if additional_info and 'quality_scores' in additional_info:
                         quality_scores = additional_info['quality_scores']
                         quality_stats['image'].append(quality_scores['image']['final_score'].mean().item())
                         quality_stats['text'].append(quality_scores['text']['final_score'].mean().item())
                         quality_stats['consistency'].append(quality_scores['cross_consistency'].mean().item())
 
-                    # Collect fusion weights data
+                    # 收集融合权重数据
                     if additional_info and 'fusion_weights' in additional_info:
                         fusion_weights = additional_info['fusion_weights']
                         if fusion_weights is not None:
                             fusion_weights_stats.append(fusion_weights.mean(dim=0).cpu().detach().numpy())
 
-                    # Track component losses
+                    # 记录各部分损失
                     cls_loss += classification_loss.item()
                     recon_loss += reconstruction_loss.item() if isinstance(reconstruction_loss,
                                                                            torch.Tensor) else reconstruction_loss
+                    contra_loss_sum += contrastive_loss_value
+
                 else:
+                    # 如果输出只有logits，没有额外信息
                     logits = output
                     # 根据数据集类型计算分类损失
                     if self.is_single_label:
@@ -591,32 +635,36 @@ class Trainer:
                     total_batch_loss = classification_loss
                     cls_loss += classification_loss.item()
 
-                # Optimization step
+                # ===== 优化步骤 =====
                 self.optimizer.zero_grad()
                 total_batch_loss.backward()
 
+                # 更新进度条
                 batch_pbar.set_postfix({"loss": f"{total_batch_loss.item():.4f}"})
                 batch_pbar.update(1)
 
-                # Optional gradient clipping
+                # 可选的梯度裁剪
                 if self.config.get("clip_grad_norm", 0) > 0:
                     torch.nn.utils.clip_grad_norm_(
                         self.model.parameters(),
                         self.config.get("clip_grad_norm", 1.0)
                     )
 
+                # 更新参数
                 self.optimizer.step()
 
-                # Update learning rate
+                # 更新学习率
                 self.scheduler.step()
 
-                # Record current learning rate
+                # 记录当前学习率
                 current_lr = self.scheduler.get_last_lr()[0]
                 if self.writer and batch_idx % 50 == 0:
                     global_step = epoch * len(self.train_loader) + batch_idx
                     self.writer.add_scalar("lr", current_lr, global_step)
 
+                # 累计损失和预测结果
                 total_loss += total_batch_loss.item()
+
                 # 根据数据集类型计算预测
                 if self.is_single_label:
                     # 单标签分类 - 使用argmax获取类别索引
@@ -628,121 +676,127 @@ class Trainer:
                     # 多标签分类 - 使用阈值
                     preds = (logits > 0.5).float()
 
-                # Collect predictions and true labels for metrics
+                # 收集预测和真实标签用于指标计算
                 all_preds.append(preds.cpu().detach())
                 all_labels.append(label.cpu().detach())
 
+            # 关闭进度条
             batch_pbar.close()
 
-            # Merge all batch predictions and labels
+            # ===== 训练轮次结束，计算指标 =====
+            # 合并所有批次的预测和标签
             all_preds = torch.cat(all_preds, dim=0)
             all_labels = torch.cat(all_labels, dim=0)
 
-            # Calculate metrics on training set
+            # 计算训练集上的指标
             train_metrics = self._compute_metrics(all_preds, all_labels)
 
-            # Record training loss and metrics
+            # 记录训练损失和指标
             avg_loss = total_loss / len(self.train_loader)
             avg_cls_loss = cls_loss / len(self.train_loader)
             avg_recon_loss = recon_loss / len(self.train_loader)
+            avg_contra_loss = contra_loss_sum / len(self.train_loader)
+            avg_quality_loss = quality_loss_sum / len(self.train_loader) if quality_loss_sum > 0 else 0
+            avg_adv_loss = adv_loss_sum / len(self.train_loader) if adv_loss_sum > 0 else 0
 
+            # 打印指标
             metrics_str = " | ".join([f"{k}={v:.4f}" for k, v in train_metrics.items()])
             self.logger.info(
-                f"Epoch {epoch}: Train Loss={avg_loss:.4f} | Cls Loss={avg_cls_loss:.4f} | Recon Loss={avg_recon_loss:.4f} | {metrics_str}")
-            # Track contrastive loss
-            contra_loss_sum = 0.0  # Initialize at the beginning of the epoch
-            contra_loss_sum += contra_loss_value  # Add in the batch loop
+                f"Epoch {epoch}: 总损失={avg_loss:.4f} | 分类损失={avg_cls_loss:.4f} | "
+                f"重建损失={avg_recon_loss:.4f} | 对比损失={avg_contra_loss:.4f} | "
+                f"质量损失={avg_quality_loss:.4f} | 对抗损失={avg_adv_loss:.4f} | {metrics_str}")
 
-            # In the logging section after the epoch
-            avg_contra_loss = contra_loss_sum / len(self.train_loader)
-            self.logger.info(
-                f"Epoch {epoch}: Train Loss={avg_loss:.4f} | Cls Loss={avg_cls_loss:.4f} | Recon Loss={avg_recon_loss:.4f} | Contra Loss={avg_contra_loss:.4f} | {metrics_str}")
-
-            # Update tensorboard logging
-            if self.writer:
-                self.writer.add_scalar("Loss/train_contra", avg_contra_loss, epoch)
-            # Log quality assessment and fusion weight statistics
-            if quality_stats['image'] and self.writer:
-                self.writer.add_scalar("Quality/image", np.mean(quality_stats['image']), epoch)
-                self.writer.add_scalar("Quality/text", np.mean(quality_stats['text']), epoch)
-                self.writer.add_scalar("Quality/consistency", np.mean(quality_stats['consistency']), epoch)
-
-            if fusion_weights_stats and self.writer:
-                avg_weights = np.mean(fusion_weights_stats, axis=0)
-                for i, w in enumerate(avg_weights):
-                    self.writer.add_scalar(f"Fusion/weight_{i}", w, epoch)
-
-            # Log modality generation statistics
-            if gen_stats['image']['mse'] and self.writer:
-                self.writer.add_scalar("Generation/image_mse", np.mean(gen_stats['image']['mse']), epoch)
-                self.writer.add_scalar("Generation/image_count", gen_stats['image']['count'], epoch)
-
-            if gen_stats['text']['mse'] and self.writer:
-                self.writer.add_scalar("Generation/text_mse", np.mean(gen_stats['text']['mse']), epoch)
-                self.writer.add_scalar("Generation/text_count", gen_stats['text']['count'], epoch)
-
+            # 更新TensorBoard日志
             if self.writer:
                 self.writer.add_scalar("Loss/train_total", avg_loss, epoch)
                 self.writer.add_scalar("Loss/train_cls", avg_cls_loss, epoch)
                 self.writer.add_scalar("Loss/train_recon", avg_recon_loss, epoch)
+                self.writer.add_scalar("Loss/train_contra", avg_contra_loss, epoch)
+                self.writer.add_scalar("Loss/train_quality", avg_quality_loss, epoch)
+                self.writer.add_scalar("Loss/train_adv", avg_adv_loss, epoch)
+
+                # 记录训练指标
                 for k, v in train_metrics.items():
                     self.writer.add_scalar(f"{k}/train", v, epoch)
 
-            # Evaluate on validation set
+                # 记录质量评估统计
+                if quality_stats['image']:
+                    self.writer.add_scalar("Quality/image", np.mean(quality_stats['image']), epoch)
+                    self.writer.add_scalar("Quality/text", np.mean(quality_stats['text']), epoch)
+                    self.writer.add_scalar("Quality/consistency", np.mean(quality_stats['consistency']), epoch)
+
+                # 记录融合权重统计
+                if fusion_weights_stats:
+                    avg_weights = np.mean(fusion_weights_stats, axis=0)
+                    for i, w in enumerate(avg_weights):
+                        self.writer.add_scalar(f"Fusion/weight_{i}", w, epoch)
+
+                # 记录模态生成统计
+                if gen_stats['image']['mse']:
+                    self.writer.add_scalar("Generation/image_mse", np.mean(gen_stats['image']['mse']), epoch)
+                    self.writer.add_scalar("Generation/image_count", gen_stats['image']['count'], epoch)
+
+                if gen_stats['text']['mse']:
+                    self.writer.add_scalar("Generation/text_mse", np.mean(gen_stats['text']['mse']), epoch)
+                    self.writer.add_scalar("Generation/text_count", gen_stats['text']['count'], epoch)
+
+            # ===== 验证集评估 =====
             val_metrics = self.evaluate(epoch)
 
-            # Save checkpoint every few epochs
+            # ===== 保存检查点 =====
+            # 每几个轮次保存一次
             if epoch % self.config.get("save_every_epochs", 5) == 0:
                 self._save_checkpoint(epoch, metrics=val_metrics)
 
-            # Save best model based on primary metric
+            # 根据主要指标保存最佳模型
             is_best = False
             if val_metrics[self.primary_metric] > self.best_metrics[self.primary_metric]:
                 self.best_metrics = val_metrics.copy()
                 is_best = True
                 self._save_checkpoint(epoch, metrics=val_metrics, is_best=True)
-                self.logger.info(
-                    f"New best model saved with {self.primary_metric} = {val_metrics[self.primary_metric]:.4f}")
+                self.logger.info(f"新的最佳模型已保存，{self.primary_metric} = {val_metrics[self.primary_metric]:.4f}")
 
+            # ===== Debug信息记录 =====
             with torch.no_grad():
+                # 记录logits和预测统计
                 mean_logit = logits.mean().item()
                 std_logit = logits.std().item()
+
                 if self.is_single_label:
-                    # 对于单标签分类，记录预测的分布
+                    # 单标签分类统计
                     pred_indices = logits.argmax(dim=1)
                     mean_pred = pred_indices.float().mean().item()
                     predictions_per_sample = 1.0  # 单标签始终预测一个类别
                 else:
-                    # 对于多标签分类，记录阈值后的预测数量
-                    mean_pred = (torch.sigmoid(logits) > 0.5).float().sum(dim=1).mean().item()
+                    # 多标签分类统计
                     sigmoid_probs = torch.sigmoid(logits)
                     predictions_per_sample = (sigmoid_probs > 0.5).float().sum(dim=1).mean().item()
 
-            if self.writer:
-                self.writer.add_scalar("Debug/mean_logit", mean_logit, epoch)
-                self.writer.add_scalar("Debug/std_logit", std_logit, epoch)
-                self.writer.add_scalar("Debug/predictions_per_sample", mean_pred, epoch)
+                # 记录到TensorBoard
+                if self.writer:
+                    self.writer.add_scalar("Debug/mean_logit", mean_logit, epoch)
+                    self.writer.add_scalar("Debug/std_logit", std_logit, epoch)
+                    self.writer.add_scalar("Debug/predictions_per_sample", predictions_per_sample, epoch)
 
-            if self.writer:
-                self.writer.add_scalar("Debug/predictions_per_sample", predictions_per_sample, epoch)
-                self.writer.add_scalar("Debug/mean_logit", mean_logit, epoch)
-                self.writer.add_scalar("Debug/std_logit", std_logit, epoch)
-                if use_asymmetric_loss and epoch >= asl_start_epoch:
-                    self.writer.add_scalar("Debug/asl_gamma_neg", gamma_neg, epoch)
-                    self.writer.add_scalar("Debug/asl_gamma_pos", gamma_pos, epoch)
+                    # 对于非对称损失，记录gamma参数
+                    if use_asymmetric_loss and epoch >= asl_start_epoch:
+                        self.writer.add_scalar("Debug/asl_gamma_neg", gamma_neg, epoch)
+                        self.writer.add_scalar("Debug/asl_gamma_pos", gamma_pos, epoch)
 
-        # Training completed
-        self.logger.info(
-            f"Training completed. Best {self.primary_metric}: {self.best_metrics[self.primary_metric]:.4f}")
+        # ===== 训练完成 =====
+        self.logger.info(f"训练完成。最佳 {self.primary_metric}: {self.best_metrics[self.primary_metric]:.4f}")
 
-        # Print all best metrics
+        # 打印所有最佳指标
         metrics_str = " | ".join([f"{k}={v:.4f}" for k, v in self.best_metrics.items()])
-        self.logger.info(f"Best metrics: {metrics_str}")
+        self.logger.info(f"最佳指标: {metrics_str}")
 
+        # 发送训练结果邮件（如果配置了）
         self.send_training_results_email()
 
+        # 关闭TensorBoard写入器
         if self.writer:
             self.writer.close()
+
 
     def _compute_metrics(self, preds, labels):
         """计算多种评估指标"""
@@ -1071,7 +1125,7 @@ class Trainer:
                     mt_txt_quality = quality_data['text_quality'][mask].mean().item()
                     mt_consistency = quality_data['consistency'][mask].mean().item()
 
-                    self.logger.info(f"  - {mt_name} missing type ({mask.sum().item()} samples):")
+                    self.logger.info(f"  - {mt_name} is missing type ({mask.sum().item()} samples):")
                     self.logger.info(
                         f"    Quality - Image: {mt_img_quality:.4f} | Text: {mt_txt_quality:.4f} | Consistency: {mt_consistency:.4f}")
 

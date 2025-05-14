@@ -70,16 +70,16 @@ class CrossModalGenerator(nn.Module):
 
     def generate(self, source_features, source_modality, target_modality):
         """基于源模态特征生成目标模态特征"""
-        if source_features is None:
-            # 如果源特征不可用，使用先验生成器
-            batch_size = 1  # 默认批次大小
-            for mod in self.modalities:
-                if mod in source_features and source_features[mod] is not None:
-                    batch_size = source_features[mod].size(0)
-                    break
+        # 修改: 检测零填充特征而不是None
+        is_zeros = False
+        if source_features is not None:
+            # 判断是否全为零
+            is_zeros = torch.sum(torch.abs(source_features)) < 1e-6
 
-            # 使用随机噪声作为输入生成目标模态特征
-            noise = torch.randn(batch_size, 1, device=next(self.parameters()).device)
+        if source_features is None or is_zeros:
+            # 如果源特征不可用或是零填充，使用先验生成器
+            batch_size = 1  # 默认批次大小
+            noise = torch.randn(batch_size, 128, device=next(self.parameters()).device)
             return self.prior_generators[target_modality](noise)
 
         # 编码源特征
@@ -93,7 +93,7 @@ class CrossModalGenerator(nn.Module):
         前向传播，根据缺失情况生成特征
 
         Args:
-            features: 字典，键为模态名称，值为该模态的特征（可能为None表示缺失）
+            features: 字典，键为模态名称，值为该模态的特征（全零表示缺失）
             missing_types: 张量，表示每个样本的缺失类型 (none=0, image=1, text=2, both=3)
 
         Returns:
@@ -110,21 +110,23 @@ class CrossModalGenerator(nn.Module):
 
             # 根据缺失类型生成特征
             if missing_type == 1:  # 图像缺失
-                if "text" in features and features["text"] is not None:
-                    text_feat = features["text"][b:b + 1]
+                # 检查文本是否非零
+                text_feat = features["text"][b:b + 1] if "text" in features else None
+                if text_feat is not None and torch.sum(torch.abs(text_feat)) > 1e-6:
                     gen_image_feat = self.generate(text_feat, "text", "image")
                     output_features["image"].append(gen_image_feat)
                     output_features["text"].append(text_feat)
 
             elif missing_type == 2:  # 文本缺失
-                if "image" in features and features["image"] is not None:
-                    image_feat = features["image"][b:b + 1]
+                # 检查图像是否非零
+                image_feat = features["image"][b:b + 1] if "image" in features else None
+                if image_feat is not None and torch.sum(torch.abs(image_feat)) > 1e-6:
                     gen_text_feat = self.generate(image_feat, "image", "text")
                     output_features["text"].append(gen_text_feat)
                     output_features["image"].append(image_feat)
 
             elif missing_type == 3:  # 双模态都缺失
-                noise = torch.randn(1, 1, device=device)
+                noise = torch.randn(1, 128, device=device)
                 gen_image_feat = self.prior_generators["image"](noise)
                 gen_text_feat = self.prior_generators["text"](noise)
                 output_features["image"].append(gen_image_feat)
@@ -132,7 +134,7 @@ class CrossModalGenerator(nn.Module):
 
             else:  # missing_type == 0, 没缺失
                 for mod in self.modalities:
-                    if features.get(mod) is not None:
+                    if mod in features and torch.sum(torch.abs(features[mod][b:b + 1])) > 1e-6:
                         output_features[mod].append(features[mod][b:b + 1])
 
         # 最后 stack 回 tensor
