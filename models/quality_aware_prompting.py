@@ -461,136 +461,197 @@ class QualityAwareFeatureFusion(nn.Module):
     def __init__(self, image_dim, text_dim, fusion_dim, num_heads=4):
         super().__init__()
 
-        # Quality-weighted feature projection
+        # 特征投影
         self.image_proj = nn.Linear(image_dim, fusion_dim)
         self.text_proj = nn.Linear(text_dim, fusion_dim)
-        self.num_heads = num_heads
 
-        # Quality score projection
-        self.quality_proj = nn.Sequential(
-            nn.Linear(2, 64),  # Simplified: just use final scores for now
-            nn.GELU(),
-            nn.Linear(64, num_heads)
+        # 质量感知的注意力
+        self.quality_attn_weights = nn.Sequential(
+            nn.Linear(2, num_heads),  # 从质量分数投影到注意力头权重
+            nn.Sigmoid()  # 确保权重为正
         )
 
-        # Multi-head attention for quality-aware cross-modal fusion
+        # 多头注意力以进行质量感知的跨模态融合
         self.cross_attn = nn.MultiheadAttention(
             embed_dim=fusion_dim,
             num_heads=num_heads,
             batch_first=True
         )
 
-        # Calculate the correct input dimension for the output projection
-        # Each modality contributes fusion_dim, and we have 2 modalities (original + attended)
-        output_input_dim = fusion_dim * 2 * 2  # 2 modalities x 2 (original + attended) x fusion_dim
-
-        # Output projection with corrected input dimension
+        # 融合后的输出投影
         self.output_proj = nn.Sequential(
-            nn.Linear(output_input_dim, fusion_dim),
+            nn.Linear(fusion_dim * 2, fusion_dim),
             nn.LayerNorm(fusion_dim),
             nn.GELU(),
             nn.Dropout(0.1),
             nn.Linear(fusion_dim, fusion_dim)
         )
 
-        # Fallback weights when quality scores are not available
-        self.default_weights = nn.Parameter(torch.ones(1, 2) / 2)
+        # 用于质量感知的门控机制
+        self.quality_gate = nn.Sequential(
+            nn.Linear(2, 1),
+            nn.Sigmoid()
+        )
 
     def forward(self, image_feat, text_feat, quality_scores=None):
+        """
+        基于质量分数的前向传播函数
+
+        Args:
+            image_feat: 图像特征 [B, D_img]
+            text_feat: 文本特征 [B, D_txt]
+            quality_scores: 质量评估模块的输出
+
+        Returns:
+            融合特征和权重
+        """
         batch_size = image_feat.size(0)
         device = image_feat.device
-        fusion_dim = self.image_proj.out_features  # Get fusion dimension
 
-        # print(f"QualityAwareFeatureFusion - Input shapes:")
-        # print(f"  image_feat: {image_feat.shape}, text_feat: {text_feat.shape}")
-        # print(f"  fusion_dim: {fusion_dim}, num_heads: {self.cross_attn.num_heads}")
-
-        # Project features to fusion space
+        # 投影特征到融合空间
         img_proj = self.image_proj(image_feat)  # [B, fusion_dim]
         txt_proj = self.text_proj(text_feat)  # [B, fusion_dim]
 
-        # print(f"  After projection - img_proj: {img_proj.shape}, txt_proj: {txt_proj.shape}")
-
-        # Default fallback for missing quality scores
+        # 准备质量向量用于注意力调制
         if quality_scores is None or 'image' not in quality_scores or 'text' not in quality_scores:
-            attn_weights = self.default_weights.expand(batch_size, 2)
-            # print(f"  Using default weights: {attn_weights.shape}")
+            # 如果没有质量分数，使用均匀权重
+            quality_vector = torch.ones(batch_size, 2, device=device) * 0.5
         else:
-            # 检查质量分数
-            # print(f"  Quality scores structure: {list(quality_scores.keys())}")
+            # 使用质量分数
+            quality_vector = torch.cat([
+                quality_scores['image']['final_score'],
+                quality_scores['text']['final_score']
+            ], dim=1)  # [B, 2]
 
-            # Check if final_score exists and is not None
-            img_score = None
-            txt_score = None
+        # 生成注意力权重
+        attn_weights = self.quality_attn_weights(quality_vector)  # [B, num_heads]
 
-            if 'final_score' in quality_scores['image']:
-                img_score = quality_scores['image']['final_score']
-                # print(f"  img_score shape: {img_score.shape}")
-
-            if 'final_score' in quality_scores['text']:
-                txt_score = quality_scores['text']['final_score']
-                # print(f"  txt_score shape: {txt_score.shape}")
-
-            if img_score is None or txt_score is None:
-                attn_weights = self.default_weights.expand(batch_size, 2)
-                # print(f"  Using default weights (scores missing): {attn_weights.shape}")
-            else:
-                # Create simple quality vector with just final scores
-                quality_vector = torch.cat([
-                    img_score,
-                    txt_score
-                ], dim=1)
-
-                # print(f"  quality_vector shape: {quality_vector.shape}")
-
-                # Project quality to attention weights
-                attn_weights = torch.softmax(self.quality_proj(quality_vector), dim=1)
-                # print(f"  attn_weights shape after projection: {attn_weights.shape}")
-
-        # Prepare for multi-head attention
-        # Stack modalities as sequence [img, txt]
+        # 堆叠特征作为序列 [img, txt]
         features = torch.stack([img_proj, txt_proj], dim=1)  # [B, 2, fusion_dim]
-        # print(f"  stacked features shape: {features.shape}")
 
-        # 检查融合维度是否能被注意力头数整除
-        if fusion_dim % self.cross_attn.num_heads != 0:
-            print(f"  WARNING: fusion_dim ({fusion_dim}) is not divisible by num_heads ({self.cross_attn.num_heads})")
-            print(f"  fusion_dim % num_heads = {fusion_dim % self.cross_attn.num_heads}")
+        # 应用质量感知的跨模态注意力
+        # 我们现在不需要修改原生的attention机制，而是在后处理中应用质量权重
+        attn_output, _ = self.cross_attn(
+            query=features,
+            key=features,
+            value=features
+        )  # [B, 2, fusion_dim]
 
-        # Apply cross-modal attention with quality-aware weights
-        try:
-            attn_output, _ = self.cross_attn(
-                query=features,
-                key=features,
-                value=features,
-                need_weights=False
-            )
-            # print(f"  attn_output shape: {attn_output.shape}")
-        except Exception as e:
-            print(f"  ERROR in cross_attn: {str(e)}")
-            # 创建一个备用输出以防错误
-            attn_output = features.clone()
+        # 提取各模态的表示
+        img_attn = attn_output[:, 0]  # [B, fusion_dim]
+        txt_attn = attn_output[:, 1]  # [B, fusion_dim]
 
-        # Reshape both tensors to ensure correct dimensions
-        features_flat = features.reshape(batch_size, -1)  # [B, 2*fusion_dim]
-        attn_output_flat = attn_output.reshape(batch_size, -1)  # [B, 2*fusion_dim]
+        # 计算质量门控值
+        quality_gate = self.quality_gate(quality_vector)  # [B, 1]
 
-        # print(f"  features_flat: {features_flat.shape}, attn_output_flat: {attn_output_flat.shape}")
+        # 基于质量的加权平均
+        weighted_img = img_proj * quality_scores['image']['final_score']
+        weighted_txt = txt_proj * quality_scores['text']['final_score']
 
-        # Concatenate original and attended features
-        concat_features = torch.cat([features_flat, attn_output_flat], dim=1)
-        # print(f"  concat_features: {concat_features.shape}")
+        # 计算质量加权的特征
+        quality_weighted = (weighted_img + weighted_txt) / (
+                quality_scores['image']['final_score'] + quality_scores['text']['final_score'] + 1e-8
+        )
 
-        # Final projection
-        fused_features = self.output_proj(concat_features)
-        # print(f"  fused_features: {fused_features.shape}")
+        # 注意力输出和质量加权之间的插值
+        attn_weighted = (img_attn + txt_attn) / 2
+        fused_features = quality_gate * quality_weighted + (1 - quality_gate) * attn_weighted
 
-        # Generate simpler attention weights for return
-        simple_weights = torch.zeros(batch_size, 2, device=device)
-        simple_weights[:, 0] = attn_weights.mean(dim=1)  # Average weight for image
-        simple_weights[:, 1] = 1 - simple_weights[:, 0]  # Weight for text
+        # 应用最终投影
+        output_features = self.output_proj(torch.cat([fused_features, attn_weighted], dim=1))
 
-        return fused_features, simple_weights
+        # 为可视化目的返回简单权重
+        simple_weights = torch.cat([
+            quality_scores['image']['final_score'],
+            quality_scores['text']['final_score']
+        ], dim=1)
+
+        return output_features, simple_weights
+
+    # def forward(self, image_feat, text_feat, quality_scores=None):
+    #     batch_size = image_feat.size(0)
+    #     device = image_feat.device
+    #     fusion_dim = self.image_proj.out_features  # Get fusion dimension
+    #
+    #     # Project features to fusion space
+    #     img_proj = self.image_proj(image_feat)  # [B, fusion_dim]
+    #     txt_proj = self.text_proj(text_feat)  # [B, fusion_dim]
+    #
+    #     # Default fallback for missing quality scores
+    #     if quality_scores is None or 'image' not in quality_scores or 'text' not in quality_scores:
+    #         attn_weights = self.default_weights.expand(batch_size, 2)
+    #         # print(f"  Using default weights: {attn_weights.shape}")
+    #     else:
+    #         # 检查质量分数
+    #         img_score = None
+    #         txt_score = None
+    #
+    #         if 'final_score' in quality_scores['image']:
+    #             img_score = quality_scores['image']['final_score']
+    #             # print(f"  img_score shape: {img_score.shape}")
+    #
+    #         if 'final_score' in quality_scores['text']:
+    #             txt_score = quality_scores['text']['final_score']
+    #             # print(f"  txt_score shape: {txt_score.shape}")
+    #
+    #         if img_score is None or txt_score is None:
+    #             attn_weights = self.default_weights.expand(batch_size, 2)
+    #             # print(f"  Using default weights (scores missing): {attn_weights.shape}")
+    #         else:
+    #             # Create simple quality vector with just final scores
+    #             quality_vector = torch.cat([
+    #                 img_score,
+    #                 txt_score
+    #             ], dim=1)
+    #
+    #             # print(f"  quality_vector shape: {quality_vector.shape}")
+    #
+    #             # Project quality to attention weights
+    #             attn_weights = torch.softmax(self.quality_proj(quality_vector), dim=1)
+    #             # print(f"  attn_weights shape after projection: {attn_weights.shape}")
+    #
+    #     # Prepare for multi-head attention
+    #     # Stack modalities as sequence [img, txt]
+    #     features = torch.stack([img_proj, txt_proj], dim=1)  # [B, 2, fusion_dim]
+    #     # print(f"  stacked features shape: {features.shape}")
+    #
+    #     # 检查融合维度是否能被注意力头数整除
+    #     if fusion_dim % self.cross_attn.num_heads != 0:
+    #         print(f"  WARNING: fusion_dim ({fusion_dim}) is not divisible by num_heads ({self.cross_attn.num_heads})")
+    #         print(f"  fusion_dim % num_heads = {fusion_dim % self.cross_attn.num_heads}")
+    #
+    #     # Apply cross-modal attention with quality-aware weights
+    #     try:
+    #         attn_output, _ = self.cross_attn(
+    #             query=features,
+    #             key=features,
+    #             value=features,
+    #             need_weights=False
+    #         )
+    #         # print(f"  attn_output shape: {attn_output.shape}")
+    #     except Exception as e:
+    #         print(f"  ERROR in cross_attn: {str(e)}")
+    #         # 创建一个备用输出以防错误
+    #         attn_output = features.clone()
+    #
+    #     # Reshape both tensors to ensure correct dimensions
+    #     features_flat = features.reshape(batch_size, -1)  # [B, 2*fusion_dim]
+    #     attn_output_flat = attn_output.reshape(batch_size, -1)  # [B, 2*fusion_dim]
+    #
+    #     # Concatenate original and attended features
+    #     concat_features = torch.cat([features_flat, attn_output_flat], dim=1)
+    #     # print(f"  concat_features: {concat_features.shape}")
+    #
+    #     # Final projection
+    #     fused_features = self.output_proj(concat_features)
+    #     # print(f"  fused_features: {fused_features.shape}")
+    #
+    #     # Generate simpler attention weights for return
+    #     simple_weights = torch.zeros(batch_size, 2, device=device)
+    #     simple_weights[:, 0] = attn_weights.mean(dim=1)  # Average weight for image
+    #     simple_weights[:, 1] = 1 - simple_weights[:, 0]  # Weight for text
+    #
+    #     return fused_features, simple_weights
 
     # def forward(self, image_feat, text_feat, quality_scores=None):
     #     batch_size = image_feat.size(0)
