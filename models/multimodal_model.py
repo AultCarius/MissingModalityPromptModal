@@ -913,7 +913,7 @@ class MultimodalPromptModel(nn.Module):
         base_hidden = self.fusion(fused)
         hidden = None
         if quality_guided_feat is not None:
-            alpha = 0.5  # Fixed weight or learnable parameter
+            alpha = 0.7  # Fixed weight or learnable parameter
             hidden = alpha * base_hidden + (1 - alpha) * quality_guided_feat
         logits = self.classifier(hidden)
 
@@ -929,6 +929,8 @@ class MultimodalPromptModel(nn.Module):
             'generated_features': generated_features,  # 生成的特征
             'reconstructed_features': reconstructed_features  # 重建的特征
         }
+        # print(missing_type)
+        # print(additional_info['generated_modalities'])
 
         return (logits, additional_info)
         # return logits if not self.training else (logits, additional_info)

@@ -516,8 +516,8 @@ class Trainer:
 
                     # ===== 第3部分：对比损失计算 =====
                     contrastive_loss_value = 0.0
-                    contrastive_decay = max(0.1,1.0-current_epoch/max_epochs)
-                    contrastive_weight = 0.5 * contrastive_decay  # 对比损失的权重（可调整）
+                    contrastive_decay = min(1.0,1.0-current_epoch/max_epochs)
+                    contrastive_weight = 1 * contrastive_decay  # 对比损失的权重（可调整）
 
                     # 计算双模态样本之间的对比损失（促进模态间对齐）
                     both_modalities = (missing_type == 0)  # 找出完整样本
