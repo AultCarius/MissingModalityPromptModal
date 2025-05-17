@@ -76,8 +76,9 @@ if __name__ == '__main__':
 
     # 4. 初始化Trainer
     trainer = Trainer(model, train_loader, val_loader, config=config)  # 测试时可以不需要训练和验证数据加载器
+
     # 5. 加载最佳模型并运行测试
-    best_model_path = "experiments\\food101_0509_clip_nocurrimlearn_mr0.7\\checkpoints\\best_model.pt"  # 替换为你的模型路径
+    best_model_path = "E:\\DL\\exp\\self\\food101_0514_text_0.7\\checkpoints\\best_model.pt"  # 替换为你的模型路径
     test_results = trainer.test(test_loader=test_loader, model_path=best_model_path)
 
     # 6. 打印测试结果

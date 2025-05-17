@@ -53,11 +53,11 @@ asl_clip: 0.05
 dataset: "food101"
 data_dir: "./data/food101"
 
-missing_strategy: "both"
+missing_strategy: "text"
 missing_prob: 0.7
-val_missing_strategy: "both"
+val_missing_strategy: "text"
 val_missing_prob: 0.7
-test_missing_strategy: "both"
+test_missing_strategy: "text"
 test_missing_prob: 0.7
 
 # Add after missing_prob line

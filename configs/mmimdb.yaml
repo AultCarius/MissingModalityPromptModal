@@ -1,5 +1,5 @@
 # 实验配置
-experiment_name: "mmimdb_allclip"
+experiment_name: "mmimdb_image_0.7"
 
 # Model Configuration
 image_model_name: "openai/clip-vit-base-patch16"
@@ -13,8 +13,8 @@ freeze_image_encoder: True
 freeze_text_encoder: True
 use_quality_prompt: True
 use_cross_modal_prompt: True
-initial_recon_weight: 1
-final_recon_weight: 0.1
+initial_recon_weight: 2
+final_recon_weight: 0.2
 max_length: 77
 
 # Training Configuration
@@ -49,11 +49,11 @@ asl_clip: 0.05
 dataset: "mmimdb"
 data_dir: "./data/mmimdb"
 
-missing_strategy: "both"
+missing_strategy: "image"
 missing_prob: 0.7
-val_missing_strategy: "both"
+val_missing_strategy: "image"
 val_missing_prob: 0.7
-test_missing_strategy: "both"
+test_missing_strategy: "image"
 test_missing_prob: 0.7
 
 # Add after missing_prob line

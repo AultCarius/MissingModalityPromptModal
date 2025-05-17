@@ -161,10 +161,13 @@ class Trainer:
         # 保存关键代码文件
         files_to_copy = [
             "trainer.py",
-            "datamodules/Food101DataModule.py",
+            "test.py",
+            "train.py",
+            "datamodules/UPMCFood101DataModule.py",
             "datamodules/MmimdbDataModule.py",
             "models/multimodal_model.py",
-            "models/quality_aware_prompting.py"
+            "models/quality_aware_prompting.py",
+            "models/modality_generator.py"
         ]
 
         for file_path in files_to_copy:
@@ -513,7 +516,8 @@ class Trainer:
 
                     # ===== 第3部分：对比损失计算 =====
                     contrastive_loss_value = 0.0
-                    contrastive_weight = 0.5  # 对比损失的权重（可调整）
+                    contrastive_decay = max(0.1,1.0-current_epoch/max_epochs)
+                    contrastive_weight = 0.5 * contrastive_decay  # 对比损失的权重（可调整）
 
                     # 计算双模态样本之间的对比损失（促进模态间对齐）
                     both_modalities = (missing_type == 0)  # 找出完整样本
@@ -1541,6 +1545,9 @@ class Trainer:
         Returns:
             Dictionary of test metrics
         """
+        # 判断数据集类型 (单标签或多标签)
+        dataset_type = self.config.get("dataset", "mmimdb")
+        self.is_single_label = dataset_type == "food101"
         # Use provided test loader or default
         if test_loader is None:
             if not hasattr(self, 'test_loader') or self.test_loader is None:
@@ -1556,13 +1563,14 @@ class Trainer:
 
         self.model.eval()
         all_preds, all_labels = [], []
+        all_logits = []  # Store raw logits for detailed analysis
 
         # Track metrics by missing modality type
         missing_type_metrics = {
-            'none': {'preds': [], 'labels': []},
-            'image': {'preds': [], 'labels': []},
-            'text': {'preds': [], 'labels': []},
-            'both': {'preds': [], 'labels': []}
+            'none': {'preds': [], 'labels': [], 'logits': []},
+            'image': {'preds': [], 'labels': [], 'logits': []},
+            'text': {'preds': [], 'labels': [], 'logits': []},
+            'both': {'preds': [], 'labels': [], 'logits': []}
         }
 
         # Track generation quality
@@ -1604,39 +1612,26 @@ class Trainer:
                             quality_scores_by_type[mt_name]['consistency'].append(
                                 quality_scores['cross_consistency'][b].item())
 
-                    # Process reconstruction quality
-                    if additional_info and 'reconstructed_features' in additional_info:
-                        recon_features = additional_info['reconstructed_features']
-                        orig_features = additional_info['original_features']
-
-                        # Evaluate image reconstruction (for missing image samples)
-                        if 'image' in recon_features and recon_features['image'] is not None:
-                            for b in range(missing_type.size(0)):
-                                if missing_type[b].item() == 1:  # Image missing
-                                    if orig_features['image'] is not None:
-                                        # This should not happen as image is missing, but check just in case
-                                        continue
-                                    # Skip if we can't evaluate reconstruction quality
-                                    # (we need the ground truth to compare)
-                                    continue
-
-                        # Evaluate text reconstruction (for missing text samples)
-                        if 'text' in recon_features and recon_features['text'] is not None:
-                            for b in range(missing_type.size(0)):
-                                if missing_type[b].item() == 2:  # Text missing
-                                    if orig_features['text'] is not None:
-                                        # This should not happen as text is missing, but check just in case
-                                        continue
-                                    # Skip if we can't evaluate reconstruction quality
-                                    continue
+                    # Process reconstruction quality (no changes needed here)
+                    # ...existing code for reconstruction quality...
                 else:
                     logits = output
 
-                preds = (logits > 0.5).float()
+                # Handle different classification types
+                if self.is_single_label:
+                    # Single-label classification (Food101) - use argmax
+                    pred_indices = logits.argmax(dim=1)
+                    # Convert to one-hot format for consistent processing
+                    preds = torch.zeros_like(logits)
+                    preds.scatter_(1, pred_indices.unsqueeze(1), 1.0)
+                else:
+                    # Multi-label classification (MMIMDB) - use threshold
+                    preds = (logits > 0.5).float()
 
                 # Collect overall predictions and labels
                 all_preds.append(preds.cpu())
                 all_labels.append(label.cpu())
+                all_logits.append(logits.cpu())
 
                 # Collect predictions and labels by missing type
                 for b in range(missing_type.size(0)):
@@ -1645,13 +1640,21 @@ class Trainer:
 
                     missing_type_metrics[mt_name]['preds'].append(preds[b:b + 1].cpu())
                     missing_type_metrics[mt_name]['labels'].append(label[b:b + 1].cpu())
+                    missing_type_metrics[mt_name]['logits'].append(logits[b:b + 1].cpu())
 
         # Combine all predictions and labels
         all_preds = torch.cat(all_preds, dim=0)
         all_labels = torch.cat(all_labels, dim=0)
+        all_logits = torch.cat(all_logits, dim=0)
 
         # Calculate overall metrics
         metrics = self._compute_metrics(all_preds, all_labels)
+
+        # Print detailed statistics based on dataset type
+        if self.is_single_label:
+            self._detailed_statistics_food101(all_logits, all_labels, all_preds, "Test Overall")
+        else:
+            self._detailed_statistics(all_logits, all_labels, all_preds, "Test Overall")
 
         # Calculate metrics by missing type
         missing_type_results = {}
@@ -1659,6 +1662,7 @@ class Trainer:
             if data['preds'] and data['labels']:
                 mt_preds = torch.cat(data['preds'], dim=0)
                 mt_labels = torch.cat(data['labels'], dim=0)
+                mt_logits = torch.cat(data['logits'], dim=0)
                 mt_metrics = self._compute_metrics(mt_preds, mt_labels)
                 missing_type_results[mt_name] = mt_metrics
 
@@ -1666,6 +1670,12 @@ class Trainer:
                 self.logger.info(f"Missing type {mt_name} ({len(data['preds'])} samples):")
                 metrics_str = " | ".join([f"{k}={v:.4f}" for k, v in mt_metrics.items()])
                 self.logger.info(f"  {metrics_str}")
+
+                # Print detailed statistics by missing type
+                if self.is_single_label:
+                    self._detailed_statistics_food101(mt_logits, mt_labels, mt_preds, f"Test {mt_name}")
+                else:
+                    self._detailed_statistics(mt_logits, mt_labels, mt_preds, f"Test {mt_name}")
 
                 # Log quality scores for this missing type
                 if quality_scores_by_type[mt_name]['image']:
@@ -1696,7 +1706,6 @@ class Trainer:
         }
 
         return detailed_metrics
-
     def contrastive_loss(self,x1, x2, temperature=0.1):
         """计算对比损失，用于提高特征表示质量"""
         # 确保输入是2D的 [batch_size, feature_dim]
@@ -1722,7 +1731,7 @@ class Trainer:
 
     # In trainer.py
 
-    def modality_contrastive_loss(self, image_features, text_features, temperature=0.1):
+    def modality_contrastive_loss(self, image_features, text_features, temperature=0.2):
         """
         Contrastive loss between modalities with dimension handling
         """
