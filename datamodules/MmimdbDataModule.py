@@ -190,7 +190,7 @@ class mmimdbDataModule(BaseDataModule):
         self.test_missing_prob = test_missing_prob  # 新增的测试集缺失率
 
     def setup(self, stage=None):
-        split_path = os.path.join(self.data_dir, "split_small.json")
+        split_path = os.path.join(self.data_dir, "split.json")
         with open(split_path, "r") as f:
             split_data = json.load(f)
 
