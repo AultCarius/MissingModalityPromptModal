@@ -475,7 +475,7 @@ def test_batch_dependency(model, datamodule, trainer):
 if __name__ == "__main__":
     # 修改路径以匹配你的设置
     config_path = "configs/mmimdb.yaml"  # 你的配置文件路径
-    checkpoint_path = "E:\\DL\\exp\\self\\mmimdb_both_0.7_clip_curleran\\checkpoints\\best_model.pt"  # 你的检查点路径
+    checkpoint_path = "E:\\DL\\exp\\self\\mmimdb_both_0.7_clip\\checkpoints\\best_model.pt"  # 你的检查点路径
 
     # 创建输出目录
     os.makedirs('debug_plots', exist_ok=True)

@@ -374,6 +374,8 @@ class Trainer:
             quality_loss_sum = 0
             adv_loss_sum = 0
 
+            consistency_loss_sum = 0
+
             all_preds, all_labels = [], []
 
             # 质量评估和融合权重统计
@@ -506,6 +508,26 @@ class Trainer:
 
                     # 结合分类损失和重建损失
                     total_batch_loss = classification_loss + recon_weight * reconstruction_loss
+
+                    # ===== 临时: 特征一致性,强调图像的缺失恢复
+                    # 计算特征一致性损失 - 强调图像缺失恢复
+                    feature_consistency_loss = 0.0
+                    if hasattr(self.model, 'compute_feature_consistency_loss'):
+                        if 'original_features' in additional_info and 'reconstructed_features' in additional_info:
+                            consistency_loss = self.model.compute_feature_consistency_loss(
+                                additional_info['original_features'],
+                                additional_info['reconstructed_features']
+                            )
+
+                            # 添加到总损失
+                            total_batch_loss = total_batch_loss + 0.2 * consistency_loss  # 0.2权重避免过度影响
+                            feature_consistency_loss = consistency_loss.item()
+
+                    # 记录损失值
+                    cls_loss += classification_loss.item()
+                    recon_loss += reconstruction_loss if isinstance(reconstruction_loss,
+                                                                    torch.Tensor) else reconstruction_loss
+                    consistency_loss_sum += feature_consistency_loss  # 新增记录
 
                     # ===== 第3部分：对比损失计算 =====
                     # 计算原始样本之间的损失有什么用?它怎么能训练模型本身呢,从头到尾就没有下降啊
@@ -1242,6 +1264,23 @@ class Trainer:
         if self.writer and epoch is not None:
             for k, v in metrics.items():
                 self.writer.add_scalar(f"{k}/val", v, epoch)
+
+            # 更新质量评估器的性能统计 - 新增
+            if hasattr(self.model, 'quality_estimator') and hasattr(self.model.quality_estimator,
+                                                                    'update_performance_stats'):
+                # 获取不同缺失类型的性能
+                img_missing_perf = missing_type_results.get('image', {}).get(self.primary_metric, 0.4)
+                txt_missing_perf = missing_type_results.get('text', {}).get(self.primary_metric, 0.5)
+
+                # 更新质量评估器
+                self.model.quality_estimator.update_performance_stats(
+                    torch.tensor(img_missing_perf),
+                    torch.tensor(txt_missing_perf)
+                )
+
+                # 记录日志
+                self.logger.info(
+                    f"Updated modality performance stats - Image missing: {img_missing_perf:.4f}, Text missing: {txt_missing_perf:.4f}")
 
         return metrics
 

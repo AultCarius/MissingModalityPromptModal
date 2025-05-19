@@ -1,5 +1,5 @@
 # 实验配置
-experiment_name: "food101_0515_text_test"
+experiment_name: "food101_0515_image_test"
 
 # Model Configuration
 image_model_name: "openai/clip-vit-base-patch16"
@@ -53,11 +53,11 @@ asl_clip: 0.05
 dataset: "food101"
 data_dir: "./data/food101"
 
-missing_strategy: "text"
+missing_strategy: "image"
 missing_prob: 0.7
-val_missing_strategy: "text"
+val_missing_strategy: "image"
 val_missing_prob: 0.7
-test_missing_strategy: "text"
+test_missing_strategy: "image"
 test_missing_prob: 0.7
 
 # Add after missing_prob line

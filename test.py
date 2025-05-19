@@ -9,8 +9,8 @@ from models.multimodal_model import create_multimodal_prompt_model
 
 # 1. 加载配置
 if __name__ == '__main__':
-    config_path = "configs/mmimdb.yaml"
-    # config_path = "configs/food101.yaml"
+    # config_path = "configs/mmimdb.yaml"
+    config_path = "configs/food101.yaml"
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
 
@@ -83,7 +83,7 @@ if __name__ == '__main__':
     trainer.class_weights = datamodule.get_class_weights().to(trainer.device)
 
     # 5. 加载最佳模型并运行测试
-    best_model_path = "E:\\DL\\exp\\self\\mmimdb_both_0.7_clip_curleran\\checkpoints\\best_model.pt"  # 替换为你的模型路径
+    best_model_path = "E:\\DL\\exp\\self\\food101_0514_image_0.7\\checkpoints\\best_model.pt"  # 替换为你的模型路径
     test_results = trainer.test(test_loader=test_loader, model_path=best_model_path)
 
     # 6. 打印测试结果

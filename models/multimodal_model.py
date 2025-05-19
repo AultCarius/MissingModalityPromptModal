@@ -342,6 +342,39 @@ class MultimodalPromptModel(nn.Module):
                 for param in module.parameters():
                     param.requires_grad = False
 
+    # 添加到MultimodalPromptModel类中
+    def compute_feature_consistency_loss(self, original_features, reconstructed_features):
+        """计算特征一致性损失"""
+        consistency_loss = 0.0
+
+        # 检查图像特征一致性
+        if 'image' in original_features and 'image' in reconstructed_features:
+            # 原始和重建特征都存在
+            if original_features['image'] is not None and reconstructed_features['image'] is not None:
+                # 计算均方误差损失
+                img_loss = F.mse_loss(
+                    reconstructed_features['image'],
+                    original_features['image']
+                )
+
+                # 图像特征一致性损失加权1.5倍 - 增强对图像缺失的处理
+                consistency_loss += 1.5 * img_loss
+
+        # 检查文本特征一致性
+        if 'text' in original_features and 'text' in reconstructed_features:
+            # 原始和重建特征都存在
+            if original_features['text'] is not None and reconstructed_features['text'] is not None:
+                # 计算均方误差损失
+                txt_loss = F.mse_loss(
+                    reconstructed_features['text'],
+                    original_features['text']
+                )
+
+                # 文本特征一致性损失正常权重
+                consistency_loss += txt_loss
+
+        return consistency_loss
+
     def _prepare_attention_mask(self, attention_mask, input_shape):
         """准备用于Transformer层的注意力掩码"""
         # 扩展维度以创建4D掩码

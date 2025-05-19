@@ -300,20 +300,34 @@ class EnhancedModalityQualityEstimator(nn.Module):
         self.register_buffer('text_mean', torch.zeros(1, text_dim))
         self.register_buffer('text_std', torch.ones(1, text_dim))
 
+        # # Generation confidence predictor
+        # self.generation_quality = nn.Sequential(
+        #     nn.Linear(image_dim + text_dim, hidden_dim),
+        #     nn.GELU(),
+        #     nn.Linear(hidden_dim, 2)  # [image_confidence, text_confidence]
+        # )
+
+        # 添加特殊的生成图像质量评估补偿器 - 新增
+        self.gen_image_compensation = nn.Sequential(
+            nn.LayerNorm(image_dim),
+            nn.Linear(image_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, 1),
+            nn.Sigmoid()
+        )
+
         # Learnable importance weights
         self.image_weights = nn.Parameter(torch.ones(5) / 5)
         self.text_weights = nn.Parameter(torch.ones(5) / 5)
         self.consistency_weights = nn.Parameter(torch.ones(3) / 3)
 
-        # Generation confidence predictor
-        self.generation_quality = nn.Sequential(
-            nn.Linear(image_dim + text_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, 2)  # [image_confidence, text_confidence]
-        )
-
         # Modality fusion weights
         self.fusion_weight = nn.Parameter(torch.tensor([0.5]))  # Balance between individual quality and consistency
+
+        # 可学习的平衡权重 - 新增
+        self.modality_importance = nn.Parameter(torch.FloatTensor([1.0, 1.0]))  # [图像,文本]
+        self.register_buffer('performance_stats', torch.zeros(2))  # [图像缺失性能,文本缺失性能]
 
     def update_reference_statistics(self, image_feats, text_feats):
         """Update reference statistics for normalization (call during training)"""
@@ -344,25 +358,15 @@ class EnhancedModalityQualityEstimator(nn.Module):
                          text_feat.size(0) if text_feat is not None else 0)
         device = image_feat.device if image_feat is not None else text_feat.device
 
-        # Track which features are real vs. generated
+        # 检测模态缺失状态
         if missing_type is not None:
             is_image_missing = (missing_type == 1) | (missing_type == 3)
             is_text_missing = (missing_type == 2) | (missing_type == 3)
         else:
-            # 修改: 如果没有提供缺失类型，检测零填充特征
-            is_image_missing = torch.sum(torch.abs(image_feat),
-                                         dim=(1, 2)) < 1e-6 if image_feat is not None else torch.ones(batch_size,
-                                                                                                      dtype=torch.bool,
-                                                                                                      device=device)
-            is_text_missing = torch.sum(torch.abs(text_feat),
-                                        dim=(1, 2)) < 1e-6 if text_feat is not None else torch.ones(batch_size,
-                                                                                                    dtype=torch.bool,
-                                                                                                    device=device)
+            is_image_missing = torch.zeros(batch_size, dtype=torch.bool, device=device)
+            is_text_missing = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
-        # Normalize features for more stable quality estimation
-        norm_img, norm_txt = self.normalize_features(image_feat, text_feat)
-
-        # Initialize results
+        # 初始化结果
         results = {
             'image': {
                 'quality': torch.zeros(batch_size, 5, device=device),
@@ -375,91 +379,259 @@ class EnhancedModalityQualityEstimator(nn.Module):
             'cross_consistency': torch.zeros(batch_size, 1, device=device)
         }
 
-        # Image quality assessment
-        if norm_img is not None:
-            # Get quality dimensions
-            img_quality = self.image_quality(norm_img)
+        # 图像质量评估 - 为生成图像应用补偿
+        if image_feat is not None:
+            img_quality = self.image_quality(image_feat)
 
-            # Apply penalties for generated features
+            # 特殊处理：为生成的图像特征提供补偿增强
             if is_image_missing.any():
-                # Create confidence mask (1.0 for real, 0.7 for generated)
-                conf_mask = torch.ones(batch_size, 1, device=device)
-                conf_mask[is_image_missing] = 0.7
+                # 获取生成图像的补偿系数
+                compensation = self.gen_image_compensation(image_feat[is_image_missing])
+                # 应用补偿 - 提高权重最多20%
+                boost_factor = 1.0 + 0.2 * compensation
+                # 仅应用于图像缺失样本
+                img_weights = torch.ones(batch_size, 1, device=device)
+                img_weights[is_image_missing] = boost_factor
+                # 应用权重
+                img_quality_weighted = img_quality * img_weights
+            else:
+                img_quality_weighted = img_quality
 
-                # Apply to quality scores
-                img_quality = img_quality * conf_mask
-
-            # Calculate final score using learned weights
-            img_weights = F.softmax(self.image_weights, dim=0)
-            img_final = torch.sigmoid(torch.sum(img_quality * img_weights, dim=1, keepdim=True))
+            # 计算最终分数
+            img_weights = F.softmax(self.modality_importance[0] * torch.ones_like(img_quality), dim=1)
+            img_final = torch.sigmoid(torch.sum(img_quality_weighted * img_weights, dim=1, keepdim=True))
 
             results['image']['quality'] = img_quality
             results['image']['final_score'] = img_final
-        else:
-            # Default low scores for missing modality
-            results['image']['quality'] = torch.full((batch_size, 5), -1.0, device=device)
-            results['image']['final_score'] = torch.full((batch_size, 1), 0.1, device=device)
 
-        # Text quality assessment (similar approach)
-        if norm_txt is not None:
-            txt_quality = self.text_quality(norm_txt)
 
-            if is_text_missing.any():
-                conf_mask = torch.ones(batch_size, 1, device=device)
-                conf_mask[is_text_missing] = 0.7
-                txt_quality = txt_quality * conf_mask
 
-            txt_weights = F.softmax(self.text_weights, dim=0)
+        # 文本质量评估 - 保持原有逻辑
+        if text_feat is not None:
+            txt_quality = self.text_quality(text_feat)
+            txt_weights = F.softmax(self.modality_importance[1] * torch.ones_like(txt_quality), dim=1)
             txt_final = torch.sigmoid(torch.sum(txt_quality * txt_weights, dim=1, keepdim=True))
 
             results['text']['quality'] = txt_quality
             results['text']['final_score'] = txt_final
-        else:
-            results['text']['quality'] = torch.full((batch_size, 5), -1.0, device=device)
-            results['text']['final_score'] = torch.full((batch_size, 1), 0.1, device=device)
 
-        # Cross-modal consistency assessment
-        if norm_img is not None and norm_txt is not None:
-            concat_feat = torch.cat([norm_img, norm_txt], dim=1)
+        # 计算跨模态一致性
+        if image_feat is not None and text_feat is not None:
+            concat_feat = torch.cat([image_feat, text_feat], dim=1)
             consistency_dims = self.cross_consistency(concat_feat)
 
-            # Apply penalties for generated features
+            # 确保一致性维度是正确的 [batch_size, 3]
+            if consistency_dims.dim() > 2:
+                consistency_dims = consistency_dims.squeeze(1)
+
+            # 应用惩罚，但保持维度兼容
             if is_image_missing.any() or is_text_missing.any():
-                # More severe penalty if both are generated
+                # 对生成特征应用惩罚
                 both_generated = is_image_missing & is_text_missing
                 one_generated = (is_image_missing | is_text_missing) & ~both_generated
 
-                # Create confidence mask
-                conf_mask = torch.ones(batch_size, 1, device=device)
-                conf_mask[one_generated] = 0.7  # One generated
-                conf_mask[both_generated] = 0.5  # Both generated
+                # 创建惩罚掩码
+                penalty_mask = torch.ones(batch_size, 1, device=device)
+                penalty_mask[one_generated] = 0.7  # 一个模态生成
+                penalty_mask[both_generated] = 0.5  # 两个模态都生成
 
-                consistency_dims = consistency_dims * conf_mask
+                # 应用惩罚到一致性维度
+                consistency_dims = consistency_dims * penalty_mask
 
-            # Calculate final consistency score
-            consistency_weights = F.softmax(self.consistency_weights, dim=0)
+            # 计算最终一致性分数
+            consistency_weights = F.softmax(torch.ones_like(consistency_dims), dim=1)
             consistency = torch.sigmoid(torch.sum(consistency_dims * consistency_weights, dim=1, keepdim=True))
 
             results['cross_consistency'] = consistency
         else:
             results['cross_consistency'] = torch.full((batch_size, 1), 0.5, device=device)
 
-        # Adjust modality scores based on consistency
-        if self.training:
-            # During training, gradually increase the importance of consistency
-            w = torch.sigmoid(self.fusion_weight)
+        # 整合一致性到最终分数
+        # 修正版本
+        if 'final_score' in results['image'] and 'final_score' in results['text']:
+            # 获取标准权重，并确保转换为标量
+            importance = F.softmax(self.modality_importance, dim=0)
+            img_importance = importance[0].item()  # 转换为Python标量
+            txt_importance = importance[1].item()  # 转换为Python标量
 
-            if norm_img is not None and norm_txt is not None:
-                # Adjust scores based on consistency
-                results['image']['final_score'] = (1 - w) * results['image']['final_score'] + w * results[
-                    'cross_consistency']
-                results['text']['final_score'] = (1 - w) * results['text']['final_score'] + w * results[
-                    'cross_consistency']
+            # 检查是否有图像缺失样本
+            if is_image_missing.any():
+                # 创建批次大小的权重矩阵，使用标量填充
+                img_weights = torch.full((batch_size, 1), img_importance, device=device)
+                txt_weights = torch.full((batch_size, 1), txt_importance, device=device)
 
-        # print("\nmisstype:",missing_type,"\nfinal_score:",results['image']['final_score'],results['text']['final_score']
-        #       ,"\ncross_consistency",results['cross_consistency'])
+                # 只为图像缺失的样本调整权重
+                img_missing_mask = is_image_missing.view(-1, 1)
+                img_weights[img_missing_mask] = 0.55  # 图像缺失时提高图像权重
+                txt_weights[img_missing_mask] = 0.45  # 相应降低文本权重
+
+                # 应用权重和一致性
+                results['image']['final_score'] = results['image']['final_score'] * results[
+                    'cross_consistency'] * img_weights
+                results['text']['final_score'] = results['text']['final_score'] * results[
+                    'cross_consistency'] * txt_weights
+            else:
+                # 正常情况，使用标准权重
+                results['image']['final_score'] = results['image']['final_score'] * results[
+                    'cross_consistency'] * img_importance
+                results['text']['final_score'] = results['text']['final_score'] * results[
+                    'cross_consistency'] * txt_importance
+
+        # print("质量评分为")
+        # print(results['image']['final_score'].shape)
+        # print(results['text']['final_score'].shape)
+        # print(results['cross_consistency'].shape)
 
         return results
+
+    # 添加性能统计更新方法 - 可以在训练循环中调用
+    def update_performance_stats(self, img_missing_perf, txt_missing_perf):
+        """更新模态缺失性能统计"""
+        # 将输入转换为张量
+        if not isinstance(img_missing_perf, torch.Tensor):
+            img_missing_perf = torch.tensor(img_missing_perf, device=self.performance_stats.device)
+        if not isinstance(txt_missing_perf, torch.Tensor):
+            txt_missing_perf = torch.tensor(txt_missing_perf, device=self.performance_stats.device)
+
+        # 使用非就地操作更新性能统计
+        self.performance_stats = torch.stack([img_missing_perf, txt_missing_perf])
+
+        # 根据性能差距计算权重调整
+        perf_ratio = txt_missing_perf / (img_missing_perf + 1e-8)  # 防止除零
+
+        # 限制在合理范围内
+        perf_ratio = torch.clamp(perf_ratio, 0.8, 1.25)
+
+        # 创建新的权重，而不是修改原来的
+        new_importance = torch.zeros_like(self.modality_importance)
+        new_importance[0] = perf_ratio
+        new_importance[1] = 2.0 - perf_ratio
+
+        # 使用非就地操作 - 通过优化器更新
+        with torch.no_grad():
+            self.modality_importance.copy_(new_importance)
+    #
+    # def forward(self, image_feat, text_feat, missing_type=None):
+    #     batch_size = max(image_feat.size(0) if image_feat is not None else 0,
+    #                      text_feat.size(0) if text_feat is not None else 0)
+    #     device = image_feat.device if image_feat is not None else text_feat.device
+    #
+    #     # Track which features are real vs. generated
+    #     if missing_type is not None:
+    #         is_image_missing = (missing_type == 1) | (missing_type == 3)
+    #         is_text_missing = (missing_type == 2) | (missing_type == 3)
+    #     else:
+    #         # 修改: 如果没有提供缺失类型，检测零填充特征
+    #         is_image_missing = torch.sum(torch.abs(image_feat),
+    #                                      dim=(1, 2)) < 1e-6 if image_feat is not None else torch.ones(batch_size,
+    #                                                                                                   dtype=torch.bool,
+    #                                                                                                   device=device)
+    #         is_text_missing = torch.sum(torch.abs(text_feat),
+    #                                     dim=(1, 2)) < 1e-6 if text_feat is not None else torch.ones(batch_size,
+    #                                                                                                 dtype=torch.bool,
+    #                                                                                                 device=device)
+    #
+    #     # Normalize features for more stable quality estimation
+    #     norm_img, norm_txt = self.normalize_features(image_feat, text_feat)
+    #
+    #     # Initialize results
+    #     results = {
+    #         'image': {
+    #             'quality': torch.zeros(batch_size, 5, device=device),
+    #             'final_score': torch.zeros(batch_size, 1, device=device)
+    #         },
+    #         'text': {
+    #             'quality': torch.zeros(batch_size, 5, device=device),
+    #             'final_score': torch.zeros(batch_size, 1, device=device)
+    #         },
+    #         'cross_consistency': torch.zeros(batch_size, 1, device=device)
+    #     }
+    #
+    #     # Image quality assessment
+    #     if norm_img is not None:
+    #         # Get quality dimensions
+    #         img_quality = self.image_quality(norm_img)
+    #
+    #         # Apply penalties for generated features
+    #         if is_image_missing.any():
+    #             # Create confidence mask (1.0 for real, 0.7 for generated)
+    #             conf_mask = torch.ones(batch_size, 1, device=device)
+    #             conf_mask[is_image_missing] = 0.7
+    #
+    #             # Apply to quality scores
+    #             img_quality = img_quality * conf_mask
+    #
+    #         # Calculate final score using learned weights
+    #         img_weights = F.softmax(self.image_weights, dim=0)
+    #         img_final = torch.sigmoid(torch.sum(img_quality * img_weights, dim=1, keepdim=True))
+    #
+    #         results['image']['quality'] = img_quality
+    #         results['image']['final_score'] = img_final
+    #     else:
+    #         # Default low scores for missing modality
+    #         results['image']['quality'] = torch.full((batch_size, 5), -1.0, device=device)
+    #         results['image']['final_score'] = torch.full((batch_size, 1), 0.1, device=device)
+    #
+    #     # Text quality assessment (similar approach)
+    #     if norm_txt is not None:
+    #         txt_quality = self.text_quality(norm_txt)
+    #
+    #         if is_text_missing.any():
+    #             conf_mask = torch.ones(batch_size, 1, device=device)
+    #             conf_mask[is_text_missing] = 0.7
+    #             txt_quality = txt_quality * conf_mask
+    #
+    #         txt_weights = F.softmax(self.text_weights, dim=0)
+    #         txt_final = torch.sigmoid(torch.sum(txt_quality * txt_weights, dim=1, keepdim=True))
+    #
+    #         results['text']['quality'] = txt_quality
+    #         results['text']['final_score'] = txt_final
+    #     else:
+    #         results['text']['quality'] = torch.full((batch_size, 5), -1.0, device=device)
+    #         results['text']['final_score'] = torch.full((batch_size, 1), 0.1, device=device)
+    #
+    #     # Cross-modal consistency assessment
+    #     if norm_img is not None and norm_txt is not None:
+    #         concat_feat = torch.cat([norm_img, norm_txt], dim=1)
+    #         consistency_dims = self.cross_consistency(concat_feat)
+    #
+    #         # Apply penalties for generated features
+    #         if is_image_missing.any() or is_text_missing.any():
+    #             # More severe penalty if both are generated
+    #             both_generated = is_image_missing & is_text_missing
+    #             one_generated = (is_image_missing | is_text_missing) & ~both_generated
+    #
+    #             # Create confidence mask
+    #             conf_mask = torch.ones(batch_size, 1, device=device)
+    #             conf_mask[one_generated] = 0.7  # One generated
+    #             conf_mask[both_generated] = 0.5  # Both generated
+    #
+    #             consistency_dims = consistency_dims * conf_mask
+    #
+    #         # Calculate final consistency score
+    #         consistency_weights = F.softmax(self.consistency_weights, dim=0)
+    #         consistency = torch.sigmoid(torch.sum(consistency_dims * consistency_weights, dim=1, keepdim=True))
+    #
+    #         results['cross_consistency'] = consistency
+    #     else:
+    #         results['cross_consistency'] = torch.full((batch_size, 1), 0.5, device=device)
+    #
+    #     # Adjust modality scores based on consistency
+    #     if self.training:
+    #         # During training, gradually increase the importance of consistency
+    #         w = torch.sigmoid(self.fusion_weight)
+    #
+    #         if norm_img is not None and norm_txt is not None:
+    #             # Adjust scores based on consistency
+    #             results['image']['final_score'] = (1 - w) * results['image']['final_score'] + w * results[
+    #                 'cross_consistency']
+    #             results['text']['final_score'] = (1 - w) * results['text']['final_score'] + w * results[
+    #                 'cross_consistency']
+    #
+    #     # print("\nmisstype:",missing_type,"\nfinal_score:",results['image']['final_score'],results['text']['final_score']
+    #     #       ,"\ncross_consistency",results['cross_consistency'])
+    #
+    #     return results
 
 
 class QualityAwareFeatureFusion(nn.Module):
@@ -498,91 +670,16 @@ class QualityAwareFeatureFusion(nn.Module):
             nn.Sigmoid()
         )
 
-    # def forward(self, image_feat, text_feat, quality_scores=None):
-    #     """
-    #     基于质量分数的前向传播函数
-    #
-    #     Args:
-    #         image_feat: 图像特征 [B, D_img]
-    #         text_feat: 文本特征 [B, D_txt]
-    #         quality_scores: 质量评估模块的输出
-    #
-    #     Returns:
-    #         融合特征和权重
-    #     """
-    #
-    #     if self.training or (random.random() < 0.01):  # 训练模式或随机采样1%
-    #         self._log_fusion_inputs(image_feat, text_feat, quality_scores)
-    #
-    #
-    #     batch_size = image_feat.size(0)
-    #     device = image_feat.device
-    #
-    #     # 投影特征到融合空间
-    #     img_proj = self.image_proj(image_feat)  # [B, fusion_dim]
-    #     txt_proj = self.text_proj(text_feat)  # [B, fusion_dim]
-    #
-    #     # 准备质量向量用于注意力调制
-    #     if quality_scores is None or 'image' not in quality_scores or 'text' not in quality_scores:
-    #         # 如果没有质量分数，使用均匀权重
-    #         quality_vector = torch.ones(batch_size, 2, device=device) * 0.5
-    #     else:
-    #         # 使用质量分数
-    #         quality_vector = torch.cat([
-    #             quality_scores['image']['final_score'],
-    #             quality_scores['text']['final_score']
-    #         ], dim=1)  # [B, 2]
-    #
-    #     # 生成注意力权重
-    #     attn_weights = self.quality_attn_weights(quality_vector)  # [B, num_heads]
-    #
-    #     # 堆叠特征作为序列 [img, txt]
-    #     features = torch.stack([img_proj, txt_proj], dim=1)  # [B, 2, fusion_dim]
-    #
-    #     # 应用质量感知的跨模态注意力
-    #     # 我们现在不需要修改原生的attention机制，而是在后处理中应用质量权重
-    #     attn_output, _ = self.cross_attn(
-    #         query=features,
-    #         key=features,
-    #         value=features
-    #     )  # [B, 2, fusion_dim]
-    #
-    #     # 提取各模态的表示
-    #     img_attn = attn_output[:, 0]  # [B, fusion_dim]
-    #     txt_attn = attn_output[:, 1]  # [B, fusion_dim]
-    #
-    #     # 计算质量门控值
-    #     quality_gate = self.quality_gate(quality_vector)  # [B, 1]
-    #
-    #     # 基于质量的加权平均
-    #     weighted_img = img_proj * quality_scores['image']['final_score']
-    #     weighted_txt = txt_proj * quality_scores['text']['final_score']
-    #
-    #     # 计算质量加权的特征
-    #     quality_weighted = (weighted_img + weighted_txt) / (
-    #             quality_scores['image']['final_score'] + quality_scores['text']['final_score'] + 1e-8
-    #     )
-    #
-    #     # 注意力输出和质量加权之间的插值
-    #     attn_weighted = (img_attn + txt_attn) / 2
-    #     fused_features = quality_gate * quality_weighted + (1 - quality_gate) * attn_weighted
-    #
-    #     # 应用最终投影
-    #     output_features = self.output_proj(torch.cat([fused_features, attn_weighted], dim=1))
-    #
-    #     # 为可视化目的返回简单权重
-    #     simple_weights = torch.cat([
-    #         quality_scores['image']['final_score'],
-    #         quality_scores['text']['final_score']
-    #     ], dim=1)
-    #
-    #     # 记录输出融合权重
-    #     if simple_weights is not None and (self.training or (random.random() < 0.01)):
-    #         self._log_fusion_weights(simple_weights)
-    #
-    #     return output_features, simple_weights
+        # 添加图像缺失补偿网络 - 新增
+        self.image_missing_compensator = nn.Sequential(
+            nn.Linear(fusion_dim, fusion_dim),
+            nn.LayerNorm(fusion_dim),
+            nn.GELU(),
+            nn.Dropout(0.2),
+            nn.Linear(fusion_dim, fusion_dim)
+        )
 
-    # 在quality_aware_prompting.py文件中的QualityAwareFeatureFusion类中添加
+
     def forward(self, image_feat, text_feat, quality_scores=None):
         batch_size = image_feat.size(0)
         device = image_feat.device
@@ -626,6 +723,22 @@ class QualityAwareFeatureFusion(nn.Module):
 
             if log_details:
                 print(f"Quality vector: {quality_vector.mean(dim=0).tolist()}")
+        # ---------
+
+        # 检测图像缺失情况 - 使用质量分数比例
+        if quality_scores is not None:
+            # 获取图像和文本质量分数
+            img_quality = quality_scores['image']['final_score']  # [batch_size, 1]
+            txt_quality = quality_scores['text']['final_score']  # [batch_size, 1]
+
+            # 计算质量比例
+            quality_ratio = img_quality / (txt_quality + 1e-8)  # 防止除零
+
+            # 使用简单阈值检测图像缺失 - 图像质量显著低于文本质量
+            is_img_missing = (quality_ratio < 0.7).float()  # 阈值0.7
+        else:
+            # 默认情况下假设没有缺失
+            is_img_missing = torch.zeros(batch_size, 1, device=device)
 
         # 生成注意力权重
         attn_weights = self.quality_attn_weights(quality_vector)
@@ -655,6 +768,16 @@ class QualityAwareFeatureFusion(nn.Module):
 
         if log_details:
             print(f"Quality gate: {quality_gate.mean().item():.6f}")
+        #---------
+        # 对图像缺失情况应用特殊处理
+        missing_compensation = torch.zeros_like(img_attn)
+        for i in range(batch_size):
+            if is_img_missing[i] > 0.5:  # 阈值0.5判断为缺失
+                # 应用补偿
+                missing_compensation[i] = self.image_missing_compensator(img_attn[i])
+
+        # 添加补偿到图像特征
+        img_attn = img_attn + missing_compensation * is_img_missing
 
         # 基于质量的加权平均
         weighted_img = img_proj * quality_scores['image']['final_score']
@@ -678,6 +801,9 @@ class QualityAwareFeatureFusion(nn.Module):
         if log_details:
             print(f"Attention weighted: {attn_weighted.mean().item():.6f}")
             print(f"Final fused features: {fused_features.mean().item():.6f}")
+
+        # 添加特征规范化 - 保证特征分布合理?
+        fused_features = F.layer_norm(fused_features, fused_features.shape[1:])
 
         # 应用最终投影
         output_features = self.output_proj(torch.cat([fused_features, attn_weighted], dim=1))

@@ -1,5 +1,5 @@
 # 实验配置
-experiment_name: "mmimdb_gaijinceshi"
+experiment_name: "mmimdb_add_enchanceimage_both"
 
 # Model Configuration
 image_model_name: "openai/clip-vit-base-patch16" #[vit_base_patch16_224,openai/clip-vit-base-patch16]
