@@ -1,4 +1,6 @@
 # Quality Aware Prompting
+import random
+
 from timm import create_model
 from transformers import CLIPTextModel, CLIPTokenizer
 import torch
@@ -454,6 +456,9 @@ class EnhancedModalityQualityEstimator(nn.Module):
                 results['text']['final_score'] = (1 - w) * results['text']['final_score'] + w * results[
                     'cross_consistency']
 
+        # print("\nmisstype:",missing_type,"\nfinal_score:",results['image']['final_score'],results['text']['final_score']
+        #       ,"\ncross_consistency",results['cross_consistency'])
+
         return results
 
 
@@ -493,72 +498,193 @@ class QualityAwareFeatureFusion(nn.Module):
             nn.Sigmoid()
         )
 
+    # def forward(self, image_feat, text_feat, quality_scores=None):
+    #     """
+    #     基于质量分数的前向传播函数
+    #
+    #     Args:
+    #         image_feat: 图像特征 [B, D_img]
+    #         text_feat: 文本特征 [B, D_txt]
+    #         quality_scores: 质量评估模块的输出
+    #
+    #     Returns:
+    #         融合特征和权重
+    #     """
+    #
+    #     if self.training or (random.random() < 0.01):  # 训练模式或随机采样1%
+    #         self._log_fusion_inputs(image_feat, text_feat, quality_scores)
+    #
+    #
+    #     batch_size = image_feat.size(0)
+    #     device = image_feat.device
+    #
+    #     # 投影特征到融合空间
+    #     img_proj = self.image_proj(image_feat)  # [B, fusion_dim]
+    #     txt_proj = self.text_proj(text_feat)  # [B, fusion_dim]
+    #
+    #     # 准备质量向量用于注意力调制
+    #     if quality_scores is None or 'image' not in quality_scores or 'text' not in quality_scores:
+    #         # 如果没有质量分数，使用均匀权重
+    #         quality_vector = torch.ones(batch_size, 2, device=device) * 0.5
+    #     else:
+    #         # 使用质量分数
+    #         quality_vector = torch.cat([
+    #             quality_scores['image']['final_score'],
+    #             quality_scores['text']['final_score']
+    #         ], dim=1)  # [B, 2]
+    #
+    #     # 生成注意力权重
+    #     attn_weights = self.quality_attn_weights(quality_vector)  # [B, num_heads]
+    #
+    #     # 堆叠特征作为序列 [img, txt]
+    #     features = torch.stack([img_proj, txt_proj], dim=1)  # [B, 2, fusion_dim]
+    #
+    #     # 应用质量感知的跨模态注意力
+    #     # 我们现在不需要修改原生的attention机制，而是在后处理中应用质量权重
+    #     attn_output, _ = self.cross_attn(
+    #         query=features,
+    #         key=features,
+    #         value=features
+    #     )  # [B, 2, fusion_dim]
+    #
+    #     # 提取各模态的表示
+    #     img_attn = attn_output[:, 0]  # [B, fusion_dim]
+    #     txt_attn = attn_output[:, 1]  # [B, fusion_dim]
+    #
+    #     # 计算质量门控值
+    #     quality_gate = self.quality_gate(quality_vector)  # [B, 1]
+    #
+    #     # 基于质量的加权平均
+    #     weighted_img = img_proj * quality_scores['image']['final_score']
+    #     weighted_txt = txt_proj * quality_scores['text']['final_score']
+    #
+    #     # 计算质量加权的特征
+    #     quality_weighted = (weighted_img + weighted_txt) / (
+    #             quality_scores['image']['final_score'] + quality_scores['text']['final_score'] + 1e-8
+    #     )
+    #
+    #     # 注意力输出和质量加权之间的插值
+    #     attn_weighted = (img_attn + txt_attn) / 2
+    #     fused_features = quality_gate * quality_weighted + (1 - quality_gate) * attn_weighted
+    #
+    #     # 应用最终投影
+    #     output_features = self.output_proj(torch.cat([fused_features, attn_weighted], dim=1))
+    #
+    #     # 为可视化目的返回简单权重
+    #     simple_weights = torch.cat([
+    #         quality_scores['image']['final_score'],
+    #         quality_scores['text']['final_score']
+    #     ], dim=1)
+    #
+    #     # 记录输出融合权重
+    #     if simple_weights is not None and (self.training or (random.random() < 0.01)):
+    #         self._log_fusion_weights(simple_weights)
+    #
+    #     return output_features, simple_weights
+
+    # 在quality_aware_prompting.py文件中的QualityAwareFeatureFusion类中添加
     def forward(self, image_feat, text_feat, quality_scores=None):
-        """
-        基于质量分数的前向传播函数
-
-        Args:
-            image_feat: 图像特征 [B, D_img]
-            text_feat: 文本特征 [B, D_txt]
-            quality_scores: 质量评估模块的输出
-
-        Returns:
-            融合特征和权重
-        """
         batch_size = image_feat.size(0)
         device = image_feat.device
 
-        # 投影特征到融合空间
-        img_proj = self.image_proj(image_feat)  # [B, fusion_dim]
-        txt_proj = self.text_proj(text_feat)  # [B, fusion_dim]
+        # 在开始时添加详细日志
+        # log_details = (torch.rand(1).item() < 0.01)  # 1%的随机概率记录详情
+        log_details = 0  # 1%的随机概率记录详情
 
-        # 准备质量向量用于注意力调制
+        if log_details:
+            print(f"\n=== FUSION TRACING (batch_size={batch_size}) ===")
+            print(f"Image feature stats: shape={image_feat.shape}, mean={image_feat.mean().item():.6f}, "
+                  f"std={image_feat.std().item():.6f}, norm={torch.norm(image_feat, dim=1).mean().item():.6f}")
+            print(f"Text feature stats: shape={text_feat.shape}, mean={text_feat.mean().item():.6f}, "
+                  f"std={text_feat.std().item():.6f}, norm={torch.norm(text_feat, dim=1).mean().item():.6f}")
+
+            if quality_scores is not None:
+                img_q = quality_scores['image']['final_score'].mean().item()
+                txt_q = quality_scores['text']['final_score'].mean().item()
+                cons = quality_scores['cross_consistency'].mean().item()
+                print(f"Quality scores: image={img_q:.6f}, text={txt_q:.6f}, consistency={cons:.6f}")
+
+        # 原始forward函数代码
+        img_proj = self.image_proj(image_feat)
+        txt_proj = self.text_proj(text_feat)
+
+        if log_details:
+            print(f"Projected features: img_proj={img_proj.shape}, img_proj_mean={img_proj.mean().item():.6f}, "
+                  f"txt_proj={txt_proj.shape}, txt_proj_mean={txt_proj.mean().item():.6f}")
+
+        # 准备质量向量
         if quality_scores is None or 'image' not in quality_scores or 'text' not in quality_scores:
-            # 如果没有质量分数，使用均匀权重
             quality_vector = torch.ones(batch_size, 2, device=device) * 0.5
+
+            if log_details:
+                print("Using default quality vector [0.5, 0.5]")
         else:
-            # 使用质量分数
             quality_vector = torch.cat([
                 quality_scores['image']['final_score'],
                 quality_scores['text']['final_score']
-            ], dim=1)  # [B, 2]
+            ], dim=1)
+
+            if log_details:
+                print(f"Quality vector: {quality_vector.mean(dim=0).tolist()}")
 
         # 生成注意力权重
-        attn_weights = self.quality_attn_weights(quality_vector)  # [B, num_heads]
+        attn_weights = self.quality_attn_weights(quality_vector)
+
+        if log_details:
+            print(f"Attention weights: {attn_weights.mean(dim=0).tolist()}")
 
         # 堆叠特征作为序列 [img, txt]
-        features = torch.stack([img_proj, txt_proj], dim=1)  # [B, 2, fusion_dim]
+        features = torch.stack([img_proj, txt_proj], dim=1)
 
         # 应用质量感知的跨模态注意力
-        # 我们现在不需要修改原生的attention机制，而是在后处理中应用质量权重
         attn_output, _ = self.cross_attn(
             query=features,
             key=features,
             value=features
-        )  # [B, 2, fusion_dim]
+        )
 
         # 提取各模态的表示
-        img_attn = attn_output[:, 0]  # [B, fusion_dim]
-        txt_attn = attn_output[:, 1]  # [B, fusion_dim]
+        img_attn = attn_output[:, 0]
+        txt_attn = attn_output[:, 1]
+
+        if log_details:
+            print(f"Attention output: img_attn={img_attn.mean().item():.6f}, txt_attn={txt_attn.mean().item():.6f}")
 
         # 计算质量门控值
-        quality_gate = self.quality_gate(quality_vector)  # [B, 1]
+        quality_gate = self.quality_gate(quality_vector)
+
+        if log_details:
+            print(f"Quality gate: {quality_gate.mean().item():.6f}")
 
         # 基于质量的加权平均
         weighted_img = img_proj * quality_scores['image']['final_score']
         weighted_txt = txt_proj * quality_scores['text']['final_score']
+
+        if log_details:
+            print(f"Weighted features: img={weighted_img.mean().item():.6f}, txt={weighted_txt.mean().item():.6f}")
 
         # 计算质量加权的特征
         quality_weighted = (weighted_img + weighted_txt) / (
                 quality_scores['image']['final_score'] + quality_scores['text']['final_score'] + 1e-8
         )
 
+        if log_details:
+            print(f"Quality weighted: {quality_weighted.mean().item():.6f}")
+
         # 注意力输出和质量加权之间的插值
         attn_weighted = (img_attn + txt_attn) / 2
         fused_features = quality_gate * quality_weighted + (1 - quality_gate) * attn_weighted
 
+        if log_details:
+            print(f"Attention weighted: {attn_weighted.mean().item():.6f}")
+            print(f"Final fused features: {fused_features.mean().item():.6f}")
+
         # 应用最终投影
         output_features = self.output_proj(torch.cat([fused_features, attn_weighted], dim=1))
+
+        if log_details:
+            print(f"Output features: {output_features.mean().item():.6f}")
+            print("=== END FUSION TRACING ===\n")
 
         # 为可视化目的返回简单权重
         simple_weights = torch.cat([
@@ -567,6 +693,7 @@ class QualityAwareFeatureFusion(nn.Module):
         ], dim=1)
 
         return output_features, simple_weights
+
 
 
     # def forward(self, image_feat, text_feat, quality_scores=None):

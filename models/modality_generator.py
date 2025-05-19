@@ -222,12 +222,14 @@ class CycleGenerationModel(nn.Module):
         batch_mode = isinstance(missing_type, torch.Tensor) and missing_type.dim() > 0
 
         if not batch_mode:
+            # print("no batch mode")
             # 单样本处理
             missing_type = int(missing_type)
             generated , reconstructed= self._generate_for_sample(features, missing_type)
             # reconstructed = self.reconstructor(generated)
             return generated, reconstructed
         else:
+            # print("batch mode")
             # 批量处理，但逐个样本处理以避免批处理问题
             batch_size = missing_type.size(0)
             device = missing_type.device

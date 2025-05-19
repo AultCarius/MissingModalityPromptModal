@@ -347,14 +347,6 @@ class Trainer:
         dataset_type = self.config.get("dataset", "mmimdb")
         self.is_single_label = dataset_type == "food101"
 
-        # Debug: 首个批次标签检查
-        with torch.no_grad():
-            for batch in self.train_loader:
-                _, _, _, label, _ = [x.to(self.device) for x in batch]
-                self.logger.info(f"标签形状: {label.shape}")
-                self.logger.info(f"每个样本标签和: {label.sum(dim=1)[:10]}")  # 显示前10个样本的标签和
-                break
-
         # ===== 开始训练循环 =====
         for epoch in range(self.start_epoch, num_epochs):
             current_epoch = epoch
@@ -400,6 +392,7 @@ class Trainer:
 
             # ===== 批次训练循环 =====
             for batch_idx, batch in enumerate(self.train_loader):
+
                 # 加载批次数据
                 image, input_ids, attention_mask, label, missing_type = [x.to(self.device) for x in batch]
                 is_image_missing = (missing_type == 1) | (missing_type == 3)
@@ -515,6 +508,7 @@ class Trainer:
                     total_batch_loss = classification_loss + recon_weight * reconstruction_loss
 
                     # ===== 第3部分：对比损失计算 =====
+                    # 计算原始样本之间的损失有什么用?它怎么能训练模型本身呢,从头到尾就没有下降啊
                     contrastive_loss_value = 0.0
                     contrastive_decay = min(1.0,1.0-current_epoch/max_epochs)
                     contrastive_weight = 1 * contrastive_decay  # 对比损失的权重（可调整）
@@ -678,7 +672,7 @@ class Trainer:
                     preds.scatter_(1, pred_indices.unsqueeze(1), 1.0)
                 else:
                     # 多标签分类 - 使用阈值
-                    preds = (logits > 0.5).float()
+                    preds = (logits > -0.2).float()
 
                 # 收集预测和真实标签用于指标计算
                 all_preds.append(preds.cpu().detach())
@@ -872,6 +866,91 @@ class Trainer:
 
         return results
 
+    # 在test或evaluate函数中添加以下代码
+    def examine_logits(self, logits, missing_type, labels=None, prefix=""):
+        """
+        详细检查不同缺失类型下的logits分布
+
+        Args:
+            logits: 模型输出的logits [batch_size, num_classes]
+            missing_type: 缺失类型标记 [batch_size]
+            labels: 可选的真实标签 [batch_size, num_classes]
+            prefix: 日志前缀
+        """
+        # 将张量转移到CPU并转为NumPy数组处理
+        logits_np = logits.detach().cpu().numpy()
+        missing_type_np = missing_type.detach().cpu().numpy()
+
+        # 分离不同缺失类型的logits
+        missing_types = {
+            'none': (missing_type_np == 0),
+            'image': (missing_type_np == 1),
+            'text': (missing_type_np == 2),
+            'both': (missing_type_np == 3)
+        }
+
+        self.logger.info(f"\n{prefix} Logits Analysis:")
+
+        # 对每种缺失类型分析
+        for mt_name, mask in missing_types.items():
+            if not np.any(mask):
+                continue  # 跳过没有样本的缺失类型
+
+            mt_logits = logits_np[mask]
+            sample_count = mt_logits.shape[0]
+
+            # 基本统计信息
+            stats = {
+                'mean': np.mean(mt_logits),
+                'std': np.std(mt_logits),
+                'min': np.min(mt_logits),
+                'max': np.max(mt_logits),
+                'positive%': np.mean(mt_logits > 0) * 100,
+                'samples': sample_count
+            }
+
+            self.logger.info(f"  {mt_name} ({sample_count} samples):")
+            self.logger.info(f"    mean={stats['mean']:.4f}, std={stats['std']:.4f}, min={stats['min']:.4f}, "
+                             f"max={stats['max']:.4f}, positive%={stats['positive%']:.2f}%")
+
+            # 每个类别的详细统计
+            if mt_name == 'image':  # 重点分析图像缺失情况
+                self.logger.info(f"    Per-class logits for {mt_name}:")
+
+                # 计算每个类别的统计信息
+                for i in range(mt_logits.shape[1]):
+                    cls_logits = mt_logits[:, i]
+                    cls_stats = {
+                        'mean': np.mean(cls_logits),
+                        'std': np.std(cls_logits),
+                        'min': np.min(cls_logits),
+                        'max': np.max(cls_logits),
+                        'positive%': np.mean(cls_logits > 0) * 100
+                    }
+
+                    # 如果有标签，计算此类别的真实正例比例
+                    if labels is not None:
+                        labels_np = labels.detach().cpu().numpy()
+                        cls_positive = np.mean(labels_np[mask, i]) * 100
+                        cls_info = f"Class {i}: mean={cls_stats['mean']:.4f}, positive%={cls_stats['positive%']:.2f}%, true_positive%={cls_positive:.2f}%"
+                    else:
+                        cls_info = f"Class {i}: mean={cls_stats['mean']:.4f}, positive%={cls_stats['positive%']:.2f}%"
+
+                    self.logger.info(f"      {cls_info}")
+
+                # 计算logits分布
+                hist, bins = np.histogram(mt_logits.flatten(), bins=10, range=(-5, 5))
+                self.logger.info(f"    Logits histogram:")
+                for i, (start, end) in enumerate(zip(bins[:-1], bins[1:])):
+                    self.logger.info(f"      [{start:.2f}, {end:.2f}): {hist[i]}")
+
+                # 计算每个样本的预测数量
+                pred_counts = np.sum(mt_logits > 0, axis=1)
+                unique_counts, count_freqs = np.unique(pred_counts, return_counts=True)
+                self.logger.info(f"    Prediction counts per sample:")
+                for count, freq in zip(unique_counts, count_freqs):
+                    self.logger.info(f"      {count} predictions: {freq} samples ({freq / sample_count * 100:.2f}%)")
+
     def evaluate(self, epoch=None):
         """在验证集上评估模型，返回各种指标"""
         self.model.eval()
@@ -937,7 +1016,7 @@ class Trainer:
                     preds.scatter_(1, pred_indices.unsqueeze(1), 1.0)
                 else:
                     # 多标签分类 - 使用阈值
-                    preds = (logits > 0.5).float()
+                    preds = (logits > -0.2).float()
 
                 # 收集总体预测和标签
                 all_preds.append(preds.cpu())
@@ -957,6 +1036,9 @@ class Trainer:
         all_preds = torch.cat(all_preds, dim=0)
         all_labels = torch.cat(all_labels, dim=0)
         all_logits = torch.cat(all_logits, dim=0)
+
+        print("检查logits")
+        self.examine_logits(logits, missing_type)
 
         # 计算总体指标
         metrics = self._compute_metrics(all_preds, all_labels)
@@ -1626,7 +1708,7 @@ class Trainer:
                     preds.scatter_(1, pred_indices.unsqueeze(1), 1.0)
                 else:
                     # Multi-label classification (MMIMDB) - use threshold
-                    preds = (logits > 0.5).float()
+                    preds = (logits > -0.2).float()
 
                 # Collect overall predictions and labels
                 all_preds.append(preds.cpu())
