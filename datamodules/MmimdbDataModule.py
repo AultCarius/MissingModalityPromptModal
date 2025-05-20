@@ -90,9 +90,18 @@ class MMIMDBDataset(Dataset):
         missing_type_tensor = torch.tensor({
                                                "none": 0, "image": 1, "text": 2, "both": 3
                                            }[missing_type])
+        # 修改: 使用零填充表示缺失模态，而不是None
+        if missing_type in ["image", "both"]:
+            # 用零张量替代图像，保留相同的形状
+            image = torch.zeros_like(image)
+
+        if missing_type in ["text", "both"]:
+            # 用零张量替代文本，保留相同的形状
+            input_ids = torch.zeros_like(input_ids)
+            attention_mask = torch.zeros_like(attention_mask)
 
         return (
-            image, input_ids, attention_mask,  # 可见模态数据
+            image, input_ids, attention_mask,
             label, missing_type_tensor
         )
 

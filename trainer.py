@@ -8,7 +8,7 @@ import shutil
 import numpy as np
 from torch.utils.tensorboard import SummaryWriter
 from datetime import datetime
-from sklearn.metrics import f1_score, roc_auc_score, accuracy_score
+
 from transformers import get_linear_schedule_with_warmup
 import torch.nn.functional as F
 from scripts.emailsender import (
@@ -20,6 +20,9 @@ from scripts.emailsender import (
 import torch.nn as nn
 from tqdm import tqdm
 from scipy.special import softmax
+
+# from sklearn.metrics import f1_score, roc_auc_score, accuracy_score
+from torchmetrics.functional import f1_score, auroc, accuracy
 
 # torch.autograd.set_detect_anomaly(True)
 GENRE_CLASS = [
@@ -347,14 +350,6 @@ class Trainer:
         dataset_type = self.config.get("dataset", "mmimdb")
         self.is_single_label = dataset_type == "food101"
 
-        # Debug: 首个批次标签检查
-        with torch.no_grad():
-            for batch in self.train_loader:
-                _, _, _, label, _ = [x.to(self.device) for x in batch]
-                self.logger.info(f"标签形状: {label.shape}")
-                self.logger.info(f"每个样本标签和: {label.sum(dim=1)[:10]}")  # 显示前10个样本的标签和
-                break
-
         # ===== 开始训练循环 =====
         for epoch in range(self.start_epoch, num_epochs):
             current_epoch = epoch
@@ -382,6 +377,8 @@ class Trainer:
             quality_loss_sum = 0
             adv_loss_sum = 0
 
+            consistency_loss_sum = 0
+
             all_preds, all_labels = [], []
 
             # 质量评估和融合权重统计
@@ -400,6 +397,7 @@ class Trainer:
 
             # ===== 批次训练循环 =====
             for batch_idx, batch in enumerate(self.train_loader):
+
                 # 加载批次数据
                 image, input_ids, attention_mask, label, missing_type = [x.to(self.device) for x in batch]
                 is_image_missing = (missing_type == 1) | (missing_type == 3)
@@ -514,10 +512,31 @@ class Trainer:
                     # 结合分类损失和重建损失
                     total_batch_loss = classification_loss + recon_weight * reconstruction_loss
 
+                    # ===== 临时: 特征一致性,强调图像的缺失恢复
+                    # 计算特征一致性损失 - 强调图像缺失恢复
+                    feature_consistency_loss = 0.0
+                    if hasattr(self.model, 'compute_feature_consistency_loss'):
+                        if 'original_features' in additional_info and 'reconstructed_features' in additional_info:
+                            consistency_loss = self.model.compute_feature_consistency_loss(
+                                additional_info['original_features'],
+                                additional_info['reconstructed_features']
+                            )
+
+                            # 添加到总损失
+                            total_batch_loss = total_batch_loss + 0.2 * consistency_loss  # 0.2权重避免过度影响
+                            feature_consistency_loss = consistency_loss.item()
+
+                    # 记录损失值
+                    cls_loss += classification_loss.item()
+                    recon_loss += reconstruction_loss if isinstance(reconstruction_loss,
+                                                                    torch.Tensor) else reconstruction_loss
+                    consistency_loss_sum += feature_consistency_loss  # 新增记录
+
                     # ===== 第3部分：对比损失计算 =====
+                    # 计算原始样本之间的损失有什么用?它怎么能训练模型本身呢,从头到尾就没有下降啊
                     contrastive_loss_value = 0.0
-                    contrastive_decay = min(1.0,1.0-current_epoch/max_epochs)
-                    contrastive_weight = 1 * contrastive_decay  # 对比损失的权重（可调整）
+                    contrastive_decay = max(0.1,1.0-current_epoch/max_epochs)
+                    contrastive_weight = 0.5 * contrastive_decay  # 对比损失的权重（可调整）
 
                     # 计算双模态样本之间的对比损失（促进模态间对齐）
                     both_modalities = (missing_type == 0)  # 找出完整样本
@@ -803,74 +822,292 @@ class Trainer:
 
 
     def _compute_metrics(self, preds, labels):
-        """计算多种评估指标"""
+        """
+            使用torchmetrics.functional计算评估指标，适用于单标签(Food101)和多标签(MMIMDB)分类任务。
+
+            Args:
+                preds: 预测值（logits或概率）
+                       对于Food101: [batch_size, 101]
+                       对于MMIMDB: [batch_size, 23]
+                labels: 真实标签
+                        对于Food101: [batch_size, 101]（one-hot编码）或 [batch_size]（类别索引）
+                        对于MMIMDB: [batch_size, 23]（multi-hot编码）
+
+            Returns:
+                指标字典
+            """
+        # 确保输入是PyTorch张量并在同一设备上
+        device = preds.device
+
+        # 初始化结果字典
         results = {}
 
-        # 将张量转换为NumPy数组
-        preds_np = preds.numpy()
-        labels_np = labels.numpy()
-
         if self.is_single_label:
-            # 单标签分类 - 使用argmax获取类别索引
-            pred_classes = preds_np.argmax(axis=1)
-            true_classes = labels_np.argmax(axis=1)
+            # 单标签分类 (Food101)
 
-            # 计算准确率
-            results["accuracy"] = (pred_classes == true_classes).mean()
+            # 获取预测的类别索引
+            pred_classes = preds.argmax(dim=1)
+
+            # 如果标签是one-hot编码，转换为类别索引
+            if labels.dim() > 1 and labels.size(1) > 1:
+                true_classes = labels.argmax(dim=1)
+            else:
+                true_classes = labels
 
             try:
-                # 计算多类别F1分数
-                results["macro_f1"] = f1_score(true_classes, pred_classes, average='macro', zero_division=0)
-                results["micro_f1"] = f1_score(true_classes, pred_classes, average='micro', zero_division=0)
-                # 计算AUROC - 对于多类别使用OVR策略
+                # 计算准确率
+                results["accuracy"] = accuracy(
+                    pred_classes,
+                    true_classes,
+                    task="multiclass",
+                    num_classes=preds.size(1)
+                ).item()
+
+                # 计算F1分数
+                results["macro_f1"] = f1_score(
+                    pred_classes,
+                    true_classes,
+                    task="multiclass",
+                    num_classes=preds.size(1),
+                    average="macro"
+                ).item()
+
+                results["micro_f1"] = f1_score(
+                    pred_classes,
+                    true_classes,
+                    task="multiclass",
+                    num_classes=preds.size(1),
+                    average="micro"
+                ).item()
+
+                # 如果需要计算AUROC
                 if "auroc" in self.metrics:
-                    # 将预测转为概率
-                    # 对于softmax输出，使用原始logits计算每类概率
-                    probs = softmax(preds_np, axis=1)
+                    # 转换logits为概率分布
+                    probs = F.softmax(preds, dim=1)
                     try:
-                        results["auroc"] = roc_auc_score(labels_np, probs, average='macro', multi_class='ovr')
-                    except:
-                        results["auroc"] = 0.5  # 随机猜测的AUC值
+                        results["auroc"] = auroc(
+                            probs,
+                            true_classes,
+                            task="multiclass",
+                            num_classes=preds.size(1),
+                            average="macro"
+                        ).item()
+                    except Exception as e:
+                        self.logger.warning(f"计算AUROC时出错: {str(e)}")
+                        results["auroc"] = 0.5  # 随机分类器的默认值
             except Exception as e:
-                self.logger.warning(f"计算F1分数时出错: {str(e)}")
+                self.logger.warning(f"计算指标时出错: {str(e)}")
+                results["accuracy"] = 0.0
                 results["macro_f1"] = 0.0
                 results["micro_f1"] = 0.0
-                results["auroc"] = 0.5  # 随机猜测的AUC值
+                results["auroc"] = 0.5
 
         else:
-            # 计算要求的指标
-            if "accuracy" in self.metrics:
-                # 多标签情况下的准确率计算
-                correct = ((preds_np > 0.5) == (labels_np > 0.5)).sum()
-                total = labels_np.size
-                results["accuracy"] = correct / total
+            # 多标签分类 (MMIMDB)
 
-            if "macro_f1" in self.metrics:
-                # 多标签宏平均F1
-                # 对每个样本的每个类别计算是否预测正确
-                binary_preds = (preds_np > 0.5).astype(float)
-                try:
-                    results["macro_f1"] = f1_score(labels_np, binary_preds, average='macro', zero_division=0)
-                except:
-                    results["macro_f1"] = 0.0
+            # 使用threshold将logits转换为二值预测
+            threshold = 0.5  # 与您原始代码中相同的阈值
+            preds_sigmoid = torch.sigmoid(preds)
+            binary_preds = (preds > threshold).float()
 
-            if "micro_f1" in self.metrics:
-                # 多标签微平均F1
-                binary_preds = (preds_np > 0.5).astype(float)
-                try:
-                    results["micro_f1"] = f1_score(labels_np, binary_preds, average='micro', zero_division=0)
-                except:
-                    results["micro_f1"] = 0.0
+            try:
+                # 计算多标签准确率（元素级匹配）
+                correct = (binary_preds == labels).sum().float()
+                total = labels.numel()
+                results["accuracy"] = (correct / total).item()
 
-            if "auroc" in self.metrics:
-                # 多标签AUROC
-                try:
-                    # 当有类别全为正或全为负时，这会失败
-                    results["auroc"] = roc_auc_score(labels_np, preds_np, average='macro')
-                except:
-                    results["auroc"] = 0.5  # 随机猜测的AUC值
+                # 计算多标签F1分数
+                results["macro_f1"] = f1_score(
+                    binary_preds,
+                    labels,
+                    task="multilabel",
+                    num_labels=preds.size(1),
+                    average="macro"
+                ).item()
+
+                results["micro_f1"] = f1_score(
+                    binary_preds,
+                    labels,
+                    task="multilabel",
+                    num_labels=preds.size(1),
+                    average="micro"
+                ).item()
+
+                # 如果需要计算AUROC
+                if "auroc" in self.metrics:
+                    try:
+                        results["auroc"] = auroc(
+                            preds_sigmoid,
+                            labels,
+                            task="multilabel",
+                            num_labels=preds.size(1),
+                            average="macro"
+                        ).item()
+                    except Exception as e:
+                        self.logger.warning(f"计算AUROC时出错: {str(e)}")
+                        results["auroc"] = 0.5  # 随机分类器的默认值
+            except Exception as e:
+                self.logger.warning(f"计算指标时出错: {str(e)}")
+                results["accuracy"] = 0.0
+                results["macro_f1"] = 0.0
+                results["micro_f1"] = 0.0
+                results["auroc"] = 0.5
 
         return results
+
+        # """计算多种评估指标"""
+        # results = {}
+        #
+        # # 将张量转换为NumPy数组
+        # preds_np = preds.numpy()
+        # labels_np = labels.numpy()
+        #
+        # if self.is_single_label:
+        #     # 单标签分类 - 使用argmax获取类别索引
+        #     pred_classes = preds_np.argmax(axis=1)
+        #     true_classes = labels_np.argmax(axis=1)
+        #
+        #     # 计算准确率
+        #     results["accuracy"] = (pred_classes == true_classes).mean()
+        #
+        #     try:
+        #         # 计算多类别F1分数
+        #         results["macro_f1"] = f1_score(true_classes, pred_classes, average='macro', zero_division=0)
+        #         results["micro_f1"] = f1_score(true_classes, pred_classes, average='micro', zero_division=0)
+        #         # 计算AUROC - 对于多类别使用OVR策略
+        #         if "auroc" in self.metrics:
+        #             # 将预测转为概率
+        #             # 对于softmax输出，使用原始logits计算每类概率
+        #             probs = softmax(preds_np, axis=1)
+        #             try:
+        #                 results["auroc"] = roc_auc_score(labels_np, probs, average='macro', multi_class='ovr')
+        #             except:
+        #                 results["auroc"] = 0.5  # 随机猜测的AUC值
+        #     except Exception as e:
+        #         self.logger.warning(f"计算F1分数时出错: {str(e)}")
+        #         results["macro_f1"] = 0.0
+        #         results["micro_f1"] = 0.0
+        #         results["auroc"] = 0.5  # 随机猜测的AUC值
+        #
+        # else:
+        #     # 计算要求的指标
+        #     if "accuracy" in self.metrics:
+        #         # 多标签情况下的准确率计算
+        #         correct = ((preds_np > 0.5) == (labels_np > 0.5)).sum()
+        #         total = labels_np.size
+        #         results["accuracy"] = correct / total
+        #
+        #     if "macro_f1" in self.metrics:
+        #         # 多标签宏平均F1
+        #         # 对每个样本的每个类别计算是否预测正确
+        #         binary_preds = (preds_np > 0.5).astype(float)
+        #         try:
+        #             results["macro_f1"] = f1_score(labels_np, binary_preds, average='macro', zero_division=0)
+        #         except:
+        #             results["macro_f1"] = 0.0
+        #
+        #     if "micro_f1" in self.metrics:
+        #         # 多标签微平均F1
+        #         binary_preds = (preds_np > 0.5).astype(float)
+        #         try:
+        #             results["micro_f1"] = f1_score(labels_np, binary_preds, average='micro', zero_division=0)
+        #         except:
+        #             results["micro_f1"] = 0.0
+        #
+        #     if "auroc" in self.metrics:
+        #         # 多标签AUROC
+        #         try:
+        #             # 当有类别全为正或全为负时，这会失败
+        #             results["auroc"] = roc_auc_score(labels_np, preds_np, average='macro')
+        #         except:
+        #             results["auroc"] = 0.5  # 随机猜测的AUC值
+        #
+        # return results
+
+    # 在test或evaluate函数中添加以下代码
+    def examine_logits(self, logits, missing_type, labels=None, prefix=""):
+        """
+        详细检查不同缺失类型下的logits分布
+
+        Args:
+            logits: 模型输出的logits [batch_size, num_classes]
+            missing_type: 缺失类型标记 [batch_size]
+            labels: 可选的真实标签 [batch_size, num_classes]
+            prefix: 日志前缀
+        """
+        # 将张量转移到CPU并转为NumPy数组处理
+        logits_np = logits.detach().cpu().numpy()
+        missing_type_np = missing_type.detach().cpu().numpy()
+
+        # 分离不同缺失类型的logits
+        missing_types = {
+            'none': (missing_type_np == 0),
+            'image': (missing_type_np == 1),
+            'text': (missing_type_np == 2),
+            'both': (missing_type_np == 3)
+        }
+
+        self.logger.info(f"\n{prefix} Logits Analysis:")
+
+        # 对每种缺失类型分析
+        for mt_name, mask in missing_types.items():
+            if not np.any(mask):
+                continue  # 跳过没有样本的缺失类型
+
+            mt_logits = logits_np[mask]
+            sample_count = mt_logits.shape[0]
+
+            # 基本统计信息
+            stats = {
+                'mean': np.mean(mt_logits),
+                'std': np.std(mt_logits),
+                'min': np.min(mt_logits),
+                'max': np.max(mt_logits),
+                'positive%': np.mean(mt_logits > 0) * 100,
+                'samples': sample_count
+            }
+
+            self.logger.info(f"  {mt_name} ({sample_count} samples):")
+            self.logger.info(f"    mean={stats['mean']:.4f}, std={stats['std']:.4f}, min={stats['min']:.4f}, "
+                             f"max={stats['max']:.4f}, positive%={stats['positive%']:.2f}%")
+
+            # 每个类别的详细统计
+            if mt_name == 'image':  # 重点分析图像缺失情况
+                self.logger.info(f"    Per-class logits for {mt_name}:")
+
+                # 计算每个类别的统计信息
+                for i in range(mt_logits.shape[1]):
+                    cls_logits = mt_logits[:, i]
+                    cls_stats = {
+                        'mean': np.mean(cls_logits),
+                        'std': np.std(cls_logits),
+                        'min': np.min(cls_logits),
+                        'max': np.max(cls_logits),
+                        'positive%': np.mean(cls_logits > 0) * 100
+                    }
+
+                    # 如果有标签，计算此类别的真实正例比例
+                    if labels is not None:
+                        labels_np = labels.detach().cpu().numpy()
+                        cls_positive = np.mean(labels_np[mask, i]) * 100
+                        cls_info = f"Class {i}: mean={cls_stats['mean']:.4f}, positive%={cls_stats['positive%']:.2f}%, true_positive%={cls_positive:.2f}%"
+                    else:
+                        cls_info = f"Class {i}: mean={cls_stats['mean']:.4f}, positive%={cls_stats['positive%']:.2f}%"
+
+                    self.logger.info(f"      {cls_info}")
+
+                # 计算logits分布
+                hist, bins = np.histogram(mt_logits.flatten(), bins=10, range=(-5, 5))
+                self.logger.info(f"    Logits histogram:")
+                for i, (start, end) in enumerate(zip(bins[:-1], bins[1:])):
+                    self.logger.info(f"      [{start:.2f}, {end:.2f}): {hist[i]}")
+
+                # 计算每个样本的预测数量
+                pred_counts = np.sum(mt_logits > 0, axis=1)
+                unique_counts, count_freqs = np.unique(pred_counts, return_counts=True)
+                self.logger.info(f"    Prediction counts per sample:")
+                for count, freq in zip(unique_counts, count_freqs):
+                    self.logger.info(f"      {count} predictions: {freq} samples ({freq / sample_count * 100:.2f}%)")
 
     def evaluate(self, epoch=None):
         """在验证集上评估模型，返回各种指标"""
@@ -957,6 +1194,9 @@ class Trainer:
         all_preds = torch.cat(all_preds, dim=0)
         all_labels = torch.cat(all_labels, dim=0)
         all_logits = torch.cat(all_logits, dim=0)
+
+        print("检查logits")
+        self.examine_logits(logits, missing_type)
 
         # 计算总体指标
         metrics = self._compute_metrics(all_preds, all_labels)
@@ -1160,6 +1400,23 @@ class Trainer:
         if self.writer and epoch is not None:
             for k, v in metrics.items():
                 self.writer.add_scalar(f"{k}/val", v, epoch)
+
+            # 更新质量评估器的性能统计 - 新增
+            if hasattr(self.model, 'quality_estimator') and hasattr(self.model.quality_estimator,
+                                                                    'update_performance_stats'):
+                # 获取不同缺失类型的性能
+                img_missing_perf = missing_type_results.get('image', {}).get(self.primary_metric, 0.4)
+                txt_missing_perf = missing_type_results.get('text', {}).get(self.primary_metric, 0.5)
+
+                # 更新质量评估器
+                self.model.quality_estimator.update_performance_stats(
+                    torch.tensor(img_missing_perf),
+                    torch.tensor(txt_missing_perf)
+                )
+
+                # 记录日志
+                self.logger.info(
+                    f"Updated modality performance stats - Image missing: {img_missing_perf:.4f}, Text missing: {txt_missing_perf:.4f}")
 
         return metrics
 

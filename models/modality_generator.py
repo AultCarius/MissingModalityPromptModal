@@ -3,6 +3,22 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class ResidualBlock(nn.Module):
+    """实现残差连接的块"""
+
+    def __init__(self, dim):
+        super().__init__()
+        self.layers = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, dim),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(dim, dim)
+        )
+
+    def forward(self, x):
+        return x + self.layers(x)
+
 class CrossModalGenerator(nn.Module):
     """跨模态生成器 - 使用可用模态生成缺失模态的特征表示"""
 
@@ -33,13 +49,31 @@ class CrossModalGenerator(nn.Module):
         for source_mod in self.modalities:
             for target_mod in self.modalities:
                 if source_mod != target_mod:
-                    self.generators[f"{source_mod}_to_{target_mod}"] = nn.Sequential(
-                        nn.Linear(fusion_hidden_dim, fusion_hidden_dim),
-                        nn.LayerNorm(fusion_hidden_dim),
-                        nn.GELU(),
-                        nn.Linear(fusion_hidden_dim, modality_dims[target_mod]),
-                        nn.Tanh()  # 使输出范围在[-1,1]之间，可根据实际特征分布调整
-                    )
+                    if source_mod == 'text' and target_mod == 'image':
+                        # 增强的文本→图像生成器
+                        self.generators[f"{source_mod}_to_{target_mod}"] = nn.Sequential(
+                            nn.Linear(fusion_hidden_dim, fusion_hidden_dim * 2),
+                            nn.LayerNorm(fusion_hidden_dim * 2),
+                            nn.GELU(),
+                            nn.Dropout(0.1),
+                            # 添加更多层和残差连接提高表达能力
+                            ResidualBlock(fusion_hidden_dim * 2),
+                            ResidualBlock(fusion_hidden_dim * 2),
+                            nn.Linear(fusion_hidden_dim * 2, fusion_hidden_dim),
+                            nn.LayerNorm(fusion_hidden_dim),
+                            nn.GELU(),
+                            nn.Linear(fusion_hidden_dim, modality_dims[target_mod]),
+                            nn.Tanh()  # 稳定输出
+                        )
+                    else:
+                        # 其他路径保持原样
+                        self.generators[f"{source_mod}_to_{target_mod}"] = nn.Sequential(
+                            nn.Linear(fusion_hidden_dim, fusion_hidden_dim),
+                            nn.LayerNorm(fusion_hidden_dim),
+                            nn.GELU(),
+                            nn.Linear(fusion_hidden_dim, modality_dims[target_mod]),
+                            nn.Tanh()
+                        )
 
         # 对于"both"情况（双模态缺失）需要的先验生成器
         self.prior_generators = nn.ModuleDict({
@@ -54,6 +88,10 @@ class CrossModalGenerator(nn.Module):
                 nn.Tanh()
             ) for mod_name, dim in modality_dims.items()
         })
+
+    # 添加辅助方法用于创建残差块
+    # 在modality_generator.py中添加这个类
+
 
     def encode(self, features, modality):
         """将特定模态的特征编码到共享空间"""
@@ -222,12 +260,14 @@ class CycleGenerationModel(nn.Module):
         batch_mode = isinstance(missing_type, torch.Tensor) and missing_type.dim() > 0
 
         if not batch_mode:
+            # print("no batch mode")
             # 单样本处理
             missing_type = int(missing_type)
             generated , reconstructed= self._generate_for_sample(features, missing_type)
             # reconstructed = self.reconstructor(generated)
             return generated, reconstructed
         else:
+            # print("batch mode")
             # 批量处理，但逐个样本处理以避免批处理问题
             batch_size = missing_type.size(0)
             device = missing_type.device

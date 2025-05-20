@@ -178,7 +178,6 @@ class MultimodalPromptModel(nn.Module):
         self.text_encoder = text_encoder_backbone
 
         # 处理CLIP模式
-        # 处理CLIP模式
         if use_clip_encoders:
             # 获取维度信息
             self.image_dim = self.image_encoder.config.hidden_size
@@ -342,6 +341,39 @@ class MultimodalPromptModel(nn.Module):
                 for param in module.parameters():
                     param.requires_grad = False
 
+    # 添加到MultimodalPromptModel类中
+    def compute_feature_consistency_loss(self, original_features, reconstructed_features):
+        """计算特征一致性损失"""
+        consistency_loss = 0.0
+
+        # 检查图像特征一致性
+        if 'image' in original_features and 'image' in reconstructed_features:
+            # 原始和重建特征都存在
+            if original_features['image'] is not None and reconstructed_features['image'] is not None:
+                # 计算均方误差损失
+                img_loss = F.mse_loss(
+                    reconstructed_features['image'],
+                    original_features['image']
+                )
+
+                # 图像特征一致性损失加权1.5倍 - 增强对图像缺失的处理
+                consistency_loss += 1.5 * img_loss
+
+        # 检查文本特征一致性
+        if 'text' in original_features and 'text' in reconstructed_features:
+            # 原始和重建特征都存在
+            if original_features['text'] is not None and reconstructed_features['text'] is not None:
+                # 计算均方误差损失
+                txt_loss = F.mse_loss(
+                    reconstructed_features['text'],
+                    original_features['text']
+                )
+
+                # 文本特征一致性损失正常权重
+                consistency_loss += txt_loss
+
+        return consistency_loss
+
     def _prepare_attention_mask(self, attention_mask, input_shape):
         """准备用于Transformer层的注意力掩码"""
         # 扩展维度以创建4D掩码
@@ -384,7 +416,9 @@ class MultimodalPromptModel(nn.Module):
         return causal_mask
 
     def _extract_features(self, image, input_ids, attention_mask, missing_type=None):
-        """提取图像和文本的原始特征，正确处理零填充的缺失模态"""
+        """提取图像和文本的原始特征，正确处理零填充的缺失模态
+            对于缺失的,模态保持零填充,而不是使用编码器去处理这个零填充的特征.
+        """
         batch_size = image.size(0) if image is not None else input_ids.size(0)
         device = next(self.parameters()).device
 
@@ -445,33 +479,49 @@ class MultimodalPromptModel(nn.Module):
                 image_embed[non_missing] = non_missing_embeds
 
         # 处理文本特征 (如果存在且不是缺失的)
-        text_embed = None
-        if input_ids is not None:
-            text_embed = torch.zeros(batch_size, input_ids.size(1), self.text_dim, device=device)  # 默认零嵌入
+        text_embed = torch.zeros(batch_size, input_ids.size(1), self.text_dim, device=device)  # 默认零嵌入
+        if input_ids is not None and not is_text_missing.all():
 
             # 只处理非缺失样本
             non_missing = ~is_text_missing
-            if non_missing.any():
-                non_missing_ids = input_ids[non_missing]
-                non_missing_mask = attention_mask[non_missing] if attention_mask is not None else None
+            non_missing_count = non_missing.sum().item()
 
-                if self.use_clip_encoders:
-                    try:
-                        if hasattr(self.text_encoder, 'embeddings'):
-                            non_missing_embeds = self.text_encoder.embeddings(non_missing_ids)
-                        else:
-                            # 回退方案
-                            non_missing_embeds = self.text_embeddings(non_missing_ids)
-                    except Exception as e:
-                        print(f"Error extracting CLIP text embeddings: {e}")
-                        seq_len = non_missing_ids.size(1)
-                        non_missing_embeds = torch.randn(non_missing.sum(), seq_len, self.text_dim, device=device)
-                else:
-                    # 标准文本模型
-                    non_missing_embeds = self.text_embeddings(non_missing_ids)  # [B_non_missing, L, D_txt]
+            if non_missing_count > 0:  # 确保有非缺失样本
+                try:
+                    non_missing_ids = input_ids[non_missing]
+                    non_missing_mask = attention_mask[non_missing] if attention_mask is not None else None
 
-                # 将非缺失样本的嵌入放回原始批次张量
-                text_embed[non_missing] = non_missing_embeds
+
+                    if self.use_clip_encoders:
+                        try:
+                            if hasattr(self.text_encoder, 'embeddings'):
+                                non_missing_embeds = self.text_encoder.embeddings(
+                                    non_missing_ids
+                                )
+                            else:
+                                # 回退方案
+                                non_missing_embeds = self.text_embeddings(non_missing_ids)
+                        except Exception as e:
+                            print(f"获取CLIP文本嵌入时出错: {str(e)}")
+                            seq_len = non_missing_ids.size(1)
+                            non_missing_embeds = torch.randn(non_missing_count, seq_len, self.text_dim, device=device)
+                    else:
+                        # 标准文本模型
+                        non_missing_embeds = self.text_embeddings(non_missing_ids)
+
+                    # 检查嵌入形状
+                    if non_missing_embeds.size(0) != non_missing_count:
+                        print(f"文本嵌入形状不匹配: {non_missing_embeds.size(0)} vs {non_missing_count}")
+                        # 处理不匹配情况...
+
+                    # 安全地赋值嵌入向量（不是IDs）
+                    text_embed[non_missing] = non_missing_embeds
+
+                except Exception as e:
+                    print(f"处理文本嵌入时出错: {str(e)}")
+                    # 回退策略：使用零填充
+                    seq_len = input_ids.size(1)
+                    text_embed = torch.zeros(batch_size, seq_len, self.text_dim, device=device)
 
         return image_embed, text_embed, is_image_missing, is_text_missing
 
@@ -506,6 +556,16 @@ class MultimodalPromptModel(nn.Module):
         image_is_zeros = (torch.sum(torch.abs(image_embed), dim=(1, 2)) < 1e-6)
         text_is_zeros = (torch.sum(torch.abs(text_embed), dim=(1, 2)) < 1e-6)
 
+        # # # 新增: 检查两种检测方法是否一致
+        # image_check = torch.all(is_image_missing == image_is_zeros)
+        # text_check = torch.all(is_text_missing == text_is_zeros)
+        # print(is_image_missing)
+        # print(image_is_zeros)
+        # print(f"图像缺失检测一致性: {image_check.item()}")
+        # print(is_text_missing)
+        # print(text_is_zeros)
+        # print(f"文本缺失检测一致性: {text_check.item()}")
+
 
         # 保存原始特征用于重建损失
         original_features = {
@@ -524,16 +584,19 @@ class MultimodalPromptModel(nn.Module):
 
         if self.use_modality_generator:
             # 准备输入数据 - 使用可见的模态
+            # 这里实际上对于缺失的模态填充的零向量也会获取输入数据了
             gen_input = {
                 'image': None if image_embed is None else image_embed[:, :token_count].detach(),  # 使用多个token
                 'text': None if text_embed is None else text_embed[:, :token_count].detach()  # 使用多个token
             }
+
 
             # 对每个样本单独处理缺失情况
             for b in range(batch_size):
                 mt = missing_type[b].item()
 
                 # 根据缺失类型准备单样本输入
+                # 如果对应的缺失,就传None,如果不缺失并且输入也正确存在就用这个
                 sample_input = {
                     'image': None if mt in [1, 3] else (
                         None if gen_input['image'] is None else gen_input['image'][b:b + 1]),
@@ -543,6 +606,7 @@ class MultimodalPromptModel(nn.Module):
 
                 # 生成缺失模态
                 sample_gen, sample_recon = self.modality_generator(sample_input, mt)
+                # 返回的是对应缺失模态的生成特征和重建特征
 
                 # 处理生成的图像特征
                 if mt in [1, 3] and 'image' in sample_gen and sample_gen['image'] is not None:
@@ -689,8 +753,19 @@ class MultimodalPromptModel(nn.Module):
 
         # 提取原始特征（包括可见和不可见的模态）
         # 处理missing_type
+        # 确保 missing_type 形状正确
         if missing_type is None:
             missing_type = torch.zeros(batch_size, dtype=torch.long, device=device)
+        elif isinstance(missing_type, int):
+            missing_type = torch.full((batch_size,), missing_type, dtype=torch.long, device=device)
+        elif missing_type.size(0) != batch_size:
+            self.logger.warning(f"missing_type 批大小不匹配: {missing_type.size(0)} vs {batch_size}")
+            # 调整大小以匹配
+            if missing_type.size(0) > batch_size:
+                missing_type = missing_type[:batch_size]
+            else:
+                padding = torch.zeros(batch_size - missing_type.size(0), dtype=missing_type.dtype, device=device)
+                missing_type = torch.cat([missing_type, padding], dim=0)
 
         # 提取特征，同时获取缺失掩码
         image_embed, text_embed, is_image_missing, is_text_missing = self._extract_features(
@@ -768,6 +843,10 @@ class MultimodalPromptModel(nn.Module):
             # Update reference statistics when training
             img_cls_feat = temp_img[:, 0]  # [B, D_img]
             txt_cls_feat = temp_txt[:, 0]  # [B, D_txt]
+            # print()
+            # print(missing_type)
+            # print("img_cls_feat",img_cls_feat.shape,img_cls_feat)
+            # print("txt_cls_feat",txt_cls_feat.shape,txt_cls_feat)
             quality_scores = self.quality_estimator(img_cls_feat, txt_cls_feat, missing_type)
             self.quality_estimator.update_reference_statistics(
                 image_embed[:, 0] if image_embed is not None else None,
@@ -913,7 +992,7 @@ class MultimodalPromptModel(nn.Module):
         base_hidden = self.fusion(fused)
         hidden = None
         if quality_guided_feat is not None:
-            alpha = 0.7  # Fixed weight or learnable parameter
+            alpha = 0.5  # Fixed weight or learnable parameter
             hidden = alpha * base_hidden + (1 - alpha) * quality_guided_feat
         logits = self.classifier(hidden)
 
@@ -929,8 +1008,6 @@ class MultimodalPromptModel(nn.Module):
             'generated_features': generated_features,  # 生成的特征
             'reconstructed_features': reconstructed_features  # 重建的特征
         }
-        # print(missing_type)
-        # print(additional_info['generated_modalities'])
 
         return (logits, additional_info)
         # return logits if not self.training else (logits, additional_info)
