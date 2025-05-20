@@ -95,8 +95,8 @@ def plot_macro_f1(epochs_data, output_path='macro_f1_trend.png'):
 
 
 if __name__ == "__main__":
-    log_file_path = 'E:\DL\MissingModalityPromptModal\experiments\mmimdb_ceshi\logs\\train_20250520_064117.log'  # 请替换为实际的日志文件路径
-    output_image_path = 'macro_f1_trend_ceshi.png'  # 输出图像路径
+    log_file_path = 'E:\DL\MissingModalityPromptModal\experiments\mmimdb_ceshi\logs\\train_20250520_102504.log'  # 请替换为实际的日志文件路径
+    output_image_path = 'macro_f1_trend_ceshi_04.png'  # 输出图像路径
 
     # 解析日志
     epochs_data = parse_log_file(log_file_path)

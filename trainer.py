@@ -261,12 +261,6 @@ class Trainer:
         warmup_steps = int(total_steps * warmup_percent)
 
         # 设置学习率调度器
-        # self.scheduler = WarmupLinearDecayLR(
-        #     self.optimizer,
-        #     warmup_steps=warmup_steps,
-        #     total_steps=total_steps,
-        #     min_lr=self.config.get("min_lr", 0)
-        # )
         self.scheduler = get_linear_schedule_with_warmup(
             self.optimizer,
             num_warmup_steps=warmup_steps,
@@ -440,77 +434,111 @@ class Trainer:
                             )
 
                     # ===== 第2部分：重建损失计算 =====
-                    reconstruction_loss = 0.0
 
-                    # 如果使用了模态生成器，计算重建损失
+                    # Inside the training loop after processing input
+                    reconstruction_loss = 0.0
+                    generation_loss = 0.0
+
                     if additional_info and 'reconstructed_features' in additional_info and additional_info[
                         'reconstructed_features']:
                         generated_features = additional_info['generated_features']
                         recon_features = additional_info['reconstructed_features']
                         orig_features = additional_info['original_features']
+                        # print("返回信息：")
+                        # print(generated_features["image"].shape,generated_features["text"].shape)
+                        # print(recon_features["image"].shape,recon_features["text"].shape)
+                        # print(orig_features["image"].shape,orig_features["text"].shape)
 
-                        # 图像重建损失计算
-                        if 'image' in recon_features and recon_features['image'] is not None:
-                            if is_image_missing.any():
-                                missing_mask = is_image_missing
-                                missing_img_recon = recon_features['image'][missing_mask]
-                                missing_img_orig = orig_features['image'][missing_mask]
+                        # Get masks for different sample types
+                        complete_samples = ~(is_image_missing | is_text_missing)  # Both modalities present
+                        image_only = ~is_image_missing & is_text_missing  # Only image present (text missing)
+                        text_only = is_image_missing & ~is_text_missing  # Only text present (image missing)
+                        # print(complete_samples,complete_samples.sum())
+                        # print(image_only,image_only.sum())
+                        # print(text_only,text_only.sum())
+                        # 1. Process complete samples for direct supervision of generator and reconstructor
+                        if complete_samples.any():
+                            # Get original features for complete samples
+                            complete_img_orig = orig_features['image'][complete_samples]
+                            complete_txt_orig = orig_features['text'][complete_samples]
+                            complete_features = {'image': complete_img_orig, 'text': complete_txt_orig}
+                            # GENERATOR TRAINING:
 
-                                # 检查有效的非零特征
-                                valid_tokens = torch.sum(torch.abs(missing_img_orig), dim=-1) > 1e-6
+                            with torch.set_grad_enabled(True):  # Ensure gradients flow
+                                # Generate text from image
 
-                                if valid_tokens.any():
-                                    # 只对有效的非零特征计算损失
-                                    if missing_img_recon.dim() > 2:  # [batch, token_count, dim]
-                                        # 多token情况
-                                        img_recon_loss = F.mse_loss(
-                                            missing_img_recon[valid_tokens],
-                                            missing_img_orig[valid_tokens]
-                                        )
-                                    else:  # 单token情况
-                                        img_recon_loss = F.mse_loss(
-                                            missing_img_recon[valid_tokens],
-                                            missing_img_orig[valid_tokens]
-                                        )
 
-                                    reconstruction_loss += img_recon_loss
-                                    gen_stats['image']['mse'].append(img_recon_loss.item())
-                                    gen_stats['image']['count'] += valid_tokens.sum().item()
 
-                        # 文本重建损失计算
-                        if 'text' in recon_features and recon_features['text'] is not None:
-                            if is_text_missing.any():
-                                missing_mask = is_text_missing
-                                missing_txt_recon = recon_features['text'][missing_mask]
-                                missing_txt_orig = orig_features['text'][missing_mask]
+                                img_to_txt = self.model.modality_generator.generator.generate(complete_img_orig, 'image', 'text')
+                                # Generate image from text
+                                txt_to_img = self.model.modality_generator.generator.generate(complete_txt_orig, 'text', 'image')
 
-                                # 检查有效的非零特征
-                                valid_tokens = torch.sum(torch.abs(missing_txt_orig), dim=-1) > 1e-6
+                                # Calculate generation losses - compare with original (ground truth) features
+                                gen_txt_loss = F.mse_loss(img_to_txt, complete_txt_orig)
+                                gen_img_loss = F.mse_loss(txt_to_img, complete_img_orig)
 
-                                if valid_tokens.any():
-                                    # 只对有效的非零特征计算损失
-                                    if missing_txt_recon.dim() > 2:  # [batch, token_count, dim]
-                                        # 多token情况
-                                        txt_recon_loss = F.mse_loss(
-                                            missing_txt_recon[valid_tokens],
-                                            missing_txt_orig[valid_tokens]
-                                        )
-                                    else:  # 单token情况
-                                        txt_recon_loss = F.mse_loss(
-                                            missing_txt_recon[valid_tokens],
-                                            missing_txt_orig[valid_tokens]
-                                        )
+                                generation_loss += gen_txt_loss + gen_img_loss
 
-                                    reconstruction_loss += txt_recon_loss
-                                    gen_stats['text']['mse'].append(txt_recon_loss.item())
-                                    gen_stats['text']['count'] += valid_tokens.sum().item()
+                            # RECONSTRUCTOR TRAINING:
+                            # Feed complete features through the reconstructor and compare with originals
+                            complete_features = {'image': complete_img_orig, 'text': complete_txt_orig}
+                            reconstructed_complete = self.model.modality_generator.reconstructor(complete_features)
+
+                            # Calculate reconstruction loss for complete samples
+                            if 'image' in reconstructed_complete and reconstructed_complete['image'] is not None:
+                                img_recon_loss = F.mse_loss(reconstructed_complete['image'], complete_img_orig)
+                                reconstruction_loss += img_recon_loss
+
+                            if 'text' in reconstructed_complete and reconstructed_complete['text'] is not None:
+                                txt_recon_loss = F.mse_loss(reconstructed_complete['text'], complete_txt_orig)
+                                reconstruction_loss += txt_recon_loss
+
+                        # 2. Process samples with only text present (image is missing)
+                        # Here the model needs to generate image from text, then reconstruct text
+                        if text_only.any():
+                            text_orig = orig_features['text'][text_only]  # Original text features
+
+                            # Check that reconstructed features exist
+                            if recon_features is not None and 'text' in recon_features and recon_features[
+                                'text'] is not None:
+                                # Get reconstructed text (after cycle: text -> generated image -> reconstructed text)
+                                text_recon = recon_features['text'][text_only]
+
+                                # Cycle consistency: Compare reconstructed text with original text
+                                if text_recon.shape == text_orig.shape:
+                                    text_cycle_loss = F.mse_loss(text_recon, text_orig)
+                                    reconstruction_loss += text_cycle_loss
+
+                        # 3. Process samples with only image present (text is missing)
+                        # Here the model needs to generate text from image, then reconstruct image
+                        if image_only.any():
+                            image_orig = orig_features['image'][image_only]  # Original image features
+
+                            # Check that reconstructed features exist
+                            if recon_features is not None and 'image' in recon_features and recon_features[
+                                'image'] is not None:
+                                # Get reconstructed image (after cycle: image -> generated text -> reconstructed image)
+                                image_recon = recon_features['image'][image_only]
+
+                                # Cycle consistency: Compare reconstructed image with original image
+                                if image_recon.shape == image_orig.shape:
+                                    image_cycle_loss = F.mse_loss(image_recon, image_orig)
+                                    reconstruction_loss += image_cycle_loss
+
+                        # Calculate final loss with appropriate weights
+                        gen_weight = 0.5  # Fixed weight or can be varied over epochs
+
+                        # Final loss combining classification, reconstruction, and generation
+
 
                     # 计算重建权重（从initial逐渐减小到final）
                     recon_weight = initial_recon_weight * (1 - current_epoch / max_epochs) + final_recon_weight * (
                             current_epoch / max_epochs)
 
                     # 结合分类损失和重建损失
-                    total_batch_loss = classification_loss + recon_weight * reconstruction_loss
+                    # total_batch_loss = classification_loss + recon_weight * reconstruction_loss
+                    total_batch_loss = classification_loss + recon_weight * reconstruction_loss + gen_weight * generation_loss
+
 
                     # ===== 临时: 特征一致性,强调图像的缺失恢复
                     # 计算特征一致性损失 - 强调图像缺失恢复
