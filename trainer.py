@@ -132,15 +132,21 @@ class Trainer:
 
     def _setup_experiment_directories(self):
         """创建实验相关的目录结构，支持在 Kaggle 上持久化保存"""
-        # if "KAGGLE_KERNEL_RUN_TYPE" in os.environ:
-        #     # 在 Kaggle 上运行，持久化目录为 /kaggle/output
-        #     base_root = "/kaggle/output"
-        # else:
-        #     # 本地或服务器上运行
-        #     base_root = "experiments"
         base_root = "experiments"
         # 基础目录
-        self.base_dir = os.path.join(base_root, self.experiment_name)
+        original_experiment_name = self.experiment_name
+        base_dir = os.path.join(base_root, self.experiment_name)
+
+        if os.path.exists(base_dir):
+            # 获取当前时间戳并添加到实验名
+            from datetime import datetime
+            timestamp = datetime.now().strftime("%m%d_%H%M")
+            self.experiment_name = f"{original_experiment_name}_{timestamp}"
+            base_dir = os.path.join(base_root, self.experiment_name)
+            print(f"实验目录 '{original_experiment_name}' 已存在，自动重命名为 '{self.experiment_name}'")
+
+        # 基础目录
+        self.base_dir = base_dir
 
         # 各子目录
         self.save_path = os.path.join(self.base_dir, "checkpoints")
@@ -690,9 +696,6 @@ class Trainer:
                 self.optimizer.zero_grad()
                 total_batch_loss.backward()
 
-                # 更新进度条
-                batch_pbar.set_postfix({"loss": f"{total_batch_loss.item():.4f}"})
-                batch_pbar.update(1)
 
                 # 可选的梯度裁剪
                 if self.config.get("clip_grad_norm", 0) > 0:
@@ -715,6 +718,48 @@ class Trainer:
 
                 # 累计损失和预测结果
                 total_loss += total_batch_loss.item()
+
+                postfix_dict = {
+                    "total": f"{total_batch_loss.item():.4f}",
+                    "cls": f"{classification_loss.item():.4f}"
+                }
+
+                # 添加重建损失（如果存在）
+                if isinstance(reconstruction_loss, torch.Tensor) and reconstruction_loss.item() > 0:
+                    postfix_dict["recon"] = f"{reconstruction_loss.item():.4f}"
+                elif reconstruction_loss > 0:
+                    postfix_dict["recon"] = f"{reconstruction_loss:.4f}"
+                if isinstance(generation_loss, torch.Tensor) and generation_loss.item() > 0:
+                    postfix_dict["gen"] = f"{generation_loss.item():.4f}"
+                elif reconstruction_loss > 0:
+                    generation_loss["gen"] = f"{generation_loss:.4f}"
+
+                # 添加对比损失（如果存在）
+                if contrastive_loss_value > 0:
+                    postfix_dict["contra"] = f"{contrastive_loss_value:.4f}"
+
+                # 添加质量损失（如果存在）
+                if quality_pred_loss > 0:
+                    postfix_dict["qual"] = f"{quality_pred_loss.item():.4f}"
+
+                # 添加对抗损失（如果存在）
+                if adv_loss_value > 0:
+                    postfix_dict["adv"] = f"{adv_loss_value:.4f}"
+
+                # 添加当前学习率
+                postfix_dict["lr"] = f"{current_lr:.6f}"
+
+                # 添加图像缺失样本的质量分数（如果可用）
+                if additional_info and 'quality_scores' in additional_info:
+                    # 仅显示图像缺失样本的图像质量分数平均值
+                    img_missing_mask = is_image_missing
+                    if img_missing_mask.any():
+                        img_quality = additional_info['quality_scores']['image']['final_score'][img_missing_mask]
+                        if len(img_quality) > 0:
+                            postfix_dict["img_q"] = f"{img_quality.mean().item():.4f}"
+
+                batch_pbar.set_postfix(postfix_dict)
+                batch_pbar.update(1)
 
                 # 根据数据集类型计算预测
                 if self.is_single_label:
@@ -1100,7 +1145,7 @@ class Trainer:
                              f"max={stats['max']:.4f}, positive%={stats['positive%']:.2f}%")
 
             # 每个类别的详细统计
-            if mt_name == 'image':  # 重点分析图像缺失情况
+            if mt_name in ['image', 'none', 'text']:
                 self.logger.info(f"    Per-class logits for {mt_name}:")
 
                 # 计算每个类别的统计信息

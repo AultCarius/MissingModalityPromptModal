@@ -1,3 +1,4 @@
+import os.path
 import re
 import matplotlib.pyplot as plt
 import numpy as np
@@ -10,7 +11,7 @@ plt.rcParams["axes.unicode_minus"] = False  # 解决负号显示问题
 
 def parse_log_file(log_path):
     """解析日志文件，提取各Epoch的Macro-F1指标"""
-    with open(log_path, 'r', encoding='gb2312') as f:
+    with open(log_path, 'r', encoding='utf-8') as f:
         log_content = f.read()
 
     # 按Epoch分割日志内容
@@ -44,6 +45,12 @@ def parse_log_file(log_path):
                 'image': float(groups[12]),  # image类型的macro_f1
                 'text': float(groups[19]),  # text类型的macro_f1
                 'total': float(groups[-2])  # 总体macro_f1
+            },
+            'acc':{
+                'none': float(groups[4]),  # none类型的macro_f1
+                'image': float(groups[11]),  # image类型的macro_f1
+                'text': float(groups[18]),  # text类型的macro_f1
+                'total': float(groups[-3])  # 总体macro_f1
             }
         }
         epochs_data.append(epoch_data)
@@ -93,13 +100,57 @@ def plot_macro_f1(epochs_data, output_path='macro_f1_trend.png'):
     # 显示图表
     plt.show()
 
+def plot_acc(epochs_data, output_path='macro_f1_trend.png'):
+    """绘制Macro-F1指标随Epoch的变化趋势图"""
+    if not epochs_data:
+        print("没有找到匹配的Epoch数据！")
+        return
+
+    # 提取数据
+    epochs = [data['epoch'] for data in epochs_data]
+    none_f1 = [data['acc']['none'] for data in epochs_data]
+    image_f1 = [data['acc']['image'] for data in epochs_data]
+    text_f1 = [data['acc']['text'] for data in epochs_data]
+    total_f1 = [data['acc']['total'] for data in epochs_data]
+
+    # 创建图表
+    plt.figure(figsize=(12, 8))
+
+    # 绘制各类型的Macro-F1曲线
+    plt.plot(epochs, none_f1, 'o-', color='blue', label='None缺失')
+    plt.plot(epochs, image_f1, 's-', color='red', label='图像缺失')
+    plt.plot(epochs, text_f1, 'd-', color='green', label='文本缺失')
+    plt.plot(epochs, total_f1, '^-', color='purple', label='总体')
+
+    # 添加标题和标签
+    plt.title('不同缺失类型的ACC指标随Epoch变化趋势', fontsize=16)
+    plt.xlabel('Epoch', fontsize=14)
+    plt.ylabel('ACC', fontsize=14)
+
+    # 设置x轴为整数
+    plt.gca().xaxis.set_major_locator(MaxNLocator(integer=True))
+
+    # 添加网格和图例
+    plt.grid(True, linestyle='--', alpha=0.7)
+    plt.legend(fontsize=12)
+
+    # 保存图表
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300)
+    print(f"图表已保存至: {output_path}")
+
+    # 显示图表
+    plt.show()
 
 if __name__ == "__main__":
-    log_file_path = 'E:\DL\MissingModalityPromptModal\experiments\mmimdb_ceshi\logs\\train_20250520_102504.log'  # 请替换为实际的日志文件路径
-    output_image_path = 'macro_f1_trend_ceshi_04.png'  # 输出图像路径
+    log_file_path = 'E:\DL\exp\self\mmimdb_test_both_changetrain\logs\\train_20250520_193236.log'  # 请替换为实际的日志文件路径
+    output_path = "debug_plots"
+    macro_f1 = 'mmimdb_changetrain_macro.png'  # 输出图像路径
+    acc = 'mmimdb_changetrain_f1.png'  # 输出图像路径
 
     # 解析日志
     epochs_data = parse_log_file(log_file_path)
 
     # 绘制并保存图表
-    plot_macro_f1(epochs_data, output_image_path)
+    plot_macro_f1(epochs_data, os.path.join(output_path,macro_f1))
+    plot_acc(epochs_data,os.path.join(output_path,acc))

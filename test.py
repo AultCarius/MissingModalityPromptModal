@@ -83,7 +83,7 @@ if __name__ == '__main__':
     trainer.class_weights = datamodule.get_class_weights().to(trainer.device)
 
     # 5. 加载最佳模型并运行测试
-    best_model_path = "E:\DL\MissingModalityPromptModal\experiments\mmimdb_ceshi\\checkpoints\\best_model.pt"  # 替换为你的模型路径
+    best_model_path = "E:\DL\exp\self\\mmimdb_test_both_changetrain\\checkpoints\\best_model.pt"  # 替换为你的模型路径
     test_results = trainer.test(test_loader=test_loader, model_path=best_model_path)
 
     # 6. 打印测试结果

@@ -26,3 +26,6 @@ __pycache__/
 # 忽略日志
 *.log
 logs/
+
+# 忽略我调试的图片
+debug_plots/
