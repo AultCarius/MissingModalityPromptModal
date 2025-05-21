@@ -154,6 +154,28 @@ class FusionAnalyzer:
 
     def set_plotdir(self,dir):
         self.save_dir = dir
+        self._create_analysis_directories()
+
+    def _create_analysis_directories(self):
+        """创建分析所需的子文件夹并保存路径到类属性"""
+        subdirs = {
+            'fusion_analysis': 'fusion_analysis',
+            'tsne_vis': 'tsne_visualization',
+            'pca_vis': 'pca_visualization',
+            'missing_type': 'analysis_by_missing_type',
+            'feature_stats': 'feature_statistics_summary',
+            'dim_dist': 'dim_distribution'
+        }
+
+        # 创建主目录（如果不存在）
+        os.makedirs(self.save_dir, exist_ok=True)
+
+        # 创建子目录并保存路径
+        for attr, subdir_name in subdirs.items():
+            full_path = os.path.join(self.save_dir, subdir_name)
+            os.makedirs(full_path, exist_ok=True)
+            setattr(self, attr, full_path)
+
 
     def analyze_fusion_features(self, base_hidden, quality_guided_feat, missing_type=None,
                                 alpha=None, batch_idx=None, save_current=False):
@@ -300,7 +322,7 @@ class FusionAnalyzer:
         plt.xlim(-1, 1)
 
         plt.tight_layout()
-        plt.savefig(os.path.join(self.save_dir, f'fusion_analysis_batch_{batch_idx}.png'))
+        plt.savefig(os.path.join(self.fusion_analysis, f'fusion_analysis_batch_{batch_idx}.png'))
         plt.close()
 
         # 4. 绘制单个维度的分布比较
@@ -325,7 +347,7 @@ class FusionAnalyzer:
                 plt.legend()
 
         plt.tight_layout()
-        plt.savefig(os.path.join(self.save_dir, f'dim_distribution_batch_{batch_idx}.png'))
+        plt.savefig(os.path.join(self.dim_dist, f'dim_distribution_batch_{batch_idx}.png'))
         plt.close()
 
     def generate_summary_report(self,epoch=0):
@@ -388,7 +410,7 @@ class FusionAnalyzer:
         plt.legend()
 
         plt.tight_layout()
-        plt.savefig(os.path.join(self.save_dir, f'feature_statistics_summary_epoch{epoch}.png'))
+        plt.savefig(os.path.join(self.feature_stats, f'feature_statistics_summary_epoch{epoch}.png'))
         plt.close()
 
         # 2. 创建差异分析图
@@ -423,7 +445,7 @@ class FusionAnalyzer:
 
         # 4. 降维可视化
         if self.stored_features['base']:
-            self._visualize_with_dimensionality_reduction()
+            self._visualize_with_dimensionality_reduction(epoch)
 
         # 5. 打印统计摘要
         print("\n===== Fusion Features Analysis Summary =====")
@@ -516,7 +538,7 @@ class FusionAnalyzer:
         plt.xscale('log')  # 使用对数刻度更好地显示比率
 
         plt.tight_layout()
-        plt.savefig(os.path.join(self.save_dir, f'analysis_by_missing_type_epoch{epoch}.png'))
+        plt.savefig(os.path.join(self.missing_type, f'analysis_by_missing_type_epoch{epoch}.png'))
         plt.close()
 
         # 统计每种缺失类型的关键指标均值
@@ -532,7 +554,7 @@ class FusionAnalyzer:
                 print(f"  Mean Difference: {np.mean(mean_diffs[mt_mask]):.6f} ± {np.std(mean_diffs[mt_mask]):.6f}")
                 print(f"  Norm Ratio: {np.mean(norm_ratios[mt_mask]):.6f} ± {np.std(norm_ratios[mt_mask]):.6f}")
 
-    def _visualize_with_dimensionality_reduction(self):
+    def _visualize_with_dimensionality_reduction(self,epoch):
         """使用降维技术可视化特征空间"""
         # 合并所有存储的特征
         base_features = np.vstack(self.stored_features['base'])
@@ -596,7 +618,7 @@ class FusionAnalyzer:
                 plt.legend()
 
             plt.tight_layout()
-            plt.savefig(os.path.join(self.save_dir, 'pca_visualization.png'))
+            plt.savefig(os.path.join(self.pca_vis, f'pca_visualization_epoch{epoch}.png'))
             plt.close()
 
             # 2. t-SNE可视化
@@ -661,7 +683,7 @@ class FusionAnalyzer:
                 plt.legend()
 
             plt.tight_layout()
-            plt.savefig(os.path.join(self.save_dir, 'tsne_visualization.png'))
+            plt.savefig(os.path.join(self.tsne_vis, f'tsne_visualization_epoch{epoch}.png'))
             plt.close()
 
         except Exception as e:
