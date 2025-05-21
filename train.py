@@ -111,6 +111,8 @@ if __name__ == '__main__':
     # Initialize trainer
     trainer = Trainer(model, train_loader, val_loader, config=config)
 
+    model.fusion_analyzer.set_plotdir(trainer.plot_dir)
+
     trainer.class_weights = datamodule.get_class_weights().to(trainer.device)
 
     # Add this right after creating the trainer instance (around line 95)

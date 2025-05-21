@@ -153,9 +153,10 @@ class Trainer:
         self.log_dir = os.path.join(self.base_dir, "logs")
         self.tb_dir = os.path.join(self.log_dir, "tb")
         self.code_dir = os.path.join(self.base_dir, "code_snapshot")
+        self.plot_dir = os.path.join(self.base_dir, "debug_plots")
 
         # 创建所有目录
-        for directory in [self.save_path, self.log_dir, self.tb_dir, self.code_dir]:
+        for directory in [self.save_path, self.log_dir, self.tb_dir, self.code_dir,self.plot_dir]:
             os.makedirs(directory, exist_ok=True)
 
         self.logger_initialized = False
@@ -406,6 +407,7 @@ class Trainer:
                 # 前向传播
                 output = self.model(image, input_ids, attention_mask, missing_type)
 
+
                 # 处理模型输出(logits和额外信息)
                 if isinstance(output, tuple):
                     logits, additional_info = output
@@ -483,7 +485,8 @@ class Trainer:
                                 gen_txt_loss = F.mse_loss(img_to_txt, complete_txt_orig)
                                 gen_img_loss = F.mse_loss(txt_to_img, complete_img_orig)
 
-                                generation_loss += gen_txt_loss + gen_img_loss
+                                generation_loss += gen_txt_loss
+                                generation_loss += gen_img_loss
 
                             # RECONSTRUCTOR TRAINING:
                             # Feed complete features through the reconstructor and compare with originals
@@ -692,6 +695,8 @@ class Trainer:
                     total_batch_loss = classification_loss
                     cls_loss += classification_loss.item()
 
+
+
                 # ===== 优化步骤 =====
                 self.optimizer.zero_grad()
                 total_batch_loss.backward()
@@ -729,9 +734,10 @@ class Trainer:
                     postfix_dict["recon"] = f"{reconstruction_loss.item():.4f}"
                 elif reconstruction_loss > 0:
                     postfix_dict["recon"] = f"{reconstruction_loss:.4f}"
+
                 if isinstance(generation_loss, torch.Tensor) and generation_loss.item() > 0:
                     postfix_dict["gen"] = f"{generation_loss.item():.4f}"
-                elif reconstruction_loss > 0:
+                elif generation_loss > 0:
                     generation_loss["gen"] = f"{generation_loss:.4f}"
 
                 # 添加对比损失（如果存在）
@@ -778,6 +784,18 @@ class Trainer:
 
             # 关闭进度条
             batch_pbar.close()
+
+            # 检查并调用FusionAnalyzer生成报告
+            if hasattr(self.model, 'fusion_analyzer') and self.model.fusion_analyzer is not None:
+                try:
+                    # 验证fusion_analyzer是否可调用generate_summary_report方法
+                    if callable(getattr(self.model.fusion_analyzer, 'generate_summary_report', None)):
+                        print("Generating fusion analysis summary report...")
+                        self.model.fusion_analyzer.generate_summary_report()
+                    else:
+                        print("Warning: fusion_analyzer exists but has no 'generate_summary_report' method.")
+                except Exception as e:
+                    print(f"Error generating report: {e}")
 
             # ===== 训练轮次结束，计算指标 =====
             # 合并所有批次的预测和标签
@@ -841,7 +859,7 @@ class Trainer:
 
             # ===== 保存检查点 =====
             # 每几个轮次保存一次
-            if epoch % self.config.get("save_every_epochs", 5) == 0:
+            if epoch!=0 and epoch % self.config.get("save_every_epochs", 5) == 0:
                 self._save_checkpoint(epoch, metrics=val_metrics)
 
             # 根据主要指标保存最佳模型

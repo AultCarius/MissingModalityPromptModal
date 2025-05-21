@@ -169,6 +169,10 @@ class MultimodalPromptModel(nn.Module):
             use_clip_encoders=False  # 标志是否使用CLIP编码器
     ):
         super().__init__()
+
+        from utils.analysis import FusionAnalyzer
+        self.fusion_analyzer = FusionAnalyzer(save_dir='fusion_analysis_results')
+
         self.max_length = max_length
         self.encoder_type = encoder_type.lower()
         self.use_clip_encoders = use_clip_encoders
@@ -1026,7 +1030,9 @@ class MultimodalPromptModel(nn.Module):
 
         # 1. 在提取特征后，分析原始特征分布
         # 创建一个随机采样检查标志，避免分析所有批次
-        should_analyze = (torch.rand(1).item() < 0.01)  # 1%的批次进行分析
+        should_analyze = (torch.rand(1).item() < 0.0)  # 1%的批次进行分析
+        shoule_analyze_fusion = (torch.rand(1).item() < 0.05)
+        # 特征分布分析
         if should_analyze and image_embed is not None and text_embed is not None:
             # 获取CLS token
             img_cls = image_embed[:, 0].detach()
@@ -1225,8 +1231,10 @@ class MultimodalPromptModel(nn.Module):
         image_feat = image_embed[:, 0]  # [B, D_img]
         text_feat = text_embed[:, 0]  # [B, D_txt]
 
-        image_feat_norm = F.normalize(image_feat, p=2, dim=1)  # L2归一化
-        text_feat_norm = F.normalize(text_feat, p=2, dim=1)  # L2归一化
+        # image_feat_norm = F.normalize(image_feat, p=2, dim=1)  # L2归一化
+        # text_feat_norm = F.normalize(text_feat, p=2, dim=1)  # L2归一化
+        image_feat_norm = F.layer_norm(image_feat, image_feat.shape[1:])
+        text_feat_norm = F.layer_norm(text_feat, text_feat.shape[1:])
 
         image_feat = image_feat_norm
         text_feat = text_feat_norm
@@ -1255,26 +1263,66 @@ class MultimodalPromptModel(nn.Module):
         if should_analyze and quality_guided_feat is not None:
             self.analyze_features_at_key_points("融合后", quality_guided_feat.detach(), None)
 
+
+
         # Prepare features for concatenation
-        features_to_concat = [image_feat, text_feat, F.one_hot(missing_type, num_classes=4).float()]
+        features_to_concat = None
 
         # Add quality scores if enabled
         if self.use_quality_prompt:
-            features_to_concat.extend([
+            image_group = torch.cat([
+                image_feat,
                 quality_scores['image']['final_score'],
-                quality_scores['text']['final_score'],
                 quality_scores['image']['quality'],
+            ], dim=1)
+
+            text_group = torch.cat([
+                text_feat,
+                quality_scores['text']['final_score'],
                 quality_scores['text']['quality'],
-                quality_scores['cross_consistency']
-            ])
+            ], dim=1)
+
+            features_to_concat = torch.cat([
+                image_group,
+                text_group,
+                quality_scores['cross_consistency'],
+                F.one_hot(missing_type, num_classes=4).float()
+            ], dim=1)
+        else:
+            features_to_concat = torch.cat([image_feat, text_feat, F.one_hot(missing_type, num_classes=4).float()], dim=1)
 
         # Concatenate all features
-        fused = torch.cat(features_to_concat, dim=1)
-        base_hidden = self.fusion(fused)
+        base_hidden = self.fusion(features_to_concat)
+
+        if should_analyze and base_hidden is not None:
+            self.analyze_features_at_key_points("原始特征投影后", base_hidden.detach(), None)
+
         hidden = None
         if quality_guided_feat is not None:
+
+            # 或方法2: 使用LayerNorm
+            base_norm = F.layer_norm(base_hidden, base_hidden.shape[1:])
+            quality_norm = F.layer_norm(quality_guided_feat, quality_guided_feat.shape[1:])
+
+            if shoule_analyze_fusion:
+                self.fusion_analyzer.analyze_fusion_features(
+                    base_hidden=base_norm,
+                    quality_guided_feat=quality_norm,
+                    missing_type=missing_type,
+                    alpha=0.5,  # 你使用的固定融合权重
+                    batch_idx=None,  # 自动生成批次索引
+                    save_current=True  # 保存当前批次的分析结果
+                )
+
             alpha = 0.5  # Fixed weight or learnable parameter
-            hidden = alpha * base_hidden + (1 - alpha) * quality_guided_feat
+            hidden = alpha * base_norm + (1 - alpha) * quality_norm
+
+        else:
+            hidden = base_hidden
+
+        if should_analyze and hidden is not None:
+            self.analyze_features_at_key_points("最终融合hidden", hidden.detach(), None)
+
         logits = self.classifier(hidden)
 
         # 返回额外信息用于分析和损失计算
