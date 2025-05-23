@@ -569,6 +569,26 @@ class Trainer:
                                                                     torch.Tensor) else reconstruction_loss
                     consistency_loss_sum += feature_consistency_loss  # 新增记录
 
+                    # ===== 临时: 特征一致性,强调图像的缺失恢复
+                    # 计算特征一致性损失 - 强调图像缺失恢复
+                    feature_consistency_loss = 0.0
+                    if hasattr(self.model, 'compute_feature_consistency_loss'):
+                        if 'original_features' in additional_info and 'reconstructed_features' in additional_info:
+                            consistency_loss = self.model.compute_feature_consistency_loss(
+                                additional_info['original_features'],
+                                additional_info['reconstructed_features']
+                            )
+
+                            # 添加到总损失
+                            total_batch_loss = total_batch_loss + 0.2 * consistency_loss  # 0.2权重避免过度影响
+                            feature_consistency_loss = consistency_loss.item()
+
+                    # 记录损失值
+                    cls_loss += classification_loss.item()
+                    recon_loss += reconstruction_loss if isinstance(reconstruction_loss,
+                                                                    torch.Tensor) else reconstruction_loss
+                    consistency_loss_sum += feature_consistency_loss  # 新增记录
+
                     # ===== 第3部分：对比损失计算 =====
                     # 计算原始样本之间的损失有什么用?它怎么能训练模型本身呢,从头到尾就没有下降啊
                     contrastive_loss_value = 0.0
@@ -776,7 +796,7 @@ class Trainer:
                     preds.scatter_(1, pred_indices.unsqueeze(1), 1.0)
                 else:
                     # 多标签分类 - 使用阈值
-                    preds = (logits > 0.5).float()
+                    preds = (logits > -0.2).float()
 
                 # 收集预测和真实标签用于指标计算
                 all_preds.append(preds.cpu().detach())
@@ -1053,6 +1073,7 @@ class Trainer:
 
         return results
 
+
         # """计算多种评估指标"""
         # results = {}
         #
@@ -1122,6 +1143,7 @@ class Trainer:
         #
         # return results
 
+
     # 在test或evaluate函数中添加以下代码
     def examine_logits(self, logits, missing_type, labels=None, prefix=""):
         """
@@ -1170,6 +1192,7 @@ class Trainer:
                              f"max={stats['max']:.4f}, positive%={stats['positive%']:.2f}%")
 
             # 每个类别的详细统计
+
             if mt_name in ['image', 'none', 'text']:
                 self.logger.info(f"    Per-class logits for {mt_name}:")
 
@@ -1272,7 +1295,7 @@ class Trainer:
                     preds.scatter_(1, pred_indices.unsqueeze(1), 1.0)
                 else:
                     # 多标签分类 - 使用阈值
-                    preds = (logits > 0.5).float()
+                    preds = (logits > -0.2).float()
 
                 # 收集总体预测和标签
                 all_preds.append(preds.cpu())
@@ -1981,7 +2004,7 @@ class Trainer:
                     preds.scatter_(1, pred_indices.unsqueeze(1), 1.0)
                 else:
                     # Multi-label classification (MMIMDB) - use threshold
-                    preds = (logits > 0.5).float()
+                    preds = (logits > -0.2).float()
 
                 # Collect overall predictions and labels
                 all_preds.append(preds.cpu())
