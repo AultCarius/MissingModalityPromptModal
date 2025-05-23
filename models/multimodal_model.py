@@ -322,7 +322,7 @@ class MultimodalPromptModel(nn.Module):
         print("fusion_input_dim=", fusion_input_dim)
         self.fusion = nn.Sequential(
             nn.Linear(fusion_input_dim, fusion_dim),
-            nn.ReLU(),
+            nn.GELU(),
             nn.Dropout(0.1)
         )
         self.classifier = nn.Linear(fusion_dim, num_classes)
@@ -1030,8 +1030,8 @@ class MultimodalPromptModel(nn.Module):
 
         # 1. 在提取特征后，分析原始特征分布
         # 创建一个随机采样检查标志，避免分析所有批次
-        should_analyze = (torch.rand(1).item() < 0.0)  # 1%的批次进行分析
-        shoule_analyze_fusion = (torch.rand(1).item() < 0.05)
+        should_analyze = (torch.rand(1).item() < 0.001)  # 1%的批次进行分析
+        shoule_analyze_fusion = (torch.rand(1).item() < 0.01)
         # 特征分布分析
         if should_analyze and image_embed is not None and text_embed is not None:
             # 获取CLS token
@@ -1236,6 +1236,22 @@ class MultimodalPromptModel(nn.Module):
         image_feat_norm = F.layer_norm(image_feat, image_feat.shape[1:])
         text_feat_norm = F.layer_norm(text_feat, text_feat.shape[1:])
 
+        # 收集模态特征用于epoch分析（在训练时且随机采样）
+        if self.training and hasattr(self, 'fusion_analyzer') and self.fusion_analyzer is not None:
+            # 随机采样收集特征，避免收集所有批次
+            should_collect = (torch.rand(1).item() < 0.1)  # 30%的批次收集特征
+            if should_collect:
+                try:
+                    self.fusion_analyzer.collect_modality_features(
+                        image_feat=image_feat_norm.detach(),  # 使用归一化后的特征
+                        text_feat=text_feat_norm.detach(),  # 使用归一化后的特征
+                        missing_type=missing_type
+                    )
+                except Exception as e:
+                    # 如果收集失败，不影响训练
+                    pass
+
+
         image_feat = image_feat_norm
         text_feat = text_feat_norm
 
@@ -1303,18 +1319,19 @@ class MultimodalPromptModel(nn.Module):
             # 或方法2: 使用LayerNorm
             base_norm = F.layer_norm(base_hidden, base_hidden.shape[1:])
             quality_norm = F.layer_norm(quality_guided_feat, quality_guided_feat.shape[1:])
+            alpha = 0  # Fixed weight or learnable parameter
+            if should_analyze:
+                self.analyze_features_at_key_points("再次归一化后.前者为base_norm,后者为qualitu_norm", base_norm.detach(), quality_norm.detach())
 
             if shoule_analyze_fusion:
                 self.fusion_analyzer.analyze_fusion_features(
                     base_hidden=base_norm,
                     quality_guided_feat=quality_norm,
                     missing_type=missing_type,
-                    alpha=0.5,  # 你使用的固定融合权重
+                    alpha=alpha,  # 你使用的固定融合权重
                     batch_idx=None,  # 自动生成批次索引
                     save_current=True  # 保存当前批次的分析结果
                 )
-
-            alpha = 0.5  # Fixed weight or learnable parameter
             hidden = alpha * base_norm + (1 - alpha) * quality_norm
 
         else:

@@ -14,6 +14,7 @@ from models.multimodal_model import create_multimodal_prompt_model
 if __name__ == '__main__':
 
 
+    # config_path = "configs/food101.yaml"
     config_path = "configs/mmimdb.yaml"
     # config_path = "/kaggle/working/MissingModalityPromptModal/configs/mmimdb.yaml"
     with open(config_path, 'r') as f:

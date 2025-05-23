@@ -1,6 +1,6 @@
 # 实验配置
 
-experiment_name: "mmimdb_ceshi-test-stdmean"
+experiment_name: "mmimdb_test_image_text_std"
 
 # Model Configuration
 image_model_name: "openai/clip-vit-base-patch16" #[vit_base_patch16_224,openai/clip-vit-base-patch16]
@@ -24,7 +24,7 @@ batch_size: 16
 num_workers: 4
 image_size: 224
 patch_size: 16
-lr: 0.001
+lr: 0.0001
 weight_decay: 0.005
 warmup_percent: 0.1
 min_lr: 0.000001

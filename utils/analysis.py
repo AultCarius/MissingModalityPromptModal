@@ -152,6 +152,17 @@ class FusionAnalyzer:
         }
         self.max_stored = 500  # 最多存储多少样本
 
+        # 新增: 用于收集每个epoch的图像和文本特征
+        self.epoch_features = {
+            'image_features': [],
+            'text_features': [],
+            'missing_types': [],
+            'sample_indices': []
+        }
+        self.current_epoch_sample_count = 0
+        self.max_epoch_samples = 1000  # 限制每个epoch收集的样本数量
+
+
     def set_plotdir(self,dir):
         self.save_dir = dir
         self._create_analysis_directories()
@@ -271,6 +282,521 @@ class FusionAnalyzer:
                 'norm': quality_norm.mean().item()
             }
         }
+
+    def collect_modality_features(self, image_feat, text_feat, missing_type, epoch=None):
+        """
+        收集图像和文本特征用于epoch结束后的分析
+
+        Args:
+            image_feat: 图像特征 [batch_size, image_dim]
+            text_feat: 文本特征 [batch_size, text_dim]
+            missing_type: 缺失类型 [batch_size]
+            epoch: 当前epoch数（可选）
+        """
+        if image_feat is None or text_feat is None:
+            return
+
+        # 检查是否超过最大收集数量
+        if self.current_epoch_sample_count >= self.max_epoch_samples:
+            return
+
+        # 转换为CPU张量
+        image_feat = image_feat.detach().cpu()
+        text_feat = text_feat.detach().cpu()
+        missing_type = missing_type.detach().cpu()
+
+        batch_size = image_feat.shape[0]
+
+        # 计算还能收集多少样本
+        remaining_slots = self.max_epoch_samples - self.current_epoch_sample_count
+        samples_to_collect = min(batch_size, remaining_slots)
+
+        if samples_to_collect > 0:
+            # 收集特征
+            self.epoch_features['image_features'].append(image_feat[:samples_to_collect])
+            self.epoch_features['text_features'].append(text_feat[:samples_to_collect])
+            self.epoch_features['missing_types'].append(missing_type[:samples_to_collect])
+            self.epoch_features['sample_indices'].extend(
+                range(self.current_epoch_sample_count,
+                      self.current_epoch_sample_count + samples_to_collect)
+            )
+
+            self.current_epoch_sample_count += samples_to_collect
+
+    def analyze_modality_features_distribution(self, epoch):
+        """
+        分析一个epoch内收集的图像和文本特征的分布
+
+        Args:
+            epoch: 当前epoch数
+        """
+        if not self.epoch_features['image_features']:
+            print("No modality features collected for analysis.")
+            return
+
+        # 合并所有收集的特征
+        image_features = torch.cat(self.epoch_features['image_features'], dim=0).numpy()
+        text_features = torch.cat(self.epoch_features['text_features'], dim=0).numpy()
+        missing_types = torch.cat(self.epoch_features['missing_types'], dim=0).numpy()
+
+        n_samples = image_features.shape[0]
+        print(f"\nAnalyzing modality features distribution for epoch {epoch}")
+        print(f"Total samples collected: {n_samples}")
+        print(f"Image features shape: {image_features.shape}")
+        print(f"Text features shape: {text_features.shape}")
+
+        # 统计各种缺失类型的样本数量
+        missing_type_names = ['none', 'image', 'text', 'both']
+        for i, mt_name in enumerate(missing_type_names):
+            count = np.sum(missing_types == i)
+            if count > 0:
+                print(f"  {mt_name}: {count} samples ({count / n_samples * 100:.1f}%)")
+
+        # 1. 原始特征分布分析
+        self._analyze_raw_feature_distributions(image_features, text_features, missing_types, epoch)
+
+        # 2. PCA分析
+        self._pca_analysis_modality_features(image_features, text_features, missing_types, epoch)
+
+        # 3. t-SNE分析
+        self._tsne_analysis_modality_features(image_features, text_features, missing_types, epoch)
+
+        # 4. 特征相关性分析
+        self._correlation_analysis(image_features, text_features, missing_types, epoch)
+
+        # 清空收集的特征，为下一个epoch做准备
+        self.reset_epoch_features()
+
+    def _analyze_raw_feature_distributions(self, image_features, text_features, missing_types, epoch):
+        """分析原始特征分布"""
+        plt.figure(figsize=(15, 10))
+
+        missing_type_names = ['none', 'image', 'text', 'both']
+        colors = ['green', 'red', 'blue', 'purple']
+
+        # 1. 图像特征的L2范数分布
+        plt.subplot(2, 3, 1)
+        img_norms = np.linalg.norm(image_features, axis=1)
+        for i, (mt_name, color) in enumerate(zip(missing_type_names, colors)):
+            mt_mask = (missing_types == i)
+            if np.sum(mt_mask) > 0:
+                plt.hist(img_norms[mt_mask], bins=30, alpha=0.5,
+                         label=f'{mt_name} (n={np.sum(mt_mask)})', color=color)
+        plt.title('Image Feature L2 Norms by Missing Type')
+        plt.xlabel('L2 Norm')
+        plt.ylabel('Count')
+        plt.legend()
+
+        # 2. 文本特征的L2范数分布
+        plt.subplot(2, 3, 2)
+        text_norms = np.linalg.norm(text_features, axis=1)
+        for i, (mt_name, color) in enumerate(zip(missing_type_names, colors)):
+            mt_mask = (missing_types == i)
+            if np.sum(mt_mask) > 0:
+                plt.hist(text_norms[mt_mask], bins=30, alpha=0.5,
+                         label=f'{mt_name} (n={np.sum(mt_mask)})', color=color)
+        plt.title('Text Feature L2 Norms by Missing Type')
+        plt.xlabel('L2 Norm')
+        plt.ylabel('Count')
+        plt.legend()
+
+        # 3. 图像特征均值分布
+        plt.subplot(2, 3, 3)
+        img_means = np.mean(image_features, axis=1)
+        for i, (mt_name, color) in enumerate(zip(missing_type_names, colors)):
+            mt_mask = (missing_types == i)
+            if np.sum(mt_mask) > 0:
+                plt.hist(img_means[mt_mask], bins=30, alpha=0.5,
+                         label=f'{mt_name} (n={np.sum(mt_mask)})', color=color)
+        plt.title('Image Feature Means by Missing Type')
+        plt.xlabel('Mean Value')
+        plt.ylabel('Count')
+        plt.legend()
+
+        # 4. 文本特征均值分布
+        plt.subplot(2, 3, 4)
+        text_means = np.mean(text_features, axis=1)
+        for i, (mt_name, color) in enumerate(zip(missing_type_names, colors)):
+            mt_mask = (missing_types == i)
+            if np.sum(mt_mask) > 0:
+                plt.hist(text_means[mt_mask], bins=30, alpha=0.5,
+                         label=f'{mt_name} (n={np.sum(mt_mask)})', color=color)
+        plt.title('Text Feature Means by Missing Type')
+        plt.xlabel('Mean Value')
+        plt.ylabel('Count')
+        plt.legend()
+
+        # 5. 图像-文本特征余弦相似度
+        plt.subplot(2, 3, 5)
+        # 归一化特征
+        img_normalized = image_features / (np.linalg.norm(image_features, axis=1, keepdims=True) + 1e-8)
+        text_normalized = text_features / (np.linalg.norm(text_features, axis=1, keepdims=True) + 1e-8)
+
+        # 计算余弦相似度（只对维度匹配的情况）
+        min_dim = min(img_normalized.shape[1], text_normalized.shape[1])
+        cosine_sims = np.sum(img_normalized[:, :min_dim] * text_normalized[:, :min_dim], axis=1)
+
+        for i, (mt_name, color) in enumerate(zip(missing_type_names, colors)):
+            mt_mask = (missing_types == i)
+            if np.sum(mt_mask) > 0:
+                plt.hist(cosine_sims[mt_mask], bins=30, alpha=0.5,
+                         label=f'{mt_name} (n={np.sum(mt_mask)})', color=color)
+        plt.title('Image-Text Cosine Similarity by Missing Type')
+        plt.xlabel('Cosine Similarity')
+        plt.ylabel('Count')
+        plt.legend()
+        plt.xlim(-1, 1)
+
+        # 6. 特征标准差对比
+        plt.subplot(2, 3, 6)
+        img_stds = np.std(image_features, axis=1)
+        text_stds = np.std(text_features, axis=1)
+
+        # 创建散点图
+        for i, (mt_name, color) in enumerate(zip(missing_type_names, colors)):
+            mt_mask = (missing_types == i)
+            if np.sum(mt_mask) > 0:
+                plt.scatter(img_stds[mt_mask], text_stds[mt_mask],
+                            c=color, label=f'{mt_name} (n={np.sum(mt_mask)})', alpha=0.6)
+
+        plt.title('Image vs Text Feature Standard Deviations')
+        plt.xlabel('Image Feature Std')
+        plt.ylabel('Text Feature Std')
+        plt.legend()
+        plt.plot([0, max(img_stds.max(), text_stds.max())],
+                 [0, max(img_stds.max(), text_stds.max())], 'k--', alpha=0.5)
+
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.save_dir, f'modality_features_distribution_epoch_{epoch}.png'),
+                    dpi=300, bbox_inches='tight')
+        plt.close()
+
+    def _pca_analysis_modality_features(self, image_features, text_features, missing_types, epoch):
+        """使用PCA分析图像和文本特征"""
+        plt.figure(figsize=(15, 12))
+
+        missing_type_names = ['none', 'image', 'text', 'both']
+        colors = ['green', 'red', 'blue', 'purple']
+        markers = ['o', 's', '^', 'D']
+
+        # 1. 图像特征PCA
+        plt.subplot(2, 2, 1)
+        pca_img = PCA(n_components=2)
+        img_pca_result = pca_img.fit_transform(image_features)
+
+        for i, (mt_name, color, marker) in enumerate(zip(missing_type_names, colors, markers)):
+            mt_mask = (missing_types == i)
+            if np.sum(mt_mask) > 0:
+                plt.scatter(img_pca_result[mt_mask, 0], img_pca_result[mt_mask, 1],
+                            c=color, marker=marker, label=f'{mt_name} (n={np.sum(mt_mask)})',
+                            alpha=0.7, s=50)
+
+        plt.title(f'Image Features PCA (Epoch {epoch})')
+        plt.xlabel(f'PC1 ({pca_img.explained_variance_ratio_[0]:.2%} variance)')
+        plt.ylabel(f'PC2 ({pca_img.explained_variance_ratio_[1]:.2%} variance)')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+
+        # 2. 文本特征PCA
+        plt.subplot(2, 2, 2)
+        pca_text = PCA(n_components=2)
+        text_pca_result = pca_text.fit_transform(text_features)
+
+        for i, (mt_name, color, marker) in enumerate(zip(missing_type_names, colors, markers)):
+            mt_mask = (missing_types == i)
+            if np.sum(mt_mask) > 0:
+                plt.scatter(text_pca_result[mt_mask, 0], text_pca_result[mt_mask, 1],
+                            c=color, marker=marker, label=f'{mt_name} (n={np.sum(mt_mask)})',
+                            alpha=0.7, s=50)
+
+        plt.title(f'Text Features PCA (Epoch {epoch})')
+        plt.xlabel(f'PC1 ({pca_text.explained_variance_ratio_[0]:.2%} variance)')
+        plt.ylabel(f'PC2 ({pca_text.explained_variance_ratio_[1]:.2%} variance)')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+
+        # 3. 联合特征空间PCA（连接图像和文本特征）
+        plt.subplot(2, 2, 3)
+        # 为了PCA分析，需要将图像和文本特征调整到相同维度或使用填充
+        min_dim = min(image_features.shape[1], text_features.shape[1])
+        img_truncated = image_features[:, :min_dim]
+        text_truncated = text_features[:, :min_dim]
+
+        # 连接特征
+        combined_features = np.concatenate([img_truncated, text_truncated], axis=1)
+        pca_combined = PCA(n_components=2)
+        combined_pca_result = pca_combined.fit_transform(combined_features)
+
+        for i, (mt_name, color, marker) in enumerate(zip(missing_type_names, colors, markers)):
+            mt_mask = (missing_types == i)
+            if np.sum(mt_mask) > 0:
+                plt.scatter(combined_pca_result[mt_mask, 0], combined_pca_result[mt_mask, 1],
+                            c=color, marker=marker, label=f'{mt_name} (n={np.sum(mt_mask)})',
+                            alpha=0.7, s=50)
+
+        plt.title(f'Combined Features PCA (Epoch {epoch})')
+        plt.xlabel(f'PC1 ({pca_combined.explained_variance_ratio_[0]:.2%} variance)')
+        plt.ylabel(f'PC2 ({pca_combined.explained_variance_ratio_[1]:.2%} variance)')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+
+        # 4. 图像-文本特征对的连接图
+        plt.subplot(2, 2, 4)
+        # 只显示一部分样本以避免图像过于密集
+        max_display = min(200, len(img_pca_result))
+        indices = np.random.choice(len(img_pca_result), max_display, replace=False)
+
+        for i, (mt_name, color, marker) in enumerate(zip(missing_type_names, colors, markers)):
+            mt_mask = (missing_types == i)
+            display_mask = mt_mask[indices]
+            if np.sum(display_mask) > 0:
+                # 绘制图像特征点
+                plt.scatter(img_pca_result[indices][display_mask, 0],
+                            img_pca_result[indices][display_mask, 1],
+                            c=color, marker=marker, s=80, alpha=0.8,
+                            label=f'{mt_name} Image')
+
+                # 绘制文本特征点
+                plt.scatter(text_pca_result[indices][display_mask, 0],
+                            text_pca_result[indices][display_mask, 1],
+                            c=color, marker='x', s=80, alpha=0.8,
+                            label=f'{mt_name} Text')
+
+                # 绘制连接线
+                for j in np.where(display_mask)[0]:
+                    plt.plot([img_pca_result[indices[j], 0], text_pca_result[indices[j], 0]],
+                             [img_pca_result[indices[j], 1], text_pca_result[indices[j], 1]],
+                             c=color, alpha=0.3, linewidth=1)
+
+        plt.title(f'Image-Text Feature Pairs PCA (Epoch {epoch}, n={max_display})')
+        plt.xlabel('PC1')
+        plt.ylabel('PC2')
+        plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+        plt.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.save_dir, f'modality_features_pca_epoch_{epoch}.png'),
+                    dpi=300, bbox_inches='tight')
+        plt.close()
+
+    def _tsne_analysis_modality_features(self, image_features, text_features, missing_types, epoch):
+        """使用t-SNE分析图像和文本特征"""
+        if len(image_features) > 1000:
+            # 如果样本太多，随机采样以加快t-SNE计算
+            indices = np.random.choice(len(image_features), 1000, replace=False)
+            image_features = image_features[indices]
+            text_features = text_features[indices]
+            missing_types = missing_types[indices]
+
+        plt.figure(figsize=(15, 12))
+
+        missing_type_names = ['none', 'image', 'text', 'both']
+        colors = ['green', 'red', 'blue', 'purple']
+        markers = ['o', 's', '^', 'D']
+
+        # 1. 图像特征t-SNE
+        plt.subplot(2, 2, 1)
+        tsne_img = TSNE(n_components=2, perplexity=30, n_iter=1000, random_state=42)
+        img_tsne_result = tsne_img.fit_transform(image_features)
+
+        for i, (mt_name, color, marker) in enumerate(zip(missing_type_names, colors, markers)):
+            mt_mask = (missing_types == i)
+            if np.sum(mt_mask) > 0:
+                plt.scatter(img_tsne_result[mt_mask, 0], img_tsne_result[mt_mask, 1],
+                            c=color, marker=marker, label=f'{mt_name} (n={np.sum(mt_mask)})',
+                            alpha=0.7, s=50)
+
+        plt.title(f'Image Features t-SNE (Epoch {epoch})')
+        plt.xlabel('t-SNE 1')
+        plt.ylabel('t-SNE 2')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+
+        # 2. 文本特征t-SNE
+        plt.subplot(2, 2, 2)
+        tsne_text = TSNE(n_components=2, perplexity=30, n_iter=1000, random_state=42)
+        text_tsne_result = tsne_text.fit_transform(text_features)
+
+        for i, (mt_name, color, marker) in enumerate(zip(missing_type_names, colors, markers)):
+            mt_mask = (missing_types == i)
+            if np.sum(mt_mask) > 0:
+                plt.scatter(text_tsne_result[mt_mask, 0], text_tsne_result[mt_mask, 1],
+                            c=color, marker=marker, label=f'{mt_name} (n={np.sum(mt_mask)})',
+                            alpha=0.7, s=50)
+
+        plt.title(f'Text Features t-SNE (Epoch {epoch})')
+        plt.xlabel('t-SNE 1')
+        plt.ylabel('t-SNE 2')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+
+        # 3. 联合特征空间t-SNE
+        plt.subplot(2, 2, 3)
+        min_dim = min(image_features.shape[1], text_features.shape[1])
+        img_truncated = image_features[:, :min_dim]
+        text_truncated = text_features[:, :min_dim]
+
+        combined_features = np.concatenate([img_truncated, text_truncated], axis=1)
+        tsne_combined = TSNE(n_components=2, perplexity=30, n_iter=1000, random_state=42)
+        combined_tsne_result = tsne_combined.fit_transform(combined_features)
+
+        for i, (mt_name, color, marker) in enumerate(zip(missing_type_names, colors, markers)):
+            mt_mask = (missing_types == i)
+            if np.sum(mt_mask) > 0:
+                plt.scatter(combined_tsne_result[mt_mask, 0], combined_tsne_result[mt_mask, 1],
+                            c=color, marker=marker, label=f'{mt_name} (n={np.sum(mt_mask)})',
+                            alpha=0.7, s=50)
+
+        plt.title(f'Combined Features t-SNE (Epoch {epoch})')
+        plt.xlabel('t-SNE 1')
+        plt.ylabel('t-SNE 2')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+
+        # 4. 图像-文本特征对的连接图（t-SNE空间）
+        plt.subplot(2, 2, 4)
+        max_display = min(100, len(img_tsne_result))  # t-SNE空间中显示更少的连接线
+        indices = np.random.choice(len(img_tsne_result), max_display, replace=False)
+
+        for i, (mt_name, color, marker) in enumerate(zip(missing_type_names, colors, markers)):
+            mt_mask = (missing_types == i)
+            display_mask = mt_mask[indices]
+            if np.sum(display_mask) > 0:
+                # 绘制图像特征点
+                plt.scatter(img_tsne_result[indices][display_mask, 0],
+                            img_tsne_result[indices][display_mask, 1],
+                            c=color, marker=marker, s=100, alpha=0.8,
+                            label=f'{mt_name} Image')
+
+                # 绘制文本特征点
+                plt.scatter(text_tsne_result[indices][display_mask, 0],
+                            text_tsne_result[indices][display_mask, 1],
+                            c=color, marker='x', s=100, alpha=0.8,
+                            label=f'{mt_name} Text')
+
+                # 绘制连接线
+                for j in np.where(display_mask)[0]:
+                    plt.plot([img_tsne_result[indices[j], 0], text_tsne_result[indices[j], 0]],
+                             [img_tsne_result[indices[j], 1], text_tsne_result[indices[j], 1]],
+                             c=color, alpha=0.4, linewidth=1.5)
+
+        plt.title(f'Image-Text Feature Pairs t-SNE (Epoch {epoch}, n={max_display})')
+        plt.xlabel('t-SNE 1')
+        plt.ylabel('t-SNE 2')
+        plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+        plt.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.save_dir, f'modality_features_tsne_epoch_{epoch}.png'),
+                    dpi=300, bbox_inches='tight')
+        plt.close()
+
+    def _correlation_analysis(self, image_features, text_features, missing_types, epoch):
+        """分析图像和文本特征的相关性"""
+        plt.figure(figsize=(12, 8))
+
+        missing_type_names = ['none', 'image', 'text', 'both']
+        colors = ['green', 'red', 'blue', 'purple']
+
+        # 计算每个样本的图像特征和文本特征的统计量
+        img_norms = np.linalg.norm(image_features, axis=1)
+        text_norms = np.linalg.norm(text_features, axis=1)
+        img_means = np.mean(image_features, axis=1)
+        text_means = np.mean(text_features, axis=1)
+        img_stds = np.std(image_features, axis=1)
+        text_stds = np.std(text_features, axis=1)
+
+        # 1. 范数相关性
+        plt.subplot(2, 2, 1)
+        for i, (mt_name, color) in enumerate(zip(missing_type_names, colors)):
+            mt_mask = (missing_types == i)
+            if np.sum(mt_mask) > 0:
+                plt.scatter(img_norms[mt_mask], text_norms[mt_mask],
+                            c=color, label=f'{mt_name} (n={np.sum(mt_mask)})',
+                            alpha=0.6, s=50)
+
+        plt.title(f'L2 Norm Correlation (Epoch {epoch})')
+        plt.xlabel('Image Feature L2 Norm')
+        plt.ylabel('Text Feature L2 Norm')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+
+        # 计算总体相关系数
+        corr_norm = np.corrcoef(img_norms, text_norms)[0, 1]
+        plt.text(0.05, 0.95, f'Corr: {corr_norm:.3f}',
+                 transform=plt.gca().transAxes, bbox=dict(boxstyle="round", facecolor='wheat'))
+
+        # 2. 均值相关性
+        plt.subplot(2, 2, 2)
+        for i, (mt_name, color) in enumerate(zip(missing_type_names, colors)):
+            mt_mask = (missing_types == i)
+            if np.sum(mt_mask) > 0:
+                plt.scatter(img_means[mt_mask], text_means[mt_mask],
+                            c=color, label=f'{mt_name} (n={np.sum(mt_mask)})',
+                            alpha=0.6, s=50)
+
+        plt.title(f'Mean Value Correlation (Epoch {epoch})')
+        plt.xlabel('Image Feature Mean')
+        plt.ylabel('Text Feature Mean')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+
+        corr_mean = np.corrcoef(img_means, text_means)[0, 1]
+        plt.text(0.05, 0.95, f'Corr: {corr_mean:.3f}',
+                 transform=plt.gca().transAxes, bbox=dict(boxstyle="round", facecolor='wheat'))
+
+        # 3. 标准差相关性
+        plt.subplot(2, 2, 3)
+        for i, (mt_name, color) in enumerate(zip(missing_type_names, colors)):
+            mt_mask = (missing_types == i)
+            if np.sum(mt_mask) > 0:
+                plt.scatter(img_stds[mt_mask], text_stds[mt_mask],
+                            c=color, label=f'{mt_name} (n={np.sum(mt_mask)})',
+                            alpha=0.6, s=50)
+
+        plt.title(f'Standard Deviation Correlation (Epoch {epoch})')
+        plt.xlabel('Image Feature Std')
+        plt.ylabel('Text Feature Std')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+
+        corr_std = np.corrcoef(img_stds, text_stds)[0, 1]
+        plt.text(0.05, 0.95, f'Corr: {corr_std:.3f}',
+                 transform=plt.gca().transAxes, bbox=dict(boxstyle="round", facecolor='wheat'))
+
+        # 4. 缺失类型统计
+        plt.subplot(2, 2, 4)
+        mt_counts = [np.sum(missing_types == i) for i in range(4)]
+        bars = plt.bar(missing_type_names, mt_counts, color=colors)
+        plt.title(f'Missing Type Distribution (Epoch {epoch})')
+        plt.ylabel('Sample Count')
+
+        # 在柱状图上添加数值标签
+        for bar, count in zip(bars, mt_counts):
+            if count > 0:
+                plt.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.5,
+                         str(count), ha='center', va='bottom')
+
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.save_dir, f'modality_correlation_epoch_{epoch}.png'),
+                    dpi=300, bbox_inches='tight')
+        plt.close()
+
+        # 打印相关性统计
+        print(f"\nCorrelation Analysis for Epoch {epoch}:")
+        print(f"  L2 Norm correlation: {corr_norm:.4f}")
+        print(f"  Mean value correlation: {corr_mean:.4f}")
+        print(f"  Standard deviation correlation: {corr_std:.4f}")
+
+    def reset_epoch_features(self):
+        """重置epoch特征收集器"""
+        self.epoch_features = {
+            'image_features': [],
+            'text_features': [],
+            'missing_types': [],
+            'sample_indices': []
+        }
+        self.current_epoch_sample_count = 0
 
     def _analyze_and_save_current_batch(self, base, quality, cosine_sim, l2_dist, missing_type, alpha, batch_idx):
         """分析并保存当前批次的详细结果"""

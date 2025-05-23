@@ -791,9 +791,16 @@ class Trainer:
                     # 验证fusion_analyzer是否可调用generate_summary_report方法
                     if callable(getattr(self.model.fusion_analyzer, 'generate_summary_report', None)):
                         print("Generating fusion analysis summary report...")
-                        self.model.fusion_analyzer.generate_summary_report()
+                        self.model.fusion_analyzer.generate_summary_report(epoch)
                     else:
                         print("Warning: fusion_analyzer exists but has no 'generate_summary_report' method.")
+                        # 新增：生成模态特征分布分析
+                    if callable(
+                            getattr(self.model.fusion_analyzer, 'analyze_modality_features_distribution', None)):
+                        print("Generating modality features distribution analysis...")
+                        self.model.fusion_analyzer.analyze_modality_features_distribution(epoch)
+                    else:
+                        print("Warning: fusion_analyzer has no 'analyze_modality_features_distribution' method.")
                 except Exception as e:
                     print(f"Error generating report: {e}")
 
