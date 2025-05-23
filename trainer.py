@@ -8,7 +8,7 @@ import shutil
 import numpy as np
 from torch.utils.tensorboard import SummaryWriter
 from datetime import datetime
-from sklearn.metrics import f1_score, roc_auc_score, accuracy_score
+
 from transformers import get_linear_schedule_with_warmup
 import torch.nn.functional as F
 from scripts.emailsender import (
@@ -20,6 +20,9 @@ from scripts.emailsender import (
 import torch.nn as nn
 from tqdm import tqdm
 from scipy.special import softmax
+
+# from sklearn.metrics import f1_score, roc_auc_score, accuracy_score
+from torchmetrics.functional import f1_score, auroc, accuracy
 
 # torch.autograd.set_detect_anomaly(True)
 GENRE_CLASS = [
@@ -129,24 +132,31 @@ class Trainer:
 
     def _setup_experiment_directories(self):
         """创建实验相关的目录结构，支持在 Kaggle 上持久化保存"""
-        # if "KAGGLE_KERNEL_RUN_TYPE" in os.environ:
-        #     # 在 Kaggle 上运行，持久化目录为 /kaggle/output
-        #     base_root = "/kaggle/output"
-        # else:
-        #     # 本地或服务器上运行
-        #     base_root = "experiments"
         base_root = "experiments"
         # 基础目录
-        self.base_dir = os.path.join(base_root, self.experiment_name)
+        original_experiment_name = self.experiment_name
+        base_dir = os.path.join(base_root, self.experiment_name)
+
+        if os.path.exists(base_dir):
+            # 获取当前时间戳并添加到实验名
+            from datetime import datetime
+            timestamp = datetime.now().strftime("%m%d_%H%M")
+            self.experiment_name = f"{original_experiment_name}_{timestamp}"
+            base_dir = os.path.join(base_root, self.experiment_name)
+            print(f"实验目录 '{original_experiment_name}' 已存在，自动重命名为 '{self.experiment_name}'")
+
+        # 基础目录
+        self.base_dir = base_dir
 
         # 各子目录
         self.save_path = os.path.join(self.base_dir, "checkpoints")
         self.log_dir = os.path.join(self.base_dir, "logs")
         self.tb_dir = os.path.join(self.log_dir, "tb")
         self.code_dir = os.path.join(self.base_dir, "code_snapshot")
+        self.plot_dir = os.path.join(self.base_dir, "debug_plots")
 
         # 创建所有目录
-        for directory in [self.save_path, self.log_dir, self.tb_dir, self.code_dir]:
+        for directory in [self.save_path, self.log_dir, self.tb_dir, self.code_dir,self.plot_dir]:
             os.makedirs(directory, exist_ok=True)
 
         self.logger_initialized = False
@@ -258,12 +268,6 @@ class Trainer:
         warmup_steps = int(total_steps * warmup_percent)
 
         # 设置学习率调度器
-        # self.scheduler = WarmupLinearDecayLR(
-        #     self.optimizer,
-        #     warmup_steps=warmup_steps,
-        #     total_steps=total_steps,
-        #     min_lr=self.config.get("min_lr", 0)
-        # )
         self.scheduler = get_linear_schedule_with_warmup(
             self.optimizer,
             num_warmup_steps=warmup_steps,
@@ -403,6 +407,7 @@ class Trainer:
                 # 前向传播
                 output = self.model(image, input_ids, attention_mask, missing_type)
 
+
                 # 处理模型输出(logits和额外信息)
                 if isinstance(output, tuple):
                     logits, additional_info = output
@@ -437,77 +442,132 @@ class Trainer:
                             )
 
                     # ===== 第2部分：重建损失计算 =====
-                    reconstruction_loss = 0.0
 
-                    # 如果使用了模态生成器，计算重建损失
+                    # Inside the training loop after processing input
+                    reconstruction_loss = 0.0
+                    generation_loss = 0.0
+
                     if additional_info and 'reconstructed_features' in additional_info and additional_info[
                         'reconstructed_features']:
                         generated_features = additional_info['generated_features']
                         recon_features = additional_info['reconstructed_features']
                         orig_features = additional_info['original_features']
+                        # print("返回信息：")
+                        # print(generated_features["image"].shape,generated_features["text"].shape)
+                        # print(recon_features["image"].shape,recon_features["text"].shape)
+                        # print(orig_features["image"].shape,orig_features["text"].shape)
 
-                        # 图像重建损失计算
-                        if 'image' in recon_features and recon_features['image'] is not None:
-                            if is_image_missing.any():
-                                missing_mask = is_image_missing
-                                missing_img_recon = recon_features['image'][missing_mask]
-                                missing_img_orig = orig_features['image'][missing_mask]
+                        # Get masks for different sample types
+                        complete_samples = ~(is_image_missing | is_text_missing)  # Both modalities present
+                        image_only = ~is_image_missing & is_text_missing  # Only image present (text missing)
+                        text_only = is_image_missing & ~is_text_missing  # Only text present (image missing)
+                        # print(complete_samples,complete_samples.sum())
+                        # print(image_only,image_only.sum())
+                        # print(text_only,text_only.sum())
+                        # 1. Process complete samples for direct supervision of generator and reconstructor
+                        if complete_samples.any():
+                            # Get original features for complete samples
+                            complete_img_orig = orig_features['image'][complete_samples]
+                            complete_txt_orig = orig_features['text'][complete_samples]
+                            complete_features = {'image': complete_img_orig, 'text': complete_txt_orig}
+                            # GENERATOR TRAINING:
 
-                                # 检查有效的非零特征
-                                valid_tokens = torch.sum(torch.abs(missing_img_orig), dim=-1) > 1e-6
+                            with torch.set_grad_enabled(True):  # Ensure gradients flow
+                                # Generate text from image
 
-                                if valid_tokens.any():
-                                    # 只对有效的非零特征计算损失
-                                    if missing_img_recon.dim() > 2:  # [batch, token_count, dim]
-                                        # 多token情况
-                                        img_recon_loss = F.mse_loss(
-                                            missing_img_recon[valid_tokens],
-                                            missing_img_orig[valid_tokens]
-                                        )
-                                    else:  # 单token情况
-                                        img_recon_loss = F.mse_loss(
-                                            missing_img_recon[valid_tokens],
-                                            missing_img_orig[valid_tokens]
-                                        )
 
-                                    reconstruction_loss += img_recon_loss
-                                    gen_stats['image']['mse'].append(img_recon_loss.item())
-                                    gen_stats['image']['count'] += valid_tokens.sum().item()
 
-                        # 文本重建损失计算
-                        if 'text' in recon_features and recon_features['text'] is not None:
-                            if is_text_missing.any():
-                                missing_mask = is_text_missing
-                                missing_txt_recon = recon_features['text'][missing_mask]
-                                missing_txt_orig = orig_features['text'][missing_mask]
+                                img_to_txt = self.model.modality_generator.generator.generate(complete_img_orig, 'image', 'text')
+                                # Generate image from text
+                                txt_to_img = self.model.modality_generator.generator.generate(complete_txt_orig, 'text', 'image')
 
-                                # 检查有效的非零特征
-                                valid_tokens = torch.sum(torch.abs(missing_txt_orig), dim=-1) > 1e-6
+                                # Calculate generation losses - compare with original (ground truth) features
+                                gen_txt_loss = F.mse_loss(img_to_txt, complete_txt_orig)
+                                gen_img_loss = F.mse_loss(txt_to_img, complete_img_orig)
 
-                                if valid_tokens.any():
-                                    # 只对有效的非零特征计算损失
-                                    if missing_txt_recon.dim() > 2:  # [batch, token_count, dim]
-                                        # 多token情况
-                                        txt_recon_loss = F.mse_loss(
-                                            missing_txt_recon[valid_tokens],
-                                            missing_txt_orig[valid_tokens]
-                                        )
-                                    else:  # 单token情况
-                                        txt_recon_loss = F.mse_loss(
-                                            missing_txt_recon[valid_tokens],
-                                            missing_txt_orig[valid_tokens]
-                                        )
+                                generation_loss += gen_txt_loss
+                                generation_loss += gen_img_loss
 
-                                    reconstruction_loss += txt_recon_loss
-                                    gen_stats['text']['mse'].append(txt_recon_loss.item())
-                                    gen_stats['text']['count'] += valid_tokens.sum().item()
+                            # RECONSTRUCTOR TRAINING:
+                            # Feed complete features through the reconstructor and compare with originals
+                            complete_features = {'image': complete_img_orig, 'text': complete_txt_orig}
+                            reconstructed_complete = self.model.modality_generator.reconstructor(complete_features)
+
+                            # Calculate reconstruction loss for complete samples
+                            if 'image' in reconstructed_complete and reconstructed_complete['image'] is not None:
+                                img_recon_loss = F.mse_loss(reconstructed_complete['image'], complete_img_orig)
+                                reconstruction_loss += img_recon_loss
+
+                            if 'text' in reconstructed_complete and reconstructed_complete['text'] is not None:
+                                txt_recon_loss = F.mse_loss(reconstructed_complete['text'], complete_txt_orig)
+                                reconstruction_loss += txt_recon_loss
+
+                        # 2. Process samples with only text present (image is missing)
+                        # Here the model needs to generate image from text, then reconstruct text
+                        if text_only.any():
+                            text_orig = orig_features['text'][text_only]  # Original text features
+
+                            # Check that reconstructed features exist
+                            if recon_features is not None and 'text' in recon_features and recon_features[
+                                'text'] is not None:
+                                # Get reconstructed text (after cycle: text -> generated image -> reconstructed text)
+                                text_recon = recon_features['text'][text_only]
+
+                                # Cycle consistency: Compare reconstructed text with original text
+                                if text_recon.shape == text_orig.shape:
+                                    text_cycle_loss = F.mse_loss(text_recon, text_orig)
+                                    reconstruction_loss += text_cycle_loss
+
+                        # 3. Process samples with only image present (text is missing)
+                        # Here the model needs to generate text from image, then reconstruct image
+                        if image_only.any():
+                            image_orig = orig_features['image'][image_only]  # Original image features
+
+                            # Check that reconstructed features exist
+                            if recon_features is not None and 'image' in recon_features and recon_features[
+                                'image'] is not None:
+                                # Get reconstructed image (after cycle: image -> generated text -> reconstructed image)
+                                image_recon = recon_features['image'][image_only]
+
+                                # Cycle consistency: Compare reconstructed image with original image
+                                if image_recon.shape == image_orig.shape:
+                                    image_cycle_loss = F.mse_loss(image_recon, image_orig)
+                                    reconstruction_loss += image_cycle_loss
+
+                        # Calculate final loss with appropriate weights
+                        gen_weight = 0.5  # Fixed weight or can be varied over epochs
+
+                        # Final loss combining classification, reconstruction, and generation
+
 
                     # 计算重建权重（从initial逐渐减小到final）
                     recon_weight = initial_recon_weight * (1 - current_epoch / max_epochs) + final_recon_weight * (
                             current_epoch / max_epochs)
 
                     # 结合分类损失和重建损失
-                    total_batch_loss = classification_loss + recon_weight * reconstruction_loss
+                    # total_batch_loss = classification_loss + recon_weight * reconstruction_loss
+                    total_batch_loss = classification_loss + recon_weight * reconstruction_loss + gen_weight * generation_loss
+
+
+                    # ===== 临时: 特征一致性,强调图像的缺失恢复
+                    # 计算特征一致性损失 - 强调图像缺失恢复
+                    feature_consistency_loss = 0.0
+                    if hasattr(self.model, 'compute_feature_consistency_loss'):
+                        if 'original_features' in additional_info and 'reconstructed_features' in additional_info:
+                            consistency_loss = self.model.compute_feature_consistency_loss(
+                                additional_info['original_features'],
+                                additional_info['reconstructed_features']
+                            )
+
+                            # 添加到总损失
+                            total_batch_loss = total_batch_loss + 0.2 * consistency_loss  # 0.2权重避免过度影响
+                            feature_consistency_loss = consistency_loss.item()
+
+                    # 记录损失值
+                    cls_loss += classification_loss.item()
+                    recon_loss += reconstruction_loss if isinstance(reconstruction_loss,
+                                                                    torch.Tensor) else reconstruction_loss
+                    consistency_loss_sum += feature_consistency_loss  # 新增记录
 
                     # ===== 临时: 特征一致性,强调图像的缺失恢复
                     # 计算特征一致性损失 - 强调图像缺失恢复
@@ -532,8 +592,8 @@ class Trainer:
                     # ===== 第3部分：对比损失计算 =====
                     # 计算原始样本之间的损失有什么用?它怎么能训练模型本身呢,从头到尾就没有下降啊
                     contrastive_loss_value = 0.0
-                    contrastive_decay = min(1.0,1.0-current_epoch/max_epochs)
-                    contrastive_weight = 1 * contrastive_decay  # 对比损失的权重（可调整）
+                    contrastive_decay = max(0.1,1.0-current_epoch/max_epochs)
+                    contrastive_weight = 0.5 * contrastive_decay  # 对比损失的权重（可调整）
 
                     # 计算双模态样本之间的对比损失（促进模态间对齐）
                     both_modalities = (missing_type == 0)  # 找出完整样本
@@ -655,13 +715,12 @@ class Trainer:
                     total_batch_loss = classification_loss
                     cls_loss += classification_loss.item()
 
+
+
                 # ===== 优化步骤 =====
                 self.optimizer.zero_grad()
                 total_batch_loss.backward()
 
-                # 更新进度条
-                batch_pbar.set_postfix({"loss": f"{total_batch_loss.item():.4f}"})
-                batch_pbar.update(1)
 
                 # 可选的梯度裁剪
                 if self.config.get("clip_grad_norm", 0) > 0:
@@ -685,6 +744,49 @@ class Trainer:
                 # 累计损失和预测结果
                 total_loss += total_batch_loss.item()
 
+                postfix_dict = {
+                    "total": f"{total_batch_loss.item():.4f}",
+                    "cls": f"{classification_loss.item():.4f}"
+                }
+
+                # 添加重建损失（如果存在）
+                if isinstance(reconstruction_loss, torch.Tensor) and reconstruction_loss.item() > 0:
+                    postfix_dict["recon"] = f"{reconstruction_loss.item():.4f}"
+                elif reconstruction_loss > 0:
+                    postfix_dict["recon"] = f"{reconstruction_loss:.4f}"
+
+                if isinstance(generation_loss, torch.Tensor) and generation_loss.item() > 0:
+                    postfix_dict["gen"] = f"{generation_loss.item():.4f}"
+                elif generation_loss > 0:
+                    generation_loss["gen"] = f"{generation_loss:.4f}"
+
+                # 添加对比损失（如果存在）
+                if contrastive_loss_value > 0:
+                    postfix_dict["contra"] = f"{contrastive_loss_value:.4f}"
+
+                # 添加质量损失（如果存在）
+                if quality_pred_loss > 0:
+                    postfix_dict["qual"] = f"{quality_pred_loss.item():.4f}"
+
+                # 添加对抗损失（如果存在）
+                if adv_loss_value > 0:
+                    postfix_dict["adv"] = f"{adv_loss_value:.4f}"
+
+                # 添加当前学习率
+                postfix_dict["lr"] = f"{current_lr:.6f}"
+
+                # 添加图像缺失样本的质量分数（如果可用）
+                if additional_info and 'quality_scores' in additional_info:
+                    # 仅显示图像缺失样本的图像质量分数平均值
+                    img_missing_mask = is_image_missing
+                    if img_missing_mask.any():
+                        img_quality = additional_info['quality_scores']['image']['final_score'][img_missing_mask]
+                        if len(img_quality) > 0:
+                            postfix_dict["img_q"] = f"{img_quality.mean().item():.4f}"
+
+                batch_pbar.set_postfix(postfix_dict)
+                batch_pbar.update(1)
+
                 # 根据数据集类型计算预测
                 if self.is_single_label:
                     # 单标签分类 - 使用argmax获取类别索引
@@ -702,6 +804,25 @@ class Trainer:
 
             # 关闭进度条
             batch_pbar.close()
+
+            # 检查并调用FusionAnalyzer生成报告
+            if hasattr(self.model, 'fusion_analyzer') and self.model.fusion_analyzer is not None:
+                try:
+                    # 验证fusion_analyzer是否可调用generate_summary_report方法
+                    if callable(getattr(self.model.fusion_analyzer, 'generate_summary_report', None)):
+                        print("Generating fusion analysis summary report...")
+                        self.model.fusion_analyzer.generate_summary_report(epoch)
+                    else:
+                        print("Warning: fusion_analyzer exists but has no 'generate_summary_report' method.")
+                        # 新增：生成模态特征分布分析
+                    if callable(
+                            getattr(self.model.fusion_analyzer, 'analyze_modality_features_distribution', None)):
+                        print("Generating modality features distribution analysis...")
+                        self.model.fusion_analyzer.analyze_modality_features_distribution(epoch)
+                    else:
+                        print("Warning: fusion_analyzer has no 'analyze_modality_features_distribution' method.")
+                except Exception as e:
+                    print(f"Error generating report: {e}")
 
             # ===== 训练轮次结束，计算指标 =====
             # 合并所有批次的预测和标签
@@ -765,7 +886,7 @@ class Trainer:
 
             # ===== 保存检查点 =====
             # 每几个轮次保存一次
-            if epoch % self.config.get("save_every_epochs", 5) == 0:
+            if epoch!=0 and epoch % self.config.get("save_every_epochs", 5) == 0:
                 self._save_checkpoint(epoch, metrics=val_metrics)
 
             # 根据主要指标保存最佳模型
@@ -819,74 +940,209 @@ class Trainer:
 
 
     def _compute_metrics(self, preds, labels):
-        """计算多种评估指标"""
+        """
+            使用torchmetrics.functional计算评估指标，适用于单标签(Food101)和多标签(MMIMDB)分类任务。
+
+            Args:
+                preds: 预测值（logits或概率）
+                       对于Food101: [batch_size, 101]
+                       对于MMIMDB: [batch_size, 23]
+                labels: 真实标签
+                        对于Food101: [batch_size, 101]（one-hot编码）或 [batch_size]（类别索引）
+                        对于MMIMDB: [batch_size, 23]（multi-hot编码）
+
+            Returns:
+                指标字典
+            """
+        # 确保输入是PyTorch张量并在同一设备上
+        device = preds.device
+
+        # 初始化结果字典
         results = {}
 
-        # 将张量转换为NumPy数组
-        preds_np = preds.numpy()
-        labels_np = labels.numpy()
-
         if self.is_single_label:
-            # 单标签分类 - 使用argmax获取类别索引
-            pred_classes = preds_np.argmax(axis=1)
-            true_classes = labels_np.argmax(axis=1)
+            # 单标签分类 (Food101)
 
-            # 计算准确率
-            results["accuracy"] = (pred_classes == true_classes).mean()
+            # 获取预测的类别索引
+            pred_classes = preds.argmax(dim=1)
+
+            # 如果标签是one-hot编码，转换为类别索引
+            if labels.dim() > 1 and labels.size(1) > 1:
+                true_classes = labels.argmax(dim=1)
+            else:
+                true_classes = labels
 
             try:
-                # 计算多类别F1分数
-                results["macro_f1"] = f1_score(true_classes, pred_classes, average='macro', zero_division=0)
-                results["micro_f1"] = f1_score(true_classes, pred_classes, average='micro', zero_division=0)
-                # 计算AUROC - 对于多类别使用OVR策略
+                # 计算准确率
+                results["accuracy"] = accuracy(
+                    pred_classes,
+                    true_classes,
+                    task="multiclass",
+                    num_classes=preds.size(1)
+                ).item()
+
+                # 计算F1分数
+                results["macro_f1"] = f1_score(
+                    pred_classes,
+                    true_classes,
+                    task="multiclass",
+                    num_classes=preds.size(1),
+                    average="macro"
+                ).item()
+
+                results["micro_f1"] = f1_score(
+                    pred_classes,
+                    true_classes,
+                    task="multiclass",
+                    num_classes=preds.size(1),
+                    average="micro"
+                ).item()
+
+                # 如果需要计算AUROC
                 if "auroc" in self.metrics:
-                    # 将预测转为概率
-                    # 对于softmax输出，使用原始logits计算每类概率
-                    probs = softmax(preds_np, axis=1)
+                    # 转换logits为概率分布
+                    probs = F.softmax(preds, dim=1)
                     try:
-                        results["auroc"] = roc_auc_score(labels_np, probs, average='macro', multi_class='ovr')
-                    except:
-                        results["auroc"] = 0.5  # 随机猜测的AUC值
+                        results["auroc"] = auroc(
+                            probs,
+                            true_classes,
+                            task="multiclass",
+                            num_classes=preds.size(1),
+                            average="macro"
+                        ).item()
+                    except Exception as e:
+                        self.logger.warning(f"计算AUROC时出错: {str(e)}")
+                        results["auroc"] = 0.5  # 随机分类器的默认值
             except Exception as e:
-                self.logger.warning(f"计算F1分数时出错: {str(e)}")
+                self.logger.warning(f"计算指标时出错: {str(e)}")
+                results["accuracy"] = 0.0
                 results["macro_f1"] = 0.0
                 results["micro_f1"] = 0.0
-                results["auroc"] = 0.5  # 随机猜测的AUC值
+                results["auroc"] = 0.5
 
         else:
-            # 计算要求的指标
-            if "accuracy" in self.metrics:
-                # 多标签情况下的准确率计算
-                correct = ((preds_np > 0.5) == (labels_np > 0.5)).sum()
-                total = labels_np.size
-                results["accuracy"] = correct / total
+            # 多标签分类 (MMIMDB)
 
-            if "macro_f1" in self.metrics:
-                # 多标签宏平均F1
-                # 对每个样本的每个类别计算是否预测正确
-                binary_preds = (preds_np > 0.5).astype(float)
-                try:
-                    results["macro_f1"] = f1_score(labels_np, binary_preds, average='macro', zero_division=0)
-                except:
-                    results["macro_f1"] = 0.0
+            # 使用threshold将logits转换为二值预测
+            threshold = 0.5  # 与您原始代码中相同的阈值
+            preds_sigmoid = torch.sigmoid(preds)
+            binary_preds = (preds > threshold).float()
 
-            if "micro_f1" in self.metrics:
-                # 多标签微平均F1
-                binary_preds = (preds_np > 0.5).astype(float)
-                try:
-                    results["micro_f1"] = f1_score(labels_np, binary_preds, average='micro', zero_division=0)
-                except:
-                    results["micro_f1"] = 0.0
+            try:
+                # 计算多标签准确率（元素级匹配）
+                correct = (binary_preds == labels).sum().float()
+                total = labels.numel()
+                results["accuracy"] = (correct / total).item()
 
-            if "auroc" in self.metrics:
-                # 多标签AUROC
-                try:
-                    # 当有类别全为正或全为负时，这会失败
-                    results["auroc"] = roc_auc_score(labels_np, preds_np, average='macro')
-                except:
-                    results["auroc"] = 0.5  # 随机猜测的AUC值
+                # 计算多标签F1分数
+                results["macro_f1"] = f1_score(
+                    binary_preds,
+                    labels,
+                    task="multilabel",
+                    num_labels=preds.size(1),
+                    average="macro"
+                ).item()
+
+                results["micro_f1"] = f1_score(
+                    binary_preds,
+                    labels,
+                    task="multilabel",
+                    num_labels=preds.size(1),
+                    average="micro"
+                ).item()
+
+                # 如果需要计算AUROC
+                if "auroc" in self.metrics:
+                    try:
+                        results["auroc"] = auroc(
+                            preds_sigmoid,
+                            labels,
+                            task="multilabel",
+                            num_labels=preds.size(1),
+                            average="macro"
+                        ).item()
+                    except Exception as e:
+                        self.logger.warning(f"计算AUROC时出错: {str(e)}")
+                        results["auroc"] = 0.5  # 随机分类器的默认值
+            except Exception as e:
+                self.logger.warning(f"计算指标时出错: {str(e)}")
+                results["accuracy"] = 0.0
+                results["macro_f1"] = 0.0
+                results["micro_f1"] = 0.0
+                results["auroc"] = 0.5
 
         return results
+
+
+        # """计算多种评估指标"""
+        # results = {}
+        #
+        # # 将张量转换为NumPy数组
+        # preds_np = preds.numpy()
+        # labels_np = labels.numpy()
+        #
+        # if self.is_single_label:
+        #     # 单标签分类 - 使用argmax获取类别索引
+        #     pred_classes = preds_np.argmax(axis=1)
+        #     true_classes = labels_np.argmax(axis=1)
+        #
+        #     # 计算准确率
+        #     results["accuracy"] = (pred_classes == true_classes).mean()
+        #
+        #     try:
+        #         # 计算多类别F1分数
+        #         results["macro_f1"] = f1_score(true_classes, pred_classes, average='macro', zero_division=0)
+        #         results["micro_f1"] = f1_score(true_classes, pred_classes, average='micro', zero_division=0)
+        #         # 计算AUROC - 对于多类别使用OVR策略
+        #         if "auroc" in self.metrics:
+        #             # 将预测转为概率
+        #             # 对于softmax输出，使用原始logits计算每类概率
+        #             probs = softmax(preds_np, axis=1)
+        #             try:
+        #                 results["auroc"] = roc_auc_score(labels_np, probs, average='macro', multi_class='ovr')
+        #             except:
+        #                 results["auroc"] = 0.5  # 随机猜测的AUC值
+        #     except Exception as e:
+        #         self.logger.warning(f"计算F1分数时出错: {str(e)}")
+        #         results["macro_f1"] = 0.0
+        #         results["micro_f1"] = 0.0
+        #         results["auroc"] = 0.5  # 随机猜测的AUC值
+        #
+        # else:
+        #     # 计算要求的指标
+        #     if "accuracy" in self.metrics:
+        #         # 多标签情况下的准确率计算
+        #         correct = ((preds_np > 0.5) == (labels_np > 0.5)).sum()
+        #         total = labels_np.size
+        #         results["accuracy"] = correct / total
+        #
+        #     if "macro_f1" in self.metrics:
+        #         # 多标签宏平均F1
+        #         # 对每个样本的每个类别计算是否预测正确
+        #         binary_preds = (preds_np > 0.5).astype(float)
+        #         try:
+        #             results["macro_f1"] = f1_score(labels_np, binary_preds, average='macro', zero_division=0)
+        #         except:
+        #             results["macro_f1"] = 0.0
+        #
+        #     if "micro_f1" in self.metrics:
+        #         # 多标签微平均F1
+        #         binary_preds = (preds_np > 0.5).astype(float)
+        #         try:
+        #             results["micro_f1"] = f1_score(labels_np, binary_preds, average='micro', zero_division=0)
+        #         except:
+        #             results["micro_f1"] = 0.0
+        #
+        #     if "auroc" in self.metrics:
+        #         # 多标签AUROC
+        #         try:
+        #             # 当有类别全为正或全为负时，这会失败
+        #             results["auroc"] = roc_auc_score(labels_np, preds_np, average='macro')
+        #         except:
+        #             results["auroc"] = 0.5  # 随机猜测的AUC值
+        #
+        # return results
+
 
     # 在test或evaluate函数中添加以下代码
     def examine_logits(self, logits, missing_type, labels=None, prefix=""):
@@ -936,7 +1192,8 @@ class Trainer:
                              f"max={stats['max']:.4f}, positive%={stats['positive%']:.2f}%")
 
             # 每个类别的详细统计
-            if mt_name == 'image':  # 重点分析图像缺失情况
+
+            if mt_name in ['image', 'none', 'text']:
                 self.logger.info(f"    Per-class logits for {mt_name}:")
 
                 # 计算每个类别的统计信息

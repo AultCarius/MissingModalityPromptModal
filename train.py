@@ -14,6 +14,7 @@ from models.multimodal_model import create_multimodal_prompt_model
 if __name__ == '__main__':
 
 
+    # config_path = "configs/food101.yaml"
     config_path = "configs/mmimdb.yaml"
     # config_path = "/kaggle/working/MissingModalityPromptModal/configs/mmimdb.yaml"
     with open(config_path, 'r') as f:
@@ -110,6 +111,8 @@ if __name__ == '__main__':
 
     # Initialize trainer
     trainer = Trainer(model, train_loader, val_loader, config=config)
+
+    model.fusion_analyzer.set_plotdir(trainer.plot_dir)
 
     trainer.class_weights = datamodule.get_class_weights().to(trainer.device)
 

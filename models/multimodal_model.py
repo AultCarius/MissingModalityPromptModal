@@ -169,6 +169,10 @@ class MultimodalPromptModel(nn.Module):
             use_clip_encoders=False  # 标志是否使用CLIP编码器
     ):
         super().__init__()
+
+        from utils.analysis import FusionAnalyzer
+        self.fusion_analyzer = FusionAnalyzer(save_dir='fusion_analysis_results')
+
         self.max_length = max_length
         self.encoder_type = encoder_type.lower()
         self.use_clip_encoders = use_clip_encoders
@@ -177,7 +181,6 @@ class MultimodalPromptModel(nn.Module):
         self.image_encoder = image_encoder_backbone
         self.text_encoder = text_encoder_backbone
 
-        # 处理CLIP模式
         # 处理CLIP模式
         if use_clip_encoders:
             # 获取维度信息
@@ -319,7 +322,7 @@ class MultimodalPromptModel(nn.Module):
         print("fusion_input_dim=", fusion_input_dim)
         self.fusion = nn.Sequential(
             nn.Linear(fusion_input_dim, fusion_dim),
-            nn.ReLU(),
+            nn.GELU(),
             nn.Dropout(0.1)
         )
         self.classifier = nn.Linear(fusion_dim, num_classes)
@@ -341,6 +344,231 @@ class MultimodalPromptModel(nn.Module):
             for module in [self.text_embeddings, self.text_blocks, self.text_norm]:
                 for param in module.parameters():
                     param.requires_grad = False
+
+
+    def analyze_feature_distributions(self, original_features, generated_features, reconstructed_features, missing_type,
+                                      step="before_processing"):
+        """
+        Analyze and print statistics about feature distributions for real, generated, and reconstructed features.
+
+        Args:
+            original_features: Dictionary of original features for each modality
+            generated_features: Dictionary of generated features for each modality
+            reconstructed_features: Dictionary of reconstructed features for each modality
+            missing_type: Tensor indicating missing modality types
+            step: String indicating when this analysis is being performed
+        """
+        batch_size = missing_type.size(0)
+        device = missing_type.device
+
+        # Convert missing_type to boolean masks
+        is_image_missing = (missing_type == 1) | (missing_type == 3)
+        is_text_missing = (missing_type == 2) | (missing_type == 3)
+
+        print(f"\n===== Feature Distribution Analysis ({step}) =====")
+        print(f"Batch size: {batch_size}, Image missing: {is_image_missing.sum().item()}/{batch_size}, "
+              f"Text missing: {is_text_missing.sum().item()}/{batch_size}")
+
+        # Analyze image features
+        print("\n----- Image Features -----")
+        self._analyze_modality_features(
+            original_features.get('image'),
+            None if generated_features is None else generated_features.get('image'),
+            None if reconstructed_features is None else reconstructed_features.get('image'),
+            is_image_missing,
+            modality="image"
+        )
+
+        # Analyze text features
+        print("\n----- Text Features -----")
+        self._analyze_modality_features(
+            original_features.get('text'),
+            None if generated_features is None else generated_features.get('text'),
+            None if reconstructed_features is None else reconstructed_features.get('text'),
+            is_text_missing,
+            modality="text"
+        )
+
+        print("===== End of Analysis =====\n")
+
+    def analyze_features_at_key_points(self, step_name, image_features=None, text_features=None):
+        """
+        分析特定步骤的特征分布
+
+        Args:
+            step_name: 步骤名称
+            image_features: 图像特征
+            text_features: 文本特征
+        """
+        print(f"\n===== Feature Analysis at {step_name} =====")
+
+        if image_features is not None and image_features.numel() > 0:
+            # 计算图像特征统计信息
+            img_mean = image_features.mean().item()
+            img_std = image_features.std().item()
+            img_min = image_features.min().item()
+            img_max = image_features.max().item()
+            img_abs_mean = image_features.abs().mean().item()
+            img_norm = torch.norm(image_features, dim=1).mean().item() if image_features.dim() > 1 else torch.norm(
+                image_features).item()
+
+            print(f"Image features:")
+            print(f"  Shape: {list(image_features.shape)}")
+            print(f"  Mean: {img_mean:.6f}, Std: {img_std:.6f}")
+            print(f"  Min: {img_min:.6f}, Max: {img_max:.6f}")
+            print(f"  Abs Mean: {img_abs_mean:.6f}, L2 Norm: {img_norm:.6f}")
+
+        if text_features is not None and text_features.numel() > 0:
+            # 计算文本特征统计信息
+            txt_mean = text_features.mean().item()
+            txt_std = text_features.std().item()
+            txt_min = text_features.min().item()
+            txt_max = text_features.max().item()
+            txt_abs_mean = text_features.abs().mean().item()
+            txt_norm = torch.norm(text_features, dim=1).mean().item() if text_features.dim() > 1 else torch.norm(
+                text_features).item()
+
+            print(f"Text features:")
+            print(f"  Shape: {list(text_features.shape)}")
+            print(f"  Mean: {txt_mean:.6f}, Std: {txt_std:.6f}")
+            print(f"  Min: {txt_min:.6f}, Max: {txt_max:.6f}")
+            print(f"  Abs Mean: {txt_abs_mean:.6f}, L2 Norm: {txt_norm:.6f}")
+
+        # 如果两者都存在，比较它们
+        if image_features is not None and text_features is not None and image_features.numel() > 0 and text_features.numel() > 0:
+            print(f"\nComparison (Image vs Text):")
+            print(f"  Std ratio: {img_std / txt_std:.4f}x")
+            print(f"  Abs Mean ratio: {img_abs_mean / txt_abs_mean:.4f}x")
+            print(f"  L2 Norm ratio: {img_norm / txt_norm:.4f}x")
+            print(f"  Range ratio: {(img_max - img_min) / (txt_max - txt_min):.4f}x")
+
+        print("========================================\n")
+
+    def _analyze_modality_features(self, original, generated, reconstructed, missing_mask, modality):
+        """
+        Helper method to analyze features for a specific modality.
+
+        Args:
+            original: Original features tensor
+            generated: Generated features tensor
+            reconstructed: Reconstructed features tensor
+            missing_mask: Boolean mask indicating which samples have this modality missing
+            modality: String indicating which modality ("image" or "text")
+        """
+        # Check if features exist
+        has_original = original is not None and original.numel() > 0
+        has_generated = generated is not None and generated.numel() > 0
+        has_reconstructed = reconstructed is not None and reconstructed.numel() > 0
+
+        # Check for NaN or Inf values
+        def check_invalid(tensor, name):
+            if tensor is None:
+                return False
+            has_nan = torch.isnan(tensor).any().item()
+            has_inf = torch.isinf(tensor).any().item()
+            if has_nan or has_inf:
+                print(f"WARNING: {name} has {'NaN' if has_nan else 'Inf'} values!")
+            return has_nan or has_inf
+
+        # Compute statistics for a tensor
+        def compute_stats(tensor, flatten=True):
+            if tensor is None:
+                return {}
+
+            # Flatten the tensor for consistent analysis
+            if flatten and tensor.dim() > 2:
+                tensor = tensor.reshape(tensor.size(0), -1)
+
+            # Basic statistics
+            stats = {
+                "mean": tensor.mean().item(),
+                "std": tensor.std().item(),
+                "min": tensor.min().item(),
+                "max": tensor.max().item(),
+                "abs_mean": tensor.abs().mean().item(),
+                "zeros_percent": (tensor == 0).float().mean().item() * 100,
+                "shape": list(tensor.shape)
+            }
+
+            # Additional statistics
+            with torch.no_grad():
+                # Compute L2 norm (feature magnitude)
+                if tensor.dim() > 1:
+                    stats["norm_mean"] = torch.norm(tensor, dim=1).mean().item()
+
+                # Check for activation patterns
+                stats["positive_percent"] = (tensor > 0).float().mean().item() * 100
+                stats["negative_percent"] = (tensor < 0).float().mean().item() * 100
+
+                # Compute histogram for distribution visualization
+                hist_vals = tensor.flatten().cpu().numpy()
+                try:
+                    from numpy import histogram
+                    hist, bins = histogram(hist_vals, bins=10)
+                    stats["histogram"] = {
+                        "counts": hist.tolist(),
+                        "bins": bins.tolist()
+                    }
+                except:
+                    stats["histogram"] = None
+
+            return stats
+
+        # Extract non-missing samples from original features
+        if has_original and not missing_mask.all():
+            real_samples = original[~missing_mask] if missing_mask.any() else original
+            real_stats = compute_stats(real_samples)
+            print(f"Real {modality} features (non-missing):")
+            print(f"  Shape: {real_stats['shape']}")
+            print(f"  Mean: {real_stats['mean']:.6f}, Std: {real_stats['std']:.6f}")
+            print(f"  Min: {real_stats['min']:.6f}, Max: {real_stats['max']:.6f}")
+            print(f"  Abs Mean: {real_stats['abs_mean']:.6f}, L2 Norm Mean: {real_stats.get('norm_mean', 'N/A')}")
+            print(
+                f"  Positive: {real_stats['positive_percent']:.2f}%, Negative: {real_stats['negative_percent']:.2f}%, Zeros: {real_stats['zeros_percent']:.2f}%")
+
+            # Check for invalid values
+            check_invalid(real_samples, f"Real {modality} features")
+
+        # Extract generated features statistics
+        if has_generated and missing_mask.any():
+            gen_samples = generated[missing_mask] if generated.shape[0] > 1 else generated
+            gen_stats = compute_stats(gen_samples)
+            print(f"Generated {modality} features:")
+            print(f"  Shape: {gen_stats['shape']}")
+            print(f"  Mean: {gen_stats['mean']:.6f}, Std: {gen_stats['std']:.6f}")
+            print(f"  Min: {gen_stats['min']:.6f}, Max: {gen_stats['max']:.6f}")
+            print(f"  Abs Mean: {gen_stats['abs_mean']:.6f}, L2 Norm Mean: {gen_stats.get('norm_mean', 'N/A')}")
+            print(
+                f"  Positive: {gen_stats['positive_percent']:.2f}%, Negative: {gen_stats['negative_percent']:.2f}%, Zeros: {gen_stats['zeros_percent']:.2f}%")
+
+            # Check for invalid values
+            check_invalid(gen_samples, f"Generated {modality} features")
+
+            # Compare with real features if both exist
+            if has_original and not missing_mask.all():
+                print(f"  Distribution comparison (Generated vs Real):")
+                print(f"    Mean ratio: {gen_stats['mean'] / real_stats['mean']:.4f} (vs 1.0 ideal)")
+                print(f"    Std ratio: {gen_stats['std'] / real_stats['std']:.4f} (vs 1.0 ideal)")
+                print(f"    Abs Mean ratio: {gen_stats['abs_mean'] / real_stats['abs_mean']:.4f} (vs 1.0 ideal)")
+                if 'norm_mean' in gen_stats and 'norm_mean' in real_stats:
+                    print(f"    Norm ratio: {gen_stats['norm_mean'] / real_stats['norm_mean']:.4f} (vs 1.0 ideal)")
+
+        # Extract reconstructed features statistics
+        if has_reconstructed:
+            # Get statistics for all reconstructed samples
+            recon_stats = compute_stats(reconstructed)
+            print(f"Reconstructed {modality} features:")
+            print(f"  Shape: {recon_stats['shape']}")
+            print(f"  Mean: {recon_stats['mean']:.6f}, Std: {recon_stats['std']:.6f}")
+            print(f"  Min: {recon_stats['min']:.6f}, Max: {recon_stats['max']:.6f}")
+            print(f"  Abs Mean: {recon_stats['abs_mean']:.6f}")
+
+            # Compare with original features if both exist
+            if has_original:
+                # Compute reconstruction error
+                if original.shape == reconstructed.shape:
+                    recon_error = torch.nn.functional.mse_loss(reconstructed, original).item()
+                    print(f"  Reconstruction MSE: {recon_error:.6f}")
 
     # 添加到MultimodalPromptModel类中
     def compute_feature_consistency_loss(self, original_features, reconstructed_features):
@@ -480,9 +708,8 @@ class MultimodalPromptModel(nn.Module):
                 image_embed[non_missing] = non_missing_embeds
 
         # 处理文本特征 (如果存在且不是缺失的)
-        text_embed = None
-        if input_ids is not None:
-            text_embed = torch.zeros(batch_size, input_ids.size(1), self.text_dim, device=device)  # 默认零嵌入
+        text_embed = torch.zeros(batch_size, input_ids.size(1), self.text_dim, device=device)  # 默认零嵌入
+        if input_ids is not None and not is_text_missing.all():
 
             # 只处理非缺失样本
             non_missing = ~is_text_missing
@@ -493,11 +720,15 @@ class MultimodalPromptModel(nn.Module):
                     non_missing_ids = input_ids[non_missing]
                     non_missing_mask = attention_mask[non_missing] if attention_mask is not None else None
 
-                    # 关键修复：使用文本编码器将token IDs转换为嵌入向量
+
+
                     if self.use_clip_encoders:
                         try:
                             if hasattr(self.text_encoder, 'embeddings'):
-                                non_missing_embeds = self.text_encoder.embeddings(non_missing_ids)
+                                non_missing_embeds = self.text_encoder.embeddings(
+                                    non_missing_ids
+                                )
+
                             else:
                                 # 回退方案
                                 non_missing_embeds = self.text_embeddings(non_missing_ids)
@@ -556,16 +787,6 @@ class MultimodalPromptModel(nn.Module):
         image_is_zeros = (torch.sum(torch.abs(image_embed), dim=(1, 2)) < 1e-6)
         text_is_zeros = (torch.sum(torch.abs(text_embed), dim=(1, 2)) < 1e-6)
 
-        # # # 新增: 检查两种检测方法是否一致
-        # image_check = torch.all(is_image_missing == image_is_zeros)
-        # text_check = torch.all(is_text_missing == text_is_zeros)
-        # print(is_image_missing)
-        # print(image_is_zeros)
-        # print(f"图像缺失检测一致性: {image_check.item()}")
-        # print(is_text_missing)
-        # print(text_is_zeros)
-        # print(f"文本缺失检测一致性: {text_check.item()}")
-
 
         # 保存原始特征用于重建损失
         original_features = {
@@ -577,6 +798,19 @@ class MultimodalPromptModel(nn.Module):
             'image': ~image_is_zeros.unsqueeze(1).expand(-1, token_count),
             'text': ~text_is_zeros.unsqueeze(1).expand(-1, token_count)
         }
+
+        # ADDED: Analyze original features
+        # Only analyze features for 1% of batches to avoid log spam
+        # should_analyze = (torch.rand(1).item() < 0.01)
+        should_analyze = 0
+        if should_analyze:
+            self.analyze_feature_distributions(
+                original_features,
+                None,  # No generated features yet
+                None,  # No reconstructed features yet
+                missing_type,
+                step="before_generation"
+            )
 
         # 处理模态生成
         generated_features = {'image': None, 'text': None}
@@ -674,6 +908,17 @@ class MultimodalPromptModel(nn.Module):
                         else:  # 带batch维度 [1, token_count, dim]
                             reconstructed_features[mod][b] = sample_recon[mod].squeeze(0)
 
+        # ADDED: Analyze features after generation
+        if should_analyze:
+            self.analyze_feature_distributions(
+                original_features,
+                generated_features,
+                reconstructed_features,
+                missing_type,
+                step="after_generation"
+            )
+
+
         # # 使用生成的特征替换缺失的模态
         if is_image_missing.any() and generated_features['image'] is not None:
 
@@ -724,7 +969,22 @@ class MultimodalPromptModel(nn.Module):
                             if attention_mask is not None:
                                 attention_mask[b, t] = 1
 
-        # print("一个batch解决")
+        # ADDED: Analyze features after replacement
+        if should_analyze:
+            # Create a dictionary of the final combined features
+            final_features = {
+                'image': image_embed[:, :token_count].reshape(batch_size, token_count, -1).detach(),
+                'text': text_embed[:, :token_count].reshape(batch_size, token_count, -1).detach()
+            }
+
+            self.analyze_feature_distributions(
+                original_features,
+                generated_features,
+                final_features,  # Use the combined features as "reconstructed"
+                missing_type,
+                step="after_replacement"
+            )
+
         return image_embed, text_embed, attention_mask, original_features, \
             (generated_features, reconstructed_features) if self.use_modality_generator else (None, None)
 
@@ -771,6 +1031,17 @@ class MultimodalPromptModel(nn.Module):
         image_embed, text_embed, is_image_missing, is_text_missing = self._extract_features(
             image, input_ids, attention_mask, missing_type
         )
+
+        # 1. 在提取特征后，分析原始特征分布
+        # 创建一个随机采样检查标志，避免分析所有批次
+        should_analyze = (torch.rand(1).item() < 0.001)  # 1%的批次进行分析
+        shoule_analyze_fusion = (torch.rand(1).item() < 0.01)
+        # 特征分布分析
+        if should_analyze and image_embed is not None and text_embed is not None:
+            # 获取CLS token
+            img_cls = image_embed[:, 0].detach()
+            txt_cls = text_embed[:, 0].detach()
+            self.analyze_features_at_key_points("原始提取的特征", img_cls, txt_cls)
 
         original_image_embed = image_embed.clone()
         original_text_embed = text_embed.clone()
@@ -830,28 +1101,14 @@ class MultimodalPromptModel(nn.Module):
                     attention_mask=extended_attention_mask
                 )[0]
 
+        # 2. 在应用Transformer层前
+        if should_analyze:
+            pre_img_feature = image_embed[:, 0].detach()
+            pre_text_feature = text_embed[:, 0].detach()
+            self.analyze_features_at_key_points("经过Transformer前", pre_img_feature, pre_text_feature)
+
         # 计算模态质量（如果启用）
         quality_scores = None
-        # if self.use_quality_prompt:
-        #     # 使用CLS token进行质量评估
-        #     img_cls_feat = temp_img[:, 0]  # [B, D_img]
-        #     txt_cls_feat = temp_txt[:, 0]  # [B, D_txt]
-        #     quality_scores = self.quality_estimator(img_cls_feat, txt_cls_feat, missing_type)
-
-        # 这里多少有点问题
-        if self.use_quality_prompt:
-            # Update reference statistics when training
-            img_cls_feat = temp_img[:, 0]  # [B, D_img]
-            txt_cls_feat = temp_txt[:, 0]  # [B, D_txt]
-            # print()
-            # print(missing_type)
-            # print("img_cls_feat",img_cls_feat.shape,img_cls_feat)
-            # print("txt_cls_feat",txt_cls_feat.shape,txt_cls_feat)
-            quality_scores = self.quality_estimator(img_cls_feat, txt_cls_feat, missing_type)
-            self.quality_estimator.update_reference_statistics(
-                image_embed[:, 0] if image_embed is not None else None,
-                text_embed[:, 0] if text_embed is not None else None
-            )
 
         # 跨层处理
         for i in range(self.prompt_depth):
@@ -907,8 +1164,6 @@ class MultimodalPromptModel(nn.Module):
             # 跨模态交互更新提示
             if i < len(self.cross_modal_layer):
                 # 从当前层特征更新提示
-                # image_prompt = self.cross_modal_layer[i](image_prompt, text_embed)
-                # text_prompt = self.cross_modal_layer[i](text_prompt, image_embed)
                 image_prompt = self.image_InterPrompt_layer[i](image_prompt, image_embed)
                 text_prompt = self.text_InterPrompt_layer[i](text_prompt, text_embed)
 
@@ -947,53 +1202,137 @@ class MultimodalPromptModel(nn.Module):
                     attention_mask=extended_attention_mask
                 )[0]
 
-
+        # 3. 在应用最终的层归一化前
+        if should_analyze:
+            pre_norm_img = image_embed[:, 0].detach()
+            pre_norm_txt = text_embed[:, 0].detach()
+            self.analyze_features_at_key_points("层归一化前", pre_norm_img, pre_norm_txt)
         # 应用最终的层归一化
         image_embed = self.image_norm(image_embed)
         text_embed = self.text_norm(text_embed)
+        # 4. 在层归一化后
+        if should_analyze:
+            post_norm_img = image_embed[:, 0].detach()
+            post_norm_txt = text_embed[:, 0].detach()
+            self.analyze_features_at_key_points("层归一化后", post_norm_img, post_norm_txt)
+
+
+
 
         # print(image_embed.shape,text_embed.shape)
         # 提取CLS token特征
         image_feat = image_embed[:, 0]  # [B, D_img]
         text_feat = text_embed[:, 0]  # [B, D_txt]
 
-        # 在应用质量引导的特征融合之前，打印维度信息
-        # print(f"DEBUG - Feature dimensions before fusion:")
-        # print(f"  image_feat shape: {image_feat.shape}")
-        # print(f"  text_feat shape: {text_feat.shape}")
-        # if quality_scores is not None:
-        #     print(f"  quality_scores image: {quality_scores['image']['final_score'].shape}")
-        #     print(f"  quality_scores text: {quality_scores['text']['final_score'].shape}")
-        #     print(f"  quality_scores consistency: {quality_scores['cross_consistency'].shape}")
+        # image_feat_norm = F.normalize(image_feat, p=2, dim=1)  # L2归一化
+        # text_feat_norm = F.normalize(text_feat, p=2, dim=1)  # L2归一化
+        image_feat_norm = F.layer_norm(image_feat, image_feat.shape[1:])
+        text_feat_norm = F.layer_norm(text_feat, text_feat.shape[1:])
+
+        # 收集模态特征用于epoch分析（在训练时且随机采样）
+        if self.training and hasattr(self, 'fusion_analyzer') and self.fusion_analyzer is not None:
+            # 随机采样收集特征，避免收集所有批次
+            should_collect = (torch.rand(1).item() < 0.1)  # 30%的批次收集特征
+            if should_collect:
+                try:
+                    self.fusion_analyzer.collect_modality_features(
+                        image_feat=image_feat_norm.detach(),  # 使用归一化后的特征
+                        text_feat=text_feat_norm.detach(),  # 使用归一化后的特征
+                        missing_type=missing_type
+                    )
+                except Exception as e:
+                    # 如果收集失败，不影响训练
+                    pass
+
+
+        image_feat = image_feat_norm
+        text_feat = text_feat_norm
+
+        # 5. 在质量评估和特征融合前
+        if should_analyze:
+            self.analyze_features_at_key_points("显式归一化", image_feat_norm.detach(), text_feat_norm.detach())
+
+        # 这里多少有点问题
+        if self.use_quality_prompt:
+            quality_scores = self.quality_estimator(image_feat_norm, text_feat_norm, missing_type)
+
+
+        # 5. 在质量评估和特征融合前
+        if should_analyze:
+            self.analyze_features_at_key_points("特征融合前", image_feat_norm.detach(), text_feat_norm.detach())
 
         # 质量引导的特征融合（如果启用）
         fusion_weights = None
         quality_guided_feat = None
         if self.use_quality_prompt and self.use_cross_modal_prompt:
-            # print(f"  Calling feature_fusion with image_feat: {image_feat.shape}, text_feat: {text_feat.shape}")
             quality_guided_feat, fusion_weights = self.feature_fusion(image_feat, text_feat, quality_scores)
-            # print(f"  After fusion: quality_guided_feat: {quality_guided_feat.shape}, fusion_weights: {fusion_weights.shape}")
+
+
+        # 6. 融合后的特征
+        if should_analyze and quality_guided_feat is not None:
+            self.analyze_features_at_key_points("融合后", quality_guided_feat.detach(), None)
+
+
 
         # Prepare features for concatenation
-        features_to_concat = [image_feat, text_feat, F.one_hot(missing_type, num_classes=4).float()]
+        features_to_concat = None
 
         # Add quality scores if enabled
         if self.use_quality_prompt:
-            features_to_concat.extend([
+            image_group = torch.cat([
+                image_feat,
                 quality_scores['image']['final_score'],
-                quality_scores['text']['final_score'],
                 quality_scores['image']['quality'],
+            ], dim=1)
+
+            text_group = torch.cat([
+                text_feat,
+                quality_scores['text']['final_score'],
                 quality_scores['text']['quality'],
-                quality_scores['cross_consistency']
-            ])
+            ], dim=1)
+
+            features_to_concat = torch.cat([
+                image_group,
+                text_group,
+                quality_scores['cross_consistency'],
+                F.one_hot(missing_type, num_classes=4).float()
+            ], dim=1)
+        else:
+            features_to_concat = torch.cat([image_feat, text_feat, F.one_hot(missing_type, num_classes=4).float()], dim=1)
 
         # Concatenate all features
-        fused = torch.cat(features_to_concat, dim=1)
-        base_hidden = self.fusion(fused)
+        base_hidden = self.fusion(features_to_concat)
+
+        if should_analyze and base_hidden is not None:
+            self.analyze_features_at_key_points("原始特征投影后", base_hidden.detach(), None)
+
         hidden = None
         if quality_guided_feat is not None:
-            alpha = 0.7  # Fixed weight or learnable parameter
-            hidden = alpha * base_hidden + (1 - alpha) * quality_guided_feat
+
+            # 或方法2: 使用LayerNorm
+            base_norm = F.layer_norm(base_hidden, base_hidden.shape[1:])
+            quality_norm = F.layer_norm(quality_guided_feat, quality_guided_feat.shape[1:])
+            alpha = 0  # Fixed weight or learnable parameter
+            if should_analyze:
+                self.analyze_features_at_key_points("再次归一化后.前者为base_norm,后者为qualitu_norm", base_norm.detach(), quality_norm.detach())
+
+            if shoule_analyze_fusion:
+                self.fusion_analyzer.analyze_fusion_features(
+                    base_hidden=base_norm,
+                    quality_guided_feat=quality_norm,
+                    missing_type=missing_type,
+                    alpha=alpha,  # 你使用的固定融合权重
+                    batch_idx=None,  # 自动生成批次索引
+                    save_current=True  # 保存当前批次的分析结果
+                )
+            hidden = alpha * base_norm + (1 - alpha) * quality_norm
+
+        else:
+            hidden = base_hidden
+
+        if should_analyze and hidden is not None:
+            self.analyze_features_at_key_points("最终融合hidden", hidden.detach(), None)
+
         logits = self.classifier(hidden)
 
         # 返回额外信息用于分析和损失计算
@@ -1008,8 +1347,6 @@ class MultimodalPromptModel(nn.Module):
             'generated_features': generated_features,  # 生成的特征
             'reconstructed_features': reconstructed_features  # 重建的特征
         }
-        # print(missing_type)
-        # print(additional_info['generated_modalities'])
 
         return (logits, additional_info)
         # return logits if not self.training else (logits, additional_info)

@@ -13,7 +13,7 @@ project_structure = {
     ],
     "prompts": ["modality_prompt.py", "quality_prompt.py", "cross_modal_prompt.py"],
     "training": ["train.py", "eval.py", "losses.py", "optimizer.py"],
-    "utils": ["logger.py", "metrics.py", "visualization.py", "helper.py"],
+    "utils": ["logger.py", "my_metrics.py", "visualization.py", "helper.py"],
     "scripts": ["preprocess_data.py", "run_experiment.sh", "inference.py"],
     "results": ["logs/", "checkpoints/", "predictions/"],
 }

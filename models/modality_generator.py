@@ -264,6 +264,7 @@ class CycleGenerationModel(nn.Module):
             # 单样本处理
             missing_type = int(missing_type)
             generated , reconstructed= self._generate_for_sample(features, missing_type)
+
             # reconstructed = self.reconstructor(generated)
             return generated, reconstructed
         else:
