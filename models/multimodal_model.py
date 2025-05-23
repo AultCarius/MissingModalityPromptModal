@@ -10,8 +10,8 @@ from transformers import RobertaModel
 from models.quality_aware_prompting import EnhancedModalityQualityEstimator, \
     QualityAwareFeatureFusion
 
-from .modality_generator import CycleGenerationModel, CrossModalGenerator
-
+# from .modality_generator import CycleGenerationModel, CrossModalGenerator
+from models.improved_modality_generator import CycleGenerationModel
 
 class InterLayerPromptBlock(nn.Module):
     def __init__(self, embed_dim, prompt_len):
@@ -283,6 +283,8 @@ class MultimodalPromptModel(nn.Module):
                 'image': self.image_dim,
                 'text': self.text_dim
             }
+            # self.modality_generator = CycleGenerationModel(modality_dims, fusion_hidden_dim=fusion_dim)
+
             self.modality_generator = CycleGenerationModel(modality_dims, fusion_hidden_dim=fusion_dim)
 
         # 使用增强的质量评估器替换原有评估器
