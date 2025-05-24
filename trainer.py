@@ -1090,10 +1090,7 @@ class Trainer:
                 self.logger.info(
                     f"New best model saved: {self.primary_metric} = {val_metrics[self.primary_metric]:.4f}")
 
-            # ===== Visualize feature distributions =====
-            # Every 5 epochs or on the last epoch, visualize feature distributions
-            if use_adversarial and (epoch % 5 == 0 or epoch == num_epochs - 1):
-                self._visualize_feature_distributions(epoch, all_features)
+
 
         # ===== End of training =====
         self.logger.info(
