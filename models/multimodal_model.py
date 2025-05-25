@@ -347,6 +347,7 @@ class MultimodalPromptModel(nn.Module):
                 for param in module.parameters():
                     param.requires_grad = False
 
+
     def analyze_feature_distributions(self, original_features, generated_features, reconstructed_features, missing_type,
                                       step="before_processing"):
         """
@@ -722,12 +723,14 @@ class MultimodalPromptModel(nn.Module):
                     non_missing_mask = attention_mask[non_missing] if attention_mask is not None else None
 
 
+
                     if self.use_clip_encoders:
                         try:
                             if hasattr(self.text_encoder, 'embeddings'):
                                 non_missing_embeds = self.text_encoder.embeddings(
                                     non_missing_ids
                                 )
+
                             else:
                                 # 回退方案
                                 non_missing_embeds = self.text_embeddings(non_missing_ids)
@@ -785,6 +788,7 @@ class MultimodalPromptModel(nn.Module):
         # 如果模态缺失，则相应的张量应该是零填充的，但仍然存在
         image_is_zeros = (torch.sum(torch.abs(image_embed), dim=(1, 2)) < 1e-6)
         text_is_zeros = (torch.sum(torch.abs(text_embed), dim=(1, 2)) < 1e-6)
+
 
         # 保存原始特征用于重建损失
         original_features = {
@@ -1107,17 +1111,6 @@ class MultimodalPromptModel(nn.Module):
 
         # 计算模态质量（如果启用）
         quality_scores = None
-
-        # # 这里多少有点问题
-        # if self.use_quality_prompt:
-        #     # Update reference statistics when training
-        #     img_cls_feat = temp_img[:, 0]  # [B, D_img]
-        #     txt_cls_feat = temp_txt[:, 0]  # [B, D_txt]
-        #     quality_scores = self.quality_estimator(img_cls_feat, txt_cls_feat, missing_type)
-        #     self.quality_estimator.update_reference_statistics(
-        #         image_embed[:, 0] if image_embed is not None else None,
-        #         text_embed[:, 0] if text_embed is not None else None
-        #     )
 
         # 跨层处理
         for i in range(self.prompt_depth):
