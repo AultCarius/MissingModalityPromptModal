@@ -649,21 +649,33 @@ class Trainer:
 
                     # ===== 对抗训练用于模态生成 =====
 
+                    # ===== 对抗训练用于模态生成 =====
                     if use_adversarial:
                         # Get original features
                         original_features = {}
+
                         if 'original_features' in additional_info:
                             original_features = additional_info['original_features']
 
-                        # Determine when to train generator and discriminator
-                        # Strategy: Train generator every batch, discriminator less frequently
+                        # Enhanced adversarial training schedule
+                        # Train generator every batch, discriminator less frequently based on epoch
                         train_generator = True
-                        train_discriminator = (batch_idx % 3 == 0)  # Every 3rd batch
+
+                        # Dynamically adjust discriminator training frequency based on training progress
+                        if epoch < 10:
+                            # Train discriminator more frequently in early epochs
+                            train_discriminator = (batch_idx % 2 == 0)  # Every 2nd batch
+                        elif epoch < 20:
+                            # Reduce frequency in middle epochs
+                            train_discriminator = (batch_idx % 3 == 0)  # Every 3rd batch
+                        else:
+                            # Further reduce frequency in later epochs
+                            train_discriminator = (batch_idx % 4 == 0)  # Every 4th batch
 
                         # Only perform adversarial training when we have missing modalities
                         has_missing = (missing_type != 0).any()
                         if has_missing and (train_generator or train_discriminator):
-                            # Perform adversarial training step
+                            # Perform adversarial training step with dynamic loss weighting
                             adv_losses, gen_features, recon_features = self.model.modality_generator.train_step(
                                 original_features,
                                 missing_type,
@@ -677,14 +689,16 @@ class Trainer:
                             additional_info['generated_features'] = gen_features
                             additional_info['reconstructed_features'] = recon_features
 
-                            # Track adversarial losses
-                            # 辅助函数：安全地获取损失值（兼容Tensor和float）
+                            # Track adversarial losses with enhanced safety
                             def get_loss_value(loss):
                                 if isinstance(loss, torch.Tensor):
+                                    # Check for valid tensor
+                                    if torch.isnan(loss).any() or torch.isinf(loss).any():
+                                        return 0.0  # Return 0 for invalid values
                                     return loss.item()
-                                return float(loss)  # 确保float类型，处理int或其他数值类型
+                                return float(loss) if loss is not None else 0.0
 
-                            # 简化后的损失累加逻辑
+                            # Track losses with better error handling
                             if train_generator and 'gen_adv_loss' in adv_losses:
                                 adv_loss_sum += get_loss_value(adv_losses['gen_adv_loss'])
 
@@ -700,8 +714,8 @@ class Trainer:
                             if train_discriminator and 'total_disc_loss' in adv_losses:
                                 disc_loss_sum += get_loss_value(adv_losses['total_disc_loss'])
 
-                            # Log to TensorBoard
-                            if self.writer and batch_idx % 50 == 0:
+                            # Log to TensorBoard with improved metrics
+                            if self.writer and batch_idx % 30 == 0:  # Reduced frequency for cleaner logs
                                 global_step = epoch * len(self.train_loader) + batch_idx
 
                                 # Generator losses
@@ -709,15 +723,22 @@ class Trainer:
                                     for loss_name in ['gen_adv_loss', 'cycle_consistency_loss',
                                                       'distribution_loss', 'feature_matching_loss']:
                                         if loss_name in adv_losses:
-                                            self.writer.add_scalar(f"Loss/{loss_name}",
-                                                                   get_loss_value(adv_losses[loss_name]), global_step)
+                                            loss_value = get_loss_value(adv_losses[loss_name])
+                                            self.writer.add_scalar(f"Loss/{loss_name}", loss_value, global_step)
 
                                 # Discriminator losses
                                 if train_discriminator:
                                     if 'total_disc_loss' in adv_losses:
                                         self.writer.add_scalar("Loss/disc_total",
-                                                               get_loss_value(adv_losses['total_disc_loss']), global_step)
+                                                               get_loss_value(adv_losses['total_disc_loss']),
+                                                               global_step)
 
+                                    # Track discriminator accuracy (real vs fake classification)
+                                    if 'disc_accuracy' in adv_losses:
+                                        self.writer.add_scalar("Metrics/disc_accuracy",
+                                                               get_loss_value(adv_losses['disc_accuracy']), global_step)
+
+                                    # Track individual modality discriminator losses
                                     for mod in ['image', 'text']:
                                         loss_name = f'disc_{mod}_loss'
                                         if loss_name in adv_losses:

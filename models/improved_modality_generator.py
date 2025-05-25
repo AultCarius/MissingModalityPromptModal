@@ -355,6 +355,9 @@ class ImprovedModalGenerator(nn.Module):
                 mix_ratio = mix_ratio.unsqueeze(1)
 
             mixed_features = mix_ratio * raw_features + (1 - mix_ratio) * prototypes
+            # Add small random variations to prototypes for diversity
+            prototype_noise = torch.randn_like(prototypes) * 0.05
+            mixed_features = mix_ratio * raw_features + (1 - mix_ratio) * (prototypes + prototype_noise)
 
             # Apply denormalization to match the feature distribution
             return self.denormalize_features(mixed_features, target_modality)
@@ -370,14 +373,23 @@ class ImprovedModalGenerator(nn.Module):
         generator = self.generators[f"{source_modality}_to_{target_modality}"]
         generated = generator(encoded)
 
-        # Add controlled noise for diversity and robustness
+        # Add controlled noise for diversity and robustness - adaptive noise level
         if add_noise:
-            noise_level = 0.03 * (1.0 - math.exp(-self.steps.item() / 1000))  # Gradually reduce noise
-            noise = torch.randn_like(generated) * noise_level
+            # Adaptive noise schedule based on training progress and feature magnitude
+            base_noise_level = 0.05  # Increased base noise level
+            decay_factor = 1000  # Controls noise decay rate with training
+            noise_level = base_noise_level * (1.0 - math.exp(-self.steps.item() / decay_factor))
+
+            # Scale noise by feature magnitude for balanced effect
+            feature_magnitude = generated.abs().mean().item()
+            scaled_noise_level = noise_level * min(1.0, feature_magnitude * 2)
+
+            # Generate noise and apply to features
+            noise = torch.randn_like(generated) * scaled_noise_level
             generated = generated + noise
 
         # Apply feature statistics to match distribution
-        if self.steps.item() > 100:  # Only apply after burn-in period
+        if self.steps.item() > 50:  # Reduced burn-in period
             generated = self.denormalize_features(generated, target_modality)
 
         return generated
@@ -690,8 +702,8 @@ class ImprovedModalGenerator(nn.Module):
         return generated, reconstructed, aux_outputs
 
     def _distribution_matching_loss(self, generated, reference):
-        """Compute a loss to make generated features match reference distribution"""
-        # 1. Mean and variance matching
+        """Compute a loss to make generated features match reference distribution with improved diversity"""
+        # 1. Mean and variance matching - more precise distribution alignment
         gen_mean = generated.mean(dim=0)
         gen_var = generated.var(dim=0)
 
@@ -701,11 +713,25 @@ class ImprovedModalGenerator(nn.Module):
         mean_loss = F.mse_loss(gen_mean, ref_mean)
         var_loss = F.mse_loss(gen_var, ref_var)
 
-        # 2. Add regularization to prevent degenerate solutions
-        diversity_loss = -torch.log(
-            torch.det(torch.cov(generated.T) + torch.eye(generated.size(1), device=generated.device) * 1e-6))
+        # 2. Enhanced diversity regularization to prevent mode collapse
+        # Calculate feature covariance and use log-determinant as a diversity measure
+        # Higher determinant = more diverse/spread out features
+        if generated.size(0) > 1:  # Need at least 2 samples for covariance
+            # Add small identity matrix for numerical stability
+            gen_cov = torch.cov(generated.T) + torch.eye(generated.size(1), device=generated.device) * 1e-6
+            # Maximize log determinant (equivalent to minimizing negative log determinant)
+            diversity_loss = -torch.logdet(gen_cov)
 
-        return mean_loss + 0.5 * var_loss + 0.1 * diversity_loss
+            # Feature correlation penalty - encourages independent features
+            gen_corr = gen_cov / (torch.sqrt(torch.diag(gen_cov).unsqueeze(0)) *
+                                  torch.sqrt(torch.diag(gen_cov).unsqueeze(1)) + 1e-6)
+            correlation_penalty = torch.norm(gen_corr - torch.eye(gen_corr.size(0), device=gen_corr.device), p='fro')
+
+            # Combined loss with balanced weights
+            return mean_loss + 0.5 * var_loss + 0.1 * diversity_loss + 0.05 * correlation_penalty
+        else:
+            # Fallback for single sample
+            return mean_loss + 0.5 * var_loss
 
     def compute_losses(self, real_features, generated_features, aux_outputs, missing_type):
         """
@@ -769,19 +795,23 @@ class ImprovedModalGenerator(nn.Module):
                 # Compute feature matching loss
                 if real_img_feats.size(0) > 0 and gen_img_feats.size(0) > 0:
                     # Compute mean and covariance for real and generated features
-                    real_mean = real_img_feats.mean(dim=0)
-                    real_cov = torch.cov(real_img_feats.T) + torch.eye(real_img_feats.size(1), device=device) * 1e-6
+                    # Normalize features for more stable comparison
+                    real_norm = F.normalize(real_img_feats, p=2, dim=1)
+                    gen_norm = F.normalize(gen_img_feats, p=2, dim=1)
 
-                    gen_mean = gen_img_feats.mean(dim=0)
-                    gen_cov = torch.cov(gen_img_feats.T) + torch.eye(gen_img_feats.size(1), device=device) * 1e-6
+                    real_mean = real_norm.mean(dim=0)
+                    real_cov = torch.cov(real_norm.T) + torch.eye(real_norm.size(1), device=device) * 1e-6
 
-                    # Mean distance
-                    mean_dist = F.mse_loss(gen_mean, real_mean)
+                    gen_mean = gen_norm.mean(dim=0)
+                    gen_cov = torch.cov(gen_norm.T) + torch.eye(gen_norm.size(1), device=device) * 1e-6
 
-                    # Frobenius norm of covariance difference
-                    cov_dist = torch.norm(real_cov - gen_cov, p='fro') / real_img_feats.size(1)
+                    # Mean distance with cosine similarity
+                    mean_dist = 1.0 - F.cosine_similarity(gen_mean.unsqueeze(0), real_mean.unsqueeze(0)).mean()
 
-                    feature_matching_loss += mean_dist + 0.1 * cov_dist
+                    # Covariance difference with Frobenius norm
+                    cov_dist = torch.norm(real_cov - gen_cov, p='fro') / real_norm.size(1)
+
+                    feature_matching_loss += mean_dist + 0.2 * cov_dist
 
         # Similarly for text missing samples
         is_text_missing = (missing_type == 2)
@@ -805,33 +835,37 @@ class ImprovedModalGenerator(nn.Module):
 
                 # Compute feature matching loss
                 if real_txt_feats.size(0) > 0 and gen_txt_feats.size(0) > 0:
+                    # Normalize features for more stable comparison
+                    real_norm = F.normalize(real_txt_feats, p=2, dim=1)
+                    gen_norm = F.normalize(gen_txt_feats, p=2, dim=1)
+
                     # Compute mean and covariance for real and generated features
-                    real_mean = real_txt_feats.mean(dim=0)
-                    real_cov = torch.cov(real_txt_feats.T) + torch.eye(real_txt_feats.size(1), device=device) * 1e-6
+                    real_mean = real_norm.mean(dim=0)
+                    real_cov = torch.cov(real_norm.T) + torch.eye(real_norm.size(1), device=device) * 1e-6
 
-                    gen_mean = gen_txt_feats.mean(dim=0)
-                    gen_cov = torch.cov(gen_txt_feats.T) + torch.eye(gen_txt_feats.size(1), device=device) * 1e-6
+                    gen_mean = gen_norm.mean(dim=0)
+                    gen_cov = torch.cov(gen_norm.T) + torch.eye(gen_norm.size(1), device=device) * 1e-6
 
-                    # Mean distance
-                    mean_dist = F.mse_loss(gen_mean, real_mean)
+                    # Mean distance with cosine similarity
+                    mean_dist = 1.0 - F.cosine_similarity(gen_mean.unsqueeze(0), real_mean.unsqueeze(0)).mean()
 
-                    # Frobenius norm of covariance difference
-                    cov_dist = torch.norm(real_cov - gen_cov, p='fro') / real_txt_feats.size(1)
+                    # Covariance difference with Frobenius norm
+                    cov_dist = torch.norm(real_cov - gen_cov, p='fro') / real_norm.size(1)
 
-                    feature_matching_loss += mean_dist + 0.1 * cov_dist
+                    feature_matching_loss += mean_dist + 0.2 * cov_dist
 
         losses['feature_matching_loss'] = feature_matching_loss
 
         # 3. Combine all losses with weights
         # Weights can be adjusted based on training progress
-        cycle_weight = 10.0
-        adv_weight = 1.0
-        distr_weight = 1.0
-        feat_weight = 5.0
+        cycle_weight = 15.0  # Increased from 10.0
+        adv_weight = 1.5  # Increased from 1.0
+        distr_weight = 2.0  # Increased from 1.0
+        feat_weight = 8.0  # Increased from 5.0
 
-        # Decrease cycle consistency weight over time to focus more on adversarial loss
+        # Adjust cycle consistency weight over time to focus more on adversarial loss
         if self.steps.item() > 1000:
-            cycle_weight = max(1.0, 10.0 * math.exp(-self.steps.item() / 5000))
+            cycle_weight = max(5.0, 15.0 * math.exp(-self.steps.item() / 5000))
 
         total_loss = (
                 adv_weight * gen_adv_loss +
@@ -999,20 +1033,20 @@ class CycleGenerationModel(nn.Module):
     def train_step(self, features, missing_type, generator_optimizer, discriminator_optimizer,
                    train_generator=True, train_discriminator=True):
         """
-        Perform a completely separated training step with adversarial training
+        Perform a complete training step with improved separation of concerns
 
         Args:
             features: Dictionary of real features
-            missing_type: Tensor indicating missing modality type
+            missing_type: Tensor indicating missing modality type for each sample
             generator_optimizer: Optimizer for generator parameters
             discriminator_optimizer: Optimizer for discriminator parameters
-            train_generator: Whether to train generator in this step
-            train_discriminator: Whether to train discriminator in this step
+            train_generator: Whether to train the generator in this step
+            train_discriminator: Whether to train the discriminator in this step
 
         Returns:
-            Dictionary of losses, generated features, reconstructed features
+            Dictionary of losses
         """
-        # Record original feature tensors
+        # Create deep copies to avoid in-place modifications affecting original tensors
         original_features = {}
         for mod, feat in features.items():
             if feat is not None:
@@ -1029,10 +1063,9 @@ class CycleGenerationModel(nn.Module):
 
             # Generate features without gradients to train discriminator
             with torch.no_grad():
-                # Run generator in eval mode to disable dropout, etc.
-                self.generator.eval()
+                self.generator.eval()  # Set to eval mode for stable features
                 gen_features, _, _ = self.generator(original_features, missing_type)
-                self.generator.train()
+                self.generator.train()  # Set back to train mode
 
             # Compute discriminator loss
             disc_losses = self._compute_discriminator_loss(original_features, gen_features, missing_type)
@@ -1040,6 +1073,8 @@ class CycleGenerationModel(nn.Module):
             # Backward and optimize
             if 'total_disc_loss' in disc_losses and disc_losses['total_disc_loss'] > 0:
                 disc_losses['total_disc_loss'].backward()
+                # Apply gradient clipping to stabilize training
+                torch.nn.utils.clip_grad_norm_(self.discriminator_params, 1.0)
                 discriminator_optimizer.step()
 
             # Add to all losses
@@ -1061,6 +1096,8 @@ class CycleGenerationModel(nn.Module):
             # Backward and optimize
             if 'total_gen_loss' in gen_losses and gen_losses['total_gen_loss'] > 0:
                 gen_losses['total_gen_loss'].backward()
+                # Apply gradient clipping to stabilize training
+                torch.nn.utils.clip_grad_norm_(self.generator_params, 1.0)
                 generator_optimizer.step()
 
             # Save generated features for return
@@ -1148,7 +1185,10 @@ class CycleGenerationModel(nn.Module):
 
             # Real loss: max(0, 1 - D(x))
             if real_scores is not None and len(real_scores) > 0:
-                real_loss = torch.nn.functional.relu(1.0 - real_scores).mean()
+                real_loss = F.binary_cross_entropy_with_logits(
+                    real_scores,
+                    torch.ones_like(real_scores)
+                )
                 disc_loss += real_loss
                 losses[f'disc_{mod}_real_loss'] = real_loss.item()
 
@@ -1156,7 +1196,10 @@ class CycleGenerationModel(nn.Module):
             if fake_mask.any():
                 fake_scores_masked = fake_scores[fake_mask]
                 if len(fake_scores_masked) > 0:
-                    fake_loss = torch.nn.functional.relu(1.0 + fake_scores_masked).mean()
+                    fake_loss = F.binary_cross_entropy_with_logits(
+                        fake_scores_masked,
+                        torch.zeros_like(fake_scores_masked)
+                    )
                     disc_loss += fake_loss
                     losses[f'disc_{mod}_fake_loss'] = fake_loss.item()
 
@@ -1207,7 +1250,10 @@ class CycleGenerationModel(nn.Module):
                 continue
 
             # Calculate adversarial loss: -D(G(z))
-            mod_adv_loss = -fake_scores.mean()
+            mod_adv_loss = F.binary_cross_entropy_with_logits(
+                fake_scores,
+                torch.ones_like(fake_scores)
+            )
             adv_loss += mod_adv_loss
             losses[f'gen_{mod}_adv_loss'] = mod_adv_loss.item()
 
