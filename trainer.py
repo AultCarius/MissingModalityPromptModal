@@ -461,48 +461,7 @@ class Trainer:
                         complete_samples = ~(is_image_missing | is_text_missing)  # Both modalities present
                         image_only = ~is_image_missing & is_text_missing  # Only image present (text missing)
                         text_only = is_image_missing & ~is_text_missing  # Only text present (image missing)
-                        # print(complete_samples,complete_samples.sum())
-                        # print(image_only,image_only.sum())
-                        # print(text_only,text_only.sum())
-                        # 1. Process complete samples for direct supervision of generator and reconstructor
-                        if complete_samples.any():
-                            # Get original features for complete samples
-                            complete_img_orig = orig_features['image'][complete_samples]
-                            complete_txt_orig = orig_features['text'][complete_samples]
-                            complete_features = {'image': complete_img_orig, 'text': complete_txt_orig}
-                            # GENERATOR TRAINING:
-
-                            with torch.set_grad_enabled(True):  # Ensure gradients flow
-                                # Generate text from image
-
-
-
-                                img_to_txt = self.model.modality_generator.generator.generate(complete_img_orig, 'image', 'text')
-                                # Generate image from text
-                                txt_to_img = self.model.modality_generator.generator.generate(complete_txt_orig, 'text', 'image')
-
-                                # Calculate generation losses - compare with original (ground truth) features
-                                gen_txt_loss = F.mse_loss(img_to_txt, complete_txt_orig)
-                                gen_img_loss = F.mse_loss(txt_to_img, complete_img_orig)
-
-                                generation_loss += gen_txt_loss
-                                generation_loss += gen_img_loss
-
-                            # RECONSTRUCTOR TRAINING:
-                            # Feed complete features through the reconstructor and compare with originals
-                            complete_features = {'image': complete_img_orig, 'text': complete_txt_orig}
-                            reconstructed_complete = self.model.modality_generator.reconstructor(complete_features)
-
-                            # Calculate reconstruction loss for complete samples
-                            if 'image' in reconstructed_complete and reconstructed_complete['image'] is not None:
-                                img_recon_loss = F.mse_loss(reconstructed_complete['image'], complete_img_orig)
-                                reconstruction_loss += img_recon_loss
-
-                            if 'text' in reconstructed_complete and reconstructed_complete['text'] is not None:
-                                txt_recon_loss = F.mse_loss(reconstructed_complete['text'], complete_txt_orig)
-                                reconstruction_loss += txt_recon_loss
-
-                        # 2. Process samples with only text present (image is missing)
+                        
                         # Here the model needs to generate image from text, then reconstruct text
                         if text_only.any():
                             text_orig = orig_features['text'][text_only]  # Original text features
@@ -548,75 +507,18 @@ class Trainer:
                     # total_batch_loss = classification_loss + recon_weight * reconstruction_loss
                     total_batch_loss = classification_loss + recon_weight * reconstruction_loss + gen_weight * generation_loss
 
-
-                    # ===== 临时: 特征一致性,强调图像的缺失恢复
-                    # 计算特征一致性损失 - 强调图像缺失恢复
-                    feature_consistency_loss = 0.0
-                    if hasattr(self.model, 'compute_feature_consistency_loss'):
-                        if 'original_features' in additional_info and 'reconstructed_features' in additional_info:
-                            consistency_loss = self.model.compute_feature_consistency_loss(
-                                additional_info['original_features'],
-                                additional_info['reconstructed_features']
-                            )
-
-                            # 添加到总损失
-                            total_batch_loss = total_batch_loss + 0.2 * consistency_loss  # 0.2权重避免过度影响
-                            feature_consistency_loss = consistency_loss.item()
-
                     # 记录损失值
                     cls_loss += classification_loss.item()
                     recon_loss += reconstruction_loss if isinstance(reconstruction_loss,
                                                                     torch.Tensor) else reconstruction_loss
                     consistency_loss_sum += feature_consistency_loss  # 新增记录
 
-                    # ===== 临时: 特征一致性,强调图像的缺失恢复
-                    # 计算特征一致性损失 - 强调图像缺失恢复
-                    feature_consistency_loss = 0.0
-                    if hasattr(self.model, 'compute_feature_consistency_loss'):
-                        if 'original_features' in additional_info and 'reconstructed_features' in additional_info:
-                            consistency_loss = self.model.compute_feature_consistency_loss(
-                                additional_info['original_features'],
-                                additional_info['reconstructed_features']
-                            )
-
-                            # 添加到总损失
-                            total_batch_loss = total_batch_loss + 0.2 * consistency_loss  # 0.2权重避免过度影响
-                            feature_consistency_loss = consistency_loss.item()
-
                     # 记录损失值
                     cls_loss += classification_loss.item()
                     recon_loss += reconstruction_loss if isinstance(reconstruction_loss,
                                                                     torch.Tensor) else reconstruction_loss
                     consistency_loss_sum += feature_consistency_loss  # 新增记录
-
-                    # ===== 第3部分：对比损失计算 =====
-                    # 计算原始样本之间的损失有什么用?它怎么能训练模型本身呢,从头到尾就没有下降啊
-                    contrastive_loss_value = 0.0
-                    contrastive_decay = max(0.1,1.0-current_epoch/max_epochs)
-                    contrastive_weight = 0.5 * contrastive_decay  # 对比损失的权重（可调整）
-
-                    # 计算双模态样本之间的对比损失（促进模态间对齐）
-                    both_modalities = (missing_type == 0)  # 找出完整样本
-                    if 'quality_scores' in additional_info and both_modalities.any():
-                        # 获取完整样本的特征
-                        if 'original_features' in additional_info:
-                            orig_img_feat = additional_info['original_features']['image']
-                            orig_txt_feat = additional_info['original_features']['text']
-
-                            if orig_img_feat is not None and orig_txt_feat is not None:
-                                # 提取只有完整样本的特征
-                                img_feat_both = orig_img_feat[both_modalities]
-                                txt_feat_both = orig_txt_feat[both_modalities]
-
-                                if len(img_feat_both) > 1:  # 至少需要2个样本计算对比损失
-                                    # 计算对比损失
-                                    contra_loss = self.modality_contrastive_loss(img_feat_both, txt_feat_both)
-                                    # 添加到总损失
-                                    total_batch_loss = total_batch_loss + contrastive_weight * contra_loss
-                                    # 记录对比损失值
-                                    contrastive_loss_value = contra_loss.item()
-
-                    # ===== 第4部分：质量预测损失计算 =====
+==
                     quality_pred_loss = 0.0
 
                     # 对完整样本计算质量预测损失
@@ -652,36 +554,6 @@ class Trainer:
                         total_batch_loss = total_batch_loss + quality_weight * quality_pred_loss
                         quality_loss_sum += quality_pred_loss.item()
 
-                    # ===== 第5部分：对抗损失计算 =====
-                    adv_loss_value = 0.0
-
-                    # 计算对抗损失（让质量评估器区分真实与生成模态）
-                    if 'quality_scores' in additional_info:
-                        # 获取只有一个模态缺失的样本
-                        only_img_missing = is_image_missing & ~is_text_missing
-                        only_txt_missing = is_text_missing & ~is_image_missing
-
-                        if only_img_missing.any() or only_txt_missing.any():
-                            # 目标：真实特征得高分，生成特征得低分
-                            adv_targets = torch.zeros(self.batch_size, 2, device=self.device)  # [图像真实, 文本真实]
-                            adv_targets[~is_image_missing, 0] = 0.9  # 真实图像 = 0.9
-                            adv_targets[~is_text_missing, 1] = 0.9  # 真实文本 = 0.9
-                            # 对生成的模态使用更适中的目标值(不是0而是0.3)
-                            adv_targets[is_image_missing, 0] = 0.3  # 生成图像不要太低
-                            adv_targets[is_text_missing, 1] = 0.3  # 生成文本不
-                            # 实际质量分数
-                            pred_quality = torch.zeros(self.batch_size, 2, device=self.device)
-                            pred_quality[:, 0] = additional_info['quality_scores']['image']['final_score'].squeeze()
-                            pred_quality[:, 1] = additional_info['quality_scores']['text']['final_score'].squeeze()
-
-                            # 对抗损失（二元交叉熵）
-                            adv_loss = F.binary_cross_entropy(pred_quality, adv_targets)
-
-                            # 添加到总损失
-                            adv_weight = 0.1
-                            total_batch_loss = total_batch_loss + adv_weight * adv_loss
-                            adv_loss_value = adv_loss.item()
-
                     # ===== 收集质量评估数据 =====
                     if additional_info and 'quality_scores' in additional_info:
                         quality_scores = additional_info['quality_scores']
@@ -714,9 +586,6 @@ class Trainer:
                         )
                     total_batch_loss = classification_loss
                     cls_loss += classification_loss.item()
-
-
-
                 # ===== 优化步骤 =====
                 self.optimizer.zero_grad()
                 total_batch_loss.backward()
