@@ -15,6 +15,8 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from transformers import get_linear_schedule_with_warmup
 import torch.nn.functional as F
+
+from models.improved_modality_generator import Discriminator
 from scripts.emailsender import (
     setup_email_config,
     parse_log_file,
@@ -28,7 +30,7 @@ from scipy.special import softmax
 # from sklearn.metrics import f1_score, roc_auc_score, accuracy_score
 from torchmetrics.functional import f1_score, auroc, accuracy
 
-torch.autograd.set_detect_anomaly(True)
+# torch.autograd.set_detect_anomaly(True)
 GENRE_CLASS = [
     'Drama', 'Comedy', 'Romance', 'Thriller', 'Crime', 'Action', 'Adventure',
     'Horror', 'Documentary', 'Mystery', 'Sci-Fi', 'Fantasy', 'Family',
@@ -80,6 +82,39 @@ class Trainer:
         self.batch_size = config.get("batch_size",8)
 
         self.is_single_label = False
+
+        # Initialize loss weights for different components
+        self.loss_weights = {
+            'classification': 1.0,
+            'reconstruction': 0.5,
+            'cycle': 0.3,
+            'contrastive': 0.2,
+            'quality': 0.1
+        }
+
+        # Override with config values if provided
+        if 'loss_weights' in config:
+            for k, v in config.get('loss_weights', {}).items():
+                if k in self.loss_weights:
+                    self.loss_weights[k] = v
+
+        # Setup curriculum learning for generator
+        self.generator_curriculum = {
+            'enabled': True,
+            'initial_weight': 0.1,
+            'final_weight': 1.0,
+            'ramp_epochs': 5
+        }
+
+        # Override with config values if provided
+        if 'generator_curriculum' in config:
+            for k, v in config.get('generator_curriculum', {}).items():
+                if k in self.generator_curriculum:
+                    self.generator_curriculum[k] = v
+
+        self.logger.info(f"Initialized loss weights: {self.loss_weights}")
+        self.logger.info(f"Initialized generator curriculum: {self.generator_curriculum}")
+
 
     def send_training_results_email(self):
         """Send training results and logs via email"""
@@ -386,14 +421,26 @@ class Trainer:
         dataset_type = self.config.get("dataset", "mmimdb")
         self.is_single_label = dataset_type == "food101"
 
-        # 检查是否使用改进的模态生成器进行对抗训练
-        use_adversarial = hasattr(self.model, 'modality_generator') and hasattr(self.model.modality_generator, 'discriminators')
+        # Focal Loss配置
+        focal_start_epoch = self.config.get("focal_start_epoch", 3)
+        use_focal_loss = self.config.get("use_focal_loss", True)
+        focal_alpha = self.config.get("focal_alpha", 0.5)
+        focal_max_gamma = self.config.get("focal_gamma", 2.0)
+        gamma_ramp_epochs = self.config.get("gamma_ramp_epochs", 5)
+        focal_weight = self.config.get("focal_weight", 0.3)
 
-        if use_adversarial:
-            self.logger.info("Using improved modality generator with adversarial training")
-            # Initialize adversarial training components if not already done
-            if not hasattr(self, 'generator_optimizer'):
-                self._setup_adversarial_optimizers()
+        # 非对称损失(ASL)配置
+        use_asymmetric_loss = self.config.get("use_asymmetric_loss", True)
+        asl_start_epoch = self.config.get("asl_start_epoch", 3)
+        asl_gamma_pos = self.config.get("asl_gamma_pos", 0.0)
+        asl_gamma_neg = self.config.get("asl_gamma_neg", 4.0)
+        asl_ramp_epochs = self.config.get("asl_ramp_epochs", 3)
+        asl_clip = self.config.get("asl_clip", 0.05)
+
+        # 重建损失权重配置
+        initial_recon_weight = self.config.get("initial_recon_weight", 0.1)
+        final_recon_weight = self.config.get("final_recon_weight", 0.01)
+
 
         # ===== Begin training loop =====
         for epoch in range(self.start_epoch, num_epochs):
@@ -412,29 +459,24 @@ class Trainer:
             self.model.train()
 
             # ===== 初始化指标跟踪器 =====
-            # Classification metrics
+            # Initialize metrics tracking
             total_loss = 0
             cls_loss_sum = 0
-
-            # Feature generation metrics
-            gen_loss_sum = 0
             recon_loss_sum = 0
-            adv_loss_sum = 0
             cycle_loss_sum = 0
-            distribution_loss_sum = 0
-            feature_matching_loss_sum = 0
-            disc_loss_sum = 0
-
-            # 质量评估器训练指标
+            contra_loss_sum = 0
             quality_loss_sum = 0
-            contrastive_loss_sum = 0
+            distribution_loss_sum =0
 
             # Prediction tracking
             all_preds, all_labels = [], []
 
-            # Quality assessment tracking
+            # Quality assessment and fusion weight statistics
             quality_stats = {'image': [], 'text': [], 'consistency': []}
             fusion_weights_stats = []
+
+            # Modality generation performance statistics
+            gen_stats = {'image': {'mse': [], 'count': 0}, 'text': {'mse': [], 'count': 0}}
 
             # Feature tracking
             all_features = {
@@ -457,8 +499,8 @@ class Trainer:
                 # Track missing modality types
                 is_image_missing = (missing_type == 1) | (missing_type == 3)
                 is_text_missing = (missing_type == 2) | (missing_type == 3)
-                batch_size = image.size(0)
                 no_missing = (~is_image_missing) & (~is_text_missing)
+
                 # ===== Forward pass =====
                 output = self.model(image, input_ids, attention_mask, missing_type)
 
@@ -473,291 +515,352 @@ class Trainer:
                     reconstructed_features = additional_info.get('reconstructed_features', {})
                     quality_scores = additional_info.get('quality_scores', None)
 
-                    # ===== 对比损失训练 =====
-                    contrastive_loss = torch.tensor(0.0, device=self.device)
-
-                    if no_missing.sum() > 1:  # 至少需要2个完整样本
-                        # 获取完整样本的真实特征
-                        if 'image' in original_features and 'text' in original_features:
-                            real_img_feat = original_features['image'][no_missing]
-                            real_txt_feat = original_features['text'][no_missing]
-
-                            # 处理多token特征
-                            if real_img_feat.dim() > 2:
-                                real_img_feat = real_img_feat.mean(dim=1)  # [batch, tokens, dim] -> [batch, dim]
-                            if real_txt_feat.dim() > 2:
-                                real_txt_feat = real_txt_feat.mean(dim=1)
-
-                            # 计算对比损失
-                            contrastive_loss = self.modality_contrastive_loss(
-                                real_img_feat,
-                                real_txt_feat,
-                                temperature=0.2
-                            )
-                            contrastive_loss_sum += contrastive_loss.item()
-
-                    # ===== 特征重建损失 =====
-                    recon_loss = torch.tensor(0.0, device=self.device)
-
-                    # 对不同缺失类型分别处理
-                    if 'original_features' in additional_info and 'reconstructed_features' in additional_info:
-                        orig_features = additional_info['original_features']
-                        recon_features = additional_info['reconstructed_features']
-                        gen_features = additional_info.get('generated_features', {})
-
-                        # 1. 处理完整样本的循环一致性损失
-                        complete_samples = (~is_image_missing) & (~is_text_missing)
-                        if complete_samples.sum() > 0:
-                            # 图像→文本→图像 循环一致性
-                            if 'image' in orig_features and 'image' in recon_features:
-                                orig_img = orig_features['image'][complete_samples]
-                                recon_img = recon_features['image'][complete_samples]
-
-                                # 确保形状匹配
-                                if orig_img is not None and recon_img is not None and orig_img.shape == recon_img.shape:
-                                    img_cycle_loss = F.mse_loss(recon_img, orig_img)
-                                    recon_loss = recon_loss + img_cycle_loss
-
-                            # 文本→图像→文本 循环一致性
-                            if 'text' in orig_features and 'text' in recon_features:
-                                orig_txt = orig_features['text'][complete_samples]
-                                recon_txt = recon_features['text'][complete_samples]
-
-                                # 确保形状匹配
-                                if orig_txt is not None and recon_txt is not None and orig_txt.shape == recon_txt.shape:
-                                    txt_cycle_loss = F.mse_loss(recon_txt, orig_txt)
-                                    recon_loss = recon_loss + txt_cycle_loss
-
-                        # 2. 处理图像缺失样本
-                        img_missing_samples = is_image_missing & (~is_text_missing)
-                        if img_missing_samples.sum() > 0:
-                            # 对于图像缺失样本，验证文本→图像→文本重建的一致性
-                            if 'text' in orig_features and 'text' in recon_features:
-                                orig_txt = orig_features['text'][img_missing_samples]  # 原始文本特征
-                                recon_txt = recon_features['text'][img_missing_samples]  # 重建的文本特征
-
-                                # 确保形状匹配且不为None
-                                if orig_txt is not None and recon_txt is not None and orig_txt.shape == recon_txt.shape:
-                                    txt_recon_loss = F.mse_loss(recon_txt, orig_txt)
-                                    recon_loss = recon_loss + txt_recon_loss
-
-                        # 3. 处理文本缺失样本
-                        txt_missing_samples = (~is_image_missing) & is_text_missing
-                        if txt_missing_samples.sum() > 0:
-                            # 对于文本缺失样本，验证图像→文本→图像重建的一致性
-                            if 'image' in orig_features and 'image' in recon_features:
-                                orig_img = orig_features['image'][txt_missing_samples]  # 原始图像特征
-                                recon_img = recon_features['image'][txt_missing_samples]  # 重建的图像特征
-
-                                # 确保形状匹配且不为None
-                                if orig_img is not None and recon_img is not None and orig_img.shape == recon_img.shape:
-                                    img_recon_loss = F.mse_loss(recon_img, orig_img)
-                                    recon_loss = recon_loss + img_recon_loss
-
-                        # 记录重建损失
-                        recon_loss_sum += recon_loss.item()
-
-                    # ===== 质量评估器训练 =====
-                    quality_loss = torch.tensor(0.0, device=self.device)
-
-                    if quality_scores is not None and 'image' in quality_scores and 'text' in quality_scores:
-                        # 创建基于缺失类型的质量目标
-                        image_quality_target = torch.ones_like(quality_scores['image']['final_score'])
-                        text_quality_target = torch.ones_like(quality_scores['text']['final_score'])
-                        consistency_target = torch.ones_like(quality_scores['cross_consistency'])
-
-                        # 根据缺失类型调整目标质量分数
-                        # 1. 图像缺失样本
-                        img_missing = is_image_missing & (~is_text_missing)
-                        if img_missing.any():
-                            # 图像缺失时：图像质量应低，文本质量应高，一致性适中
-                            image_quality_target[img_missing] = 0.2  # 生成的图像质量低
-                            text_quality_target[img_missing] = 0.9  # 真实文本质量高
-                            consistency_target[img_missing] = 0.5  # 一致性适中
-
-                        # 2. 文本缺失样本
-                        txt_missing = (~is_image_missing) & is_text_missing
-                        if txt_missing.any():
-                            # 文本缺失时：图像质量应高，文本质量应低，一致性适中
-                            image_quality_target[txt_missing] = 0.9  # 真实图像质量高
-                            text_quality_target[txt_missing] = 0.2  # 生成的文本质量低
-                            consistency_target[txt_missing] = 0.5  # 一致性适中
-
-                        # 3. 两个模态都缺失
-                        both_missing = is_image_missing & is_text_missing
-                        if both_missing.any():
-                            # 两个模态都缺失时：两个质量都应低，一致性低
-                            image_quality_target[both_missing] = 0.2
-                            text_quality_target[both_missing] = 0.2
-                            consistency_target[both_missing] = 0.3
-
-                        # 4. 完整样本
-                        complete = (~is_image_missing) & (~is_text_missing)
-                        if complete.any():
-                            # 完整样本：两个质量都应高，一致性高
-                            image_quality_target[complete] = 0.9
-                            text_quality_target[complete] = 0.9
-                            consistency_target[complete] = 0.9
-
-                        # 计算质量评估损失
-                        img_quality_loss = F.mse_loss(
-                            quality_scores['image']['final_score'],
-                            image_quality_target
-                        )
-
-                        txt_quality_loss = F.mse_loss(
-                            quality_scores['text']['final_score'],
-                            text_quality_target
-                        )
-
-                        consistency_loss = F.mse_loss(
-                            quality_scores['cross_consistency'],
-                            consistency_target
-                        )
-
-                        # 组合质量损失
-                        quality_loss = img_quality_loss + txt_quality_loss + consistency_loss
-                        quality_loss_sum += quality_loss.item()
-
-                        # 添加分布一致性约束 - 确保质量分数分布合理
-                        # 这将鼓励质量评估器对相似质量的特征给出相似的分数
-                        if epoch > 5:  # 在训练初期阶段跳过此损失
-                            # 使用相同缺失类型样本的质量分数方差作为正则化项
-                            reg_loss = 0.0
-
-                            # 对每种缺失类型计算质量分数分布约束
-                            for mask in [img_missing, txt_missing, complete, both_missing]:
-                                if mask.sum() > 1:  # 至少需要两个样本
-                                    # 图像质量分数方差
-                                    img_quality_var = torch.var(quality_scores['image']['final_score'][mask])
-                                    # 文本质量分数方差
-                                    txt_quality_var = torch.var(quality_scores['text']['final_score'][mask])
-                                    reg_weight = 0.05 + 0.15 * min(1.0, epoch / 5)  # 随着训练进行逐渐增加权重
-                                    reg_loss += reg_weight * (img_quality_var + txt_quality_var)
-                                    # 加权平均方差 - 鼓励同类样本质量分数一致
-                                    reg_loss += 0.2 * (img_quality_var + txt_quality_var)
-
-                            # 添加到质量损失
-                            quality_loss = quality_loss + reg_loss
-
-                    # ===== 对抗训练用于模态生成 =====
-
-                    # ===== 对抗训练用于模态生成 =====
-                    if use_adversarial:
-                        # Get original features
-                        original_features = {}
-
-                        if 'original_features' in additional_info:
-                            original_features = additional_info['original_features']
-
-                        # Enhanced adversarial training schedule
-                        # Train generator every batch, discriminator less frequently based on epoch
-                        train_generator = True
-
-                        # Dynamically adjust discriminator training frequency based on training progress
-                        if epoch < 10:
-                            # Train discriminator more frequently in early epochs
-                            train_discriminator = (batch_idx % 2 == 0)  # Every 2nd batch
-                        elif epoch < 20:
-                            # Reduce frequency in middle epochs
-                            train_discriminator = (batch_idx % 3 == 0)  # Every 3rd batch
-                        else:
-                            # Further reduce frequency in later epochs
-                            train_discriminator = (batch_idx % 4 == 0)  # Every 4th batch
-
-                        # Only perform adversarial training when we have missing modalities
-                        has_missing = (missing_type != 0).any()
-                        if has_missing and (train_generator or train_discriminator):
-                            # Perform adversarial training step with dynamic loss weighting
-                            adv_losses, gen_features, recon_features = self.model.modality_generator.train_step(
-                                original_features,
-                                missing_type,
-                                self.generator_optimizer,
-                                self.discriminator_optimizer,
-                                train_generator=train_generator,
-                                train_discriminator=train_discriminator
-                            )
-
-                            # Update additional_info with generated features
-                            additional_info['generated_features'] = gen_features
-                            additional_info['reconstructed_features'] = recon_features
-
-                            # Track adversarial losses with enhanced safety
-                            def get_loss_value(loss):
-                                if isinstance(loss, torch.Tensor):
-                                    # Check for valid tensor
-                                    if torch.isnan(loss).any() or torch.isinf(loss).any():
-                                        return 0.0  # Return 0 for invalid values
-                                    return loss.item()
-                                return float(loss) if loss is not None else 0.0
-
-                            # Track losses with better error handling
-                            if train_generator and 'gen_adv_loss' in adv_losses:
-                                adv_loss_sum += get_loss_value(adv_losses['gen_adv_loss'])
-
-                            if 'cycle_consistency_loss' in adv_losses:
-                                cycle_loss_sum += get_loss_value(adv_losses['cycle_consistency_loss'])
-
-                            if 'distribution_loss' in adv_losses:
-                                distribution_loss_sum += get_loss_value(adv_losses['distribution_loss'])
-
-                            if 'feature_matching_loss' in adv_losses:
-                                feature_matching_loss_sum += get_loss_value(adv_losses['feature_matching_loss'])
-
-                            if train_discriminator and 'total_disc_loss' in adv_losses:
-                                disc_loss_sum += get_loss_value(adv_losses['total_disc_loss'])
-
-                            # Log to TensorBoard with improved metrics
-                            if self.writer and batch_idx % 30 == 0:  # Reduced frequency for cleaner logs
-                                global_step = epoch * len(self.train_loader) + batch_idx
-
-                                # Generator losses
-                                if train_generator:
-                                    for loss_name in ['gen_adv_loss', 'cycle_consistency_loss',
-                                                      'distribution_loss', 'feature_matching_loss']:
-                                        if loss_name in adv_losses:
-                                            loss_value = get_loss_value(adv_losses[loss_name])
-                                            self.writer.add_scalar(f"Loss/{loss_name}", loss_value, global_step)
-
-                                # Discriminator losses
-                                if train_discriminator:
-                                    if 'total_disc_loss' in adv_losses:
-                                        self.writer.add_scalar("Loss/disc_total",
-                                                               get_loss_value(adv_losses['total_disc_loss']),
-                                                               global_step)
-
-                                    # Track discriminator accuracy (real vs fake classification)
-                                    if 'disc_accuracy' in adv_losses:
-                                        self.writer.add_scalar("Metrics/disc_accuracy",
-                                                               get_loss_value(adv_losses['disc_accuracy']), global_step)
-
-                                    # Track individual modality discriminator losses
-                                    for mod in ['image', 'text']:
-                                        loss_name = f'disc_{mod}_loss'
-                                        if loss_name in adv_losses:
-                                            self.writer.add_scalar(f"Loss/{loss_name}",
-                                                                   get_loss_value(adv_losses[loss_name]), global_step)
-
-                    # ===== 分类损失 =====
-                    # Calculate classification loss based on dataset type
+                    # ===== 1.分类损失 =====
                     if self.is_single_label:
-                        # Single-label classification - use cross entropy
-                        targets = label.argmax(dim=1)
+                        # Single-label classification - use cross-entropy loss
+                        targets = label.argmax(dim=1)  # Convert to class indices
                         classification_loss = F.cross_entropy(logits, targets)
                     else:
-                        # Multi-label classification - use binary cross entropy
-                        classification_loss = F.binary_cross_entropy_with_logits(
-                            logits, label, pos_weight=self.class_weights
-                        )
+                        # Multi-label classification - can use different loss types
+                        if use_asymmetric_loss and epoch >= asl_start_epoch:
+                            # Asymmetric Loss (ASL) - better for imbalanced multi-label classification
+                            progress = min(1.0, (epoch - asl_start_epoch + 1) / asl_ramp_epochs)
+                            gamma_pos = asl_gamma_pos * progress
+                            gamma_neg = asl_gamma_neg * progress
+                            classification_loss = self.asymmetric_loss_with_logits(
+                                logits, label,
+                                gamma_pos=gamma_pos, gamma_neg=gamma_neg, clip=asl_clip
+                            )
+                        elif use_focal_loss and epoch >= focal_start_epoch:
+                            # Focal Loss - focus on hard examples
+                            progress = min(1.0, (epoch - focal_start_epoch + 1) / gamma_ramp_epochs)
+                            gamma = focal_max_gamma * progress
+                            bce_loss = F.binary_cross_entropy_with_logits(logits, label, pos_weight=self.class_weights)
+                            focal = self.focal_loss(logits, label, alpha=focal_alpha, gamma=gamma)
+                            classification_loss = bce_loss + focal_weight * focal
+                        else:
+                            # Standard binary cross-entropy loss
+                            classification_loss = F.binary_cross_entropy_with_logits(
+                                logits, label, pos_weight=self.class_weights
+                            )
 
-                    # Initialize total batch loss with classification loss
-                    total_batch_loss = classification_loss.clone()
-                    cls_loss_sum += classification_loss.item()
+                        # ===== 2. Reconstruction and Cycle Consistency Losses =====
+                        reconstruction_loss = 0.0
+                        cycle_loss = 0.0
+                        generation_quality_loss = 0.0
+
+                        # Extract information from additional_info
+                        if additional_info:
+                            orig_features = additional_info.get('original_features', {})
+                            gen_features = additional_info.get('generated_features', {})
+                            recon_features = additional_info.get('reconstructed_features', {})
+                            cycle_features = additional_info.get('cycle_features', {})
+
+                            # Create masks for different sample types
+                            both_modalities = ~is_image_missing & ~is_text_missing  # Complete samples
+                            image_only = ~is_image_missing & is_text_missing  # Only image present
+                            text_only = is_image_missing & ~is_text_missing  # Only text present
+                            both_missing = is_image_missing & is_text_missing  # Both modalities missing
+
+                            # Track reconstruction and cycle loss components
+                            recon_components = []
+                            cycle_components = []
+
+                            # === 2.1 Process samples with only text present (image is missing) ===
+                            if text_only.any() and 'text' in orig_features:
+                                text_orig = orig_features['text'][text_only]  # Original text features
+
+                                # Check if we have reconstructed text features
+                                text_recon_key = None
+                                for key in recon_features.keys():
+                                    if key.startswith('text_from_') and 'image' in key:
+                                        text_recon_key = key
+                                        break
+
+                                if text_recon_key and text_recon_key in recon_features:
+                                    # Get text that was reconstructed from generated image
+                                    text_recon = recon_features[text_recon_key]
+                                    if text_only.sum() <= text_recon.size(0):
+                                        text_recon = text_recon[text_only]
+
+                                        # Calculate cycle consistency loss (text -> gen image -> recon text)
+                                        if text_recon.shape == text_orig.shape:
+                                            text_cycle_loss = F.mse_loss(text_recon, text_orig)
+                                            cycle_components.append(text_cycle_loss)
+
+                                            # Log metrics
+                                            cycle_loss_sum += text_cycle_loss.item()
+                                            gen_stats['image']['mse'].append(text_cycle_loss.item())
+                                            gen_stats['image']['count'] += text_only.sum().item()
+
+                            # === 2.2 Process samples with only image present (text is missing) ===
+                            if image_only.any() and 'image' in orig_features:
+                                image_orig = orig_features['image'][image_only]  # Original image features
+
+                                # Check if we have reconstructed image features
+                                image_recon_key = None
+                                for key in recon_features.keys():
+                                    if key.startswith('image_from_') and 'text' in key:
+                                        image_recon_key = key
+                                        break
+
+                                if image_recon_key and image_recon_key in recon_features:
+                                    # Get image that was reconstructed from generated text
+                                    image_recon = recon_features[image_recon_key]
+                                    if image_only.sum() <= image_recon.size(0):
+                                        image_recon = image_recon[image_only]
+
+                                        # Calculate cycle consistency loss (image -> gen text -> recon image)
+                                        if image_recon.shape == image_orig.shape:
+                                            image_cycle_loss = F.mse_loss(image_recon, image_orig)
+                                            cycle_components.append(image_cycle_loss)
+
+                                            # Log metrics
+                                            cycle_loss_sum += image_cycle_loss.item()
+                                            gen_stats['text']['mse'].append(image_cycle_loss.item())
+                                            gen_stats['text']['count'] += image_only.sum().item()
+
+                            # === 2.3 Process complete samples (both modalities present) ===
+                            # For complete samples, we can train the generator with direct reconstruction
+                            if both_modalities.any() and cycle_features:
+                                # Extract original features for complete samples
+                                if 'image' in orig_features and 'text' in orig_features:
+                                    img_orig = orig_features['image'][both_modalities]
+                                    txt_orig = orig_features['text'][both_modalities]
+
+                                    # Check which cycle features we have
+                                    for key, features in cycle_features.items():
+                                        if key == 'text_from_image' and features is not None:
+                                            # Get generated text from image
+                                            txt_from_img = features
+                                            if both_modalities.sum() <= txt_from_img.size(0):
+                                                txt_from_img = txt_from_img[both_modalities]
+
+                                                # Calculate reconstruction loss (how well image->text works)
+                                                if txt_from_img.shape == txt_orig.shape:
+                                                    txt_gen_loss = F.mse_loss(txt_from_img, txt_orig)
+                                                    recon_components.append(txt_gen_loss)
+                                                    recon_loss_sum += txt_gen_loss.item()
+
+                                        elif key == 'image_from_text' and features is not None:
+                                            # Get generated image from text
+                                            img_from_txt = features
+                                            if both_modalities.sum() <= img_from_txt.size(0):
+                                                img_from_txt = img_from_txt[both_modalities]
+
+                                                # Calculate reconstruction loss (how well text->image works)
+                                                if img_from_txt.shape == img_orig.shape:
+                                                    img_gen_loss = F.mse_loss(img_from_txt, img_orig)
+                                                    recon_components.append(img_gen_loss)
+                                                    recon_loss_sum += img_gen_loss.item()
+
+                            # === 2.4 Calculate combined reconstruction and cycle losses ===
+                            if recon_components:
+                                reconstruction_loss = sum(recon_components) / len(recon_components)
+
+                            if cycle_components:
+                                cycle_loss = sum(cycle_components) / len(cycle_components)
+
+                            # ===== 3. Contrastive Loss =====
+                            contrastive_loss = 0.0
+                            contrastive_components = []
+
+                            # Only calculate contrastive loss for complete samples
+                            if both_modalities.any() and cycle_features:
+                                # Original features
+                                img_orig = orig_features['image'][
+                                    both_modalities] if 'image' in orig_features else None
+                                txt_orig = orig_features['text'][
+                                    both_modalities] if 'text' in orig_features else None
+
+                                # Generated features
+                                img_gen = cycle_features.get('image_from_text')
+                                txt_gen = cycle_features.get('text_from_image')
+
+                                if img_orig is not None and txt_orig is not None and img_gen is not None and txt_gen is not None:
+                                    # Prepare features for contrastive loss (flatten multi-token features)
+                                    if img_orig.dim() > 2:
+                                        img_orig = img_orig.mean(dim=1)  # Average over tokens
+                                    if txt_orig.dim() > 2:
+                                        txt_orig = txt_orig.mean(dim=1)
+                                    if img_gen.dim() > 2:
+                                        img_gen = img_gen.mean(dim=1)
+                                    if txt_gen.dim() > 2:
+                                        txt_gen = txt_gen.mean(dim=1)
+
+                                    # Ensure all tensors have the same batch size
+                                    min_batch = min(img_orig.size(0), txt_orig.size(0), img_gen.size(0),
+                                                    txt_gen.size(0))
+                                    img_orig = img_orig[:min_batch]
+                                    txt_orig = txt_orig[:min_batch]
+                                    img_gen = img_gen[:min_batch]
+                                    txt_gen = txt_gen[:min_batch]
+
+                                    # 1. Image-to-Text alignment (original image features should be close to original text)
+                                    img_txt_contra = self.modality_contrastive_loss(img_orig, txt_orig)
+                                    contrastive_components.append(img_txt_contra)
+
+                                    # 2. Original-to-Generated alignment
+                                    img_gen_contra = self.contrastive_loss(img_orig, img_gen)
+                                    txt_gen_contra = self.contrastive_loss(txt_orig, txt_gen)
+                                    contrastive_components.extend([img_gen_contra, txt_gen_contra])
+
+                                    # 3. Generated-to-Generated alignment (cross-modal)
+                                    gen_contra = self.modality_contrastive_loss(img_gen, txt_gen)
+                                    contrastive_components.append(gen_contra)
+
+                            # Calculate average contrastive loss
+                            if contrastive_components:
+                                contrastive_loss = sum(contrastive_components) / len(contrastive_components)
+                                contra_loss_sum += contrastive_loss.item()
+
+                    # ===== 质量评估器训练 =====
+                    # ===== 4. Quality Assessment Loss =====
+                    quality_loss = 0.0
+                    quality_components = []
+
+                    # Calculate quality assessment loss for complete samples
+                    if both_modalities.any() and 'quality_scores' in additional_info:
+                        quality_scores = additional_info['quality_scores']
+
+                        # For complete samples, we expect high quality
+                        target_quality = torch.ones(both_modalities.sum(), 1, device=self.device) * 0.9
+
+                        # Get quality scores for complete samples
+                        img_quality = quality_scores['image']['final_score'][both_modalities]
+                        txt_quality = quality_scores['text']['final_score'][both_modalities]
+                        consistency = quality_scores['cross_consistency'][both_modalities]
+
+                        # Calculate quality prediction loss
+                        img_quality_loss = F.mse_loss(img_quality, target_quality)
+                        txt_quality_loss = F.mse_loss(txt_quality, target_quality)
+                        consistency_loss = F.mse_loss(consistency, target_quality)
+
+                        quality_components.extend([img_quality_loss, txt_quality_loss, consistency_loss])
+
+                        # For missing modality samples, generated features should have lower quality
+                        if text_only.any():
+                            # Image is missing - generated image should have lower quality
+                            gen_img_quality = quality_scores['image']['final_score'][text_only]
+                            target_gen_quality = torch.ones(text_only.sum(), 1, device=self.device) * 0.6
+                            gen_img_quality_loss = F.mse_loss(gen_img_quality, target_gen_quality)
+                            quality_components.append(gen_img_quality_loss)
+
+                        if image_only.any():
+                            # Text is missing - generated text should have lower quality
+                            gen_txt_quality = quality_scores['text']['final_score'][image_only]
+                            target_gen_quality = torch.ones(image_only.sum(), 1, device=self.device) * 0.6
+                            gen_txt_quality_loss = F.mse_loss(gen_txt_quality, target_gen_quality)
+                            quality_components.append(gen_txt_quality_loss)
+
+                    # Calculate average quality loss
+                    if quality_components:
+                        quality_loss = sum(quality_components) / len(quality_components)
+                        quality_loss_sum += quality_loss.item()
+
+                    # ===== 5. Collect Quality Assessment Data =====
+                    if 'quality_scores' in additional_info:
+                        quality_scores = additional_info['quality_scores']
+                        quality_stats['image'].append(quality_scores['image']['final_score'].mean().item())
+                        quality_stats['text'].append(quality_scores['text']['final_score'].mean().item())
+                        quality_stats['consistency'].append(
+                            quality_scores['cross_consistency'].mean().item())
+
+                    # Collect fusion weights data
+                    if 'fusion_weights' in additional_info and additional_info[
+                        'fusion_weights'] is not None:
+                        fusion_weights = additional_info['fusion_weights']
+                        fusion_weights_stats.append(fusion_weights.mean(dim=0).cpu().detach().numpy())
+
+
+                    # quality_loss = torch.tensor(0.0, device=self.device)
+                    #
+                    # if quality_scores is not None and 'image' in quality_scores and 'text' in quality_scores:
+                    #     # 创建基于缺失类型的质量目标
+                    #     image_quality_target = torch.ones_like(quality_scores['image']['final_score'])
+                    #     text_quality_target = torch.ones_like(quality_scores['text']['final_score'])
+                    #     consistency_target = torch.ones_like(quality_scores['cross_consistency'])
+                    #
+                    #     # 根据缺失类型调整目标质量分数
+                    #     # 1. 图像缺失样本
+                    #     img_missing = is_image_missing & (~is_text_missing)
+                    #     if img_missing.any():
+                    #         # 图像缺失时：图像质量应低，文本质量应高，一致性适中
+                    #         image_quality_target[img_missing] = 0.2  # 生成的图像质量低
+                    #         text_quality_target[img_missing] = 0.9  # 真实文本质量高
+                    #         consistency_target[img_missing] = 0.5  # 一致性适中
+                    #
+                    #     # 2. 文本缺失样本
+                    #     txt_missing = (~is_image_missing) & is_text_missing
+                    #     if txt_missing.any():
+                    #         # 文本缺失时：图像质量应高，文本质量应低，一致性适中
+                    #         image_quality_target[txt_missing] = 0.9  # 真实图像质量高
+                    #         text_quality_target[txt_missing] = 0.2  # 生成的文本质量低
+                    #         consistency_target[txt_missing] = 0.5  # 一致性适中
+                    #
+                    #     # 3. 两个模态都缺失
+                    #     both_missing = is_image_missing & is_text_missing
+                    #     if both_missing.any():
+                    #         # 两个模态都缺失时：两个质量都应低，一致性低
+                    #         image_quality_target[both_missing] = 0.2
+                    #         text_quality_target[both_missing] = 0.2
+                    #         consistency_target[both_missing] = 0.3
+                    #
+                    #     # 4. 完整样本
+                    #     complete = (~is_image_missing) & (~is_text_missing)
+                    #     if complete.any():
+                    #         # 完整样本：两个质量都应高，一致性高
+                    #         image_quality_target[complete] = 0.9
+                    #         text_quality_target[complete] = 0.9
+                    #         consistency_target[complete] = 0.9
+                    #
+                    #     # 计算质量评估损失
+                    #     img_quality_loss = F.mse_loss(
+                    #         quality_scores['image']['final_score'],
+                    #         image_quality_target
+                    #     )
+                    #
+                    #     txt_quality_loss = F.mse_loss(
+                    #         quality_scores['text']['final_score'],
+                    #         text_quality_target
+                    #     )
+                    #
+                    #     consistency_loss = F.mse_loss(
+                    #         quality_scores['cross_consistency'],
+                    #         consistency_target
+                    #     )
+                    #
+                    #     # 组合质量损失
+                    #     quality_loss = img_quality_loss + txt_quality_loss + consistency_loss
+                    #     quality_loss_sum += quality_loss.item()
+                    #
+                    #     # 添加分布一致性约束 - 确保质量分数分布合理
+                    #     # 这将鼓励质量评估器对相似质量的特征给出相似的分数
+                    #     if epoch > 5:  # 在训练初期阶段跳过此损失
+                    #         # 使用相同缺失类型样本的质量分数方差作为正则化项
+                    #         reg_loss = 0.0
+                    #
+                    #         # 对每种缺失类型计算质量分数分布约束
+                    #         for mask in [img_missing, txt_missing, complete, both_missing]:
+                    #             if mask.sum() > 1:  # 至少需要两个样本
+                    #                 # 图像质量分数方差
+                    #                 img_quality_var = torch.var(quality_scores['image']['final_score'][mask])
+                    #                 # 文本质量分数方差
+                    #                 txt_quality_var = torch.var(quality_scores['text']['final_score'][mask])
+                    #                 reg_weight = 0.05 + 0.15 * min(1.0, epoch / 5)  # 随着训练进行逐渐增加权重
+                    #                 reg_loss += reg_weight * (img_quality_var + txt_quality_var)
+                    #                 # 加权平均方差 - 鼓励同类样本质量分数一致
+                    #                 reg_loss += 0.2 * (img_quality_var + txt_quality_var)
+                    #
+                    #         # 添加到质量损失
+                    #         quality_loss = quality_loss + reg_loss
+
+
 
                     # ===== Part 3: Feature consistency loss =====
                     # Only apply if not using adversarial training (which already has cycle consistency)
                     # 如果想要额外添加分布损失监督（在不使用对抗训练或作为补充）
-                    if not use_adversarial or self.config.get("add_distribution_supervision", False):
+                    if self.config.get("add_distribution_supervision", False):
                         distribution_loss = torch.tensor(0.0, device=self.device)
 
                         if 'generated_features' in additional_info:
@@ -823,31 +926,56 @@ class Trainer:
                                         # 添加到分布损失
                                         distribution_loss = distribution_loss + mean_loss + 0.5 * var_loss
 
-                            # 添加分布损失到总损失
-                            if distribution_loss > 0:
-                                distribution_loss_weight = 0.5  # 调整权重
-                                total_batch_loss = total_batch_loss + distribution_loss_weight * distribution_loss
-                                distribution_loss_sum += distribution_loss.item()
 
                     # ===== 组合所有损失 =====
-                    # 添加质量评估损失（如果有）
-                    if quality_loss > 0:
-                        # 根据训练进度逐渐增加质量损失权重
-                        quality_weight = min(0.5, 0.1 + 0.4 * (epoch / max(10, num_epochs)))
-                        total_batch_loss = total_batch_loss + quality_weight * quality_loss
+                    # ===== 6. Calculate Total Loss with Weighting =====
+                    # Initialize with classification loss
+                    total_batch_loss = self.loss_weights['classification'] * classification_loss
 
-                    # 添加对比损失（如果有）
-                    if contrastive_loss > 0:
-                        # 对比损失权重
-                        contrastive_weight = 0.2
-                        total_batch_loss = total_batch_loss + contrastive_weight * contrastive_loss
+                    # 添加分布损失到总损失
+                    if 'distribution_loss' in locals() and distribution_loss> 0:
+                        distribution_loss_weight = 0.5  # 调整权重
+                        total_batch_loss = total_batch_loss + distribution_loss_weight * distribution_loss
+                        distribution_loss_sum += distribution_loss.item()
 
-                    # 添加重建损失（如果有）
-                    if recon_loss > 0:
-                        # 重建损失权重随时间降低
-                        recon_weight = max(0.1, 1.0 - 0.9 * (epoch / max(10, num_epochs)))
-                        total_batch_loss = total_batch_loss + recon_weight * recon_loss
+                    # Apply curriculum learning for generator components
+                    if hasattr(self, 'generator_curriculum') and self.generator_curriculum['enabled']:
+                        progress = min(1.0, epoch / self.generator_curriculum['ramp_epochs'])
+                        current_weight = self.generator_curriculum['initial_weight'] + progress * (
+                                self.generator_curriculum['final_weight'] - self.generator_curriculum[
+                            'initial_weight']
+                        )
 
+                        # Apply weight to generator losses
+                        if reconstruction_loss > 0:
+                            total_batch_loss += current_weight * self.loss_weights[
+                                'reconstruction'] * reconstruction_loss
+
+                        if cycle_loss > 0:
+                            total_batch_loss += current_weight * self.loss_weights['cycle'] * cycle_loss
+
+                        if contrastive_loss > 0:
+                            total_batch_loss += current_weight * self.loss_weights[
+                                'contrastive'] * contrastive_loss
+
+                        if quality_loss > 0:
+                            total_batch_loss += current_weight * self.loss_weights['quality'] * quality_loss
+                    else:
+                        # Use fixed weights
+                        if reconstruction_loss > 0:
+                            total_batch_loss += self.loss_weights['reconstruction'] * reconstruction_loss
+
+                        if cycle_loss > 0:
+                            total_batch_loss += self.loss_weights['cycle'] * cycle_loss
+
+                        if contrastive_loss > 0:
+                            total_batch_loss += self.loss_weights['contrastive'] * contrastive_loss
+
+                        if quality_loss > 0:
+                            total_batch_loss += self.loss_weights['quality'] * quality_loss
+
+                    # Track loss components
+                    cls_loss_sum += classification_loss.item()
 
                 else:
                     # Simple case: output is just logits without additional info
@@ -866,21 +994,12 @@ class Trainer:
                     cls_loss_sum += classification_loss.item()
 
                 # ===== Optimization step =====
-                # 只有在不进行对抗训练时才执行优化
-                # 或者需要更新分类头时
-                if not use_adversarial or self.config.get("train_classifier_with_adversarial", True):
-                    self.optimizer.zero_grad()
-                    total_batch_loss.backward()
+                self.optimizer.zero_grad()
+                total_batch_loss.backward()
 
-                    # Optional gradient clipping
-                    if self.config.get("clip_grad_norm", 0) > 0:
-                        torch.nn.utils.clip_grad_norm_(
-                            self.model.parameters(),
-                            self.config.get("clip_grad_norm", 1.0)
-                        )
+                self.optimizer.step()
+                self.scheduler.step()
 
-                    self.optimizer.step()
-                    self.scheduler.step()
 
                 # Track current learning rate
                 current_lr = self.scheduler.get_last_lr()[0]
@@ -891,8 +1010,12 @@ class Trainer:
                 # ===== Update progress bar =====
                 # Prepare display info for progress bar
                 postfix_dict = {
+                    "total": f"{total_batch_loss.item():.4f}",
                     "cls": f"{classification_loss.item():.4f}",
-                    "lr": f"{current_lr:.6f}"
+                    "lr": f"{current_lr:.6f}",
+                    "recon" : f"{reconstruction_loss:.4f}",
+                    "cycle_loss":f"{cycle_loss:.4f}",
+                    "contra":f"{contrastive_loss:.4f}"
                 }
 
                 # 如果有质量损失，添加到显示
@@ -904,13 +1027,6 @@ class Trainer:
                     postfix_dict["cont"] = f"{contrastive_loss.item():.4f}"
 
                 # Add feature generation metrics if available
-                if use_adversarial and 'adv_losses' in locals():
-                    if 'gen_adv_loss' in adv_losses:
-                        postfix_dict["adv"] = f"{get_loss_value(adv_losses['gen_adv_loss']):.4f}"
-                    if 'cycle_consistency_loss' in adv_losses:
-                        postfix_dict["cycle"] = f"{get_loss_value(adv_losses['cycle_consistency_loss']):.4f}"
-                    if 'total_disc_loss' in adv_losses:
-                        postfix_dict["disc"] = f"{get_loss_value(adv_losses['total_disc_loss']):.4f}"
 
                 # Add quality scores if available
                 if additional_info and 'quality_scores' in additional_info:
@@ -1023,13 +1139,9 @@ class Trainer:
             # Additional losses if applicable
 
             avg_quality_loss = quality_loss_sum / num_batches if num_batches > 0 else 0
-            avg_contrastive_loss = contrastive_loss_sum / num_batches if num_batches > 0 else 0
             avg_recon_loss = recon_loss_sum / num_batches if num_batches > 0 else 0
-            avg_adv_loss = adv_loss_sum / num_batches if num_batches > 0 else 0
             avg_cycle_loss = cycle_loss_sum / num_batches if num_batches > 0 else 0
-            avg_disc_loss = disc_loss_sum / num_batches if num_batches > 0 else 0
             avg_distribution_loss = distribution_loss_sum / num_batches if num_batches > 0 else 0
-            avg_feature_matching_loss = feature_matching_loss_sum / num_batches if num_batches > 0 else 0
 
             # ===== Log metrics =====
             # Create metrics string
@@ -1038,9 +1150,8 @@ class Trainer:
             # Log to console
             self.logger.info(
                 f"Epoch {epoch} Train: loss={avg_loss:.4f} | cls={avg_cls_loss:.4f} | "
-                f"recon={avg_recon_loss:.4f} | adv={avg_adv_loss:.4f} | cycle={avg_cycle_loss:.4f} | "
-                f"quality={avg_quality_loss:.4f} | contrastive={avg_contrastive_loss:.4f} | "
-                f"disc={avg_disc_loss:.4f} | {metrics_str}"
+                f"recon={avg_recon_loss:.4f} | cycle={avg_cycle_loss:.4f} | "
+                f"quality={avg_quality_loss:.4f} | {metrics_str}"
             )
 
             # Log to TensorBoard
@@ -1049,11 +1160,8 @@ class Trainer:
                 self.writer.add_scalar("Loss/train_total", avg_loss, epoch)
                 self.writer.add_scalar("Loss/train_cls", avg_cls_loss, epoch)
                 self.writer.add_scalar("Loss/train_recon", avg_recon_loss, epoch)
-                self.writer.add_scalar("Loss/train_adv", avg_adv_loss, epoch)
                 self.writer.add_scalar("Loss/train_cycle", avg_cycle_loss, epoch)
-                self.writer.add_scalar("Loss/train_disc", avg_disc_loss, epoch)
                 self.writer.add_scalar("Loss/train_distribution", avg_distribution_loss, epoch)
-                self.writer.add_scalar("Loss/train_feature_matching", avg_feature_matching_loss, epoch)
 
                 # Training metrics
                 for k, v in train_metrics.items():
@@ -1077,18 +1185,6 @@ class Trainer:
             # ===== Update learning rate schedulers =====
             # Main model scheduler
             self.scheduler.step()
-
-            # Adversarial training schedulers
-            if use_adversarial:
-                if hasattr(self, 'generator_scheduler'):
-                    self.generator_scheduler.step()
-                    current_gen_lr = self.generator_scheduler.get_last_lr()[0]
-                    self.logger.info(f"Generator learning rate: {current_gen_lr:.6f}")
-
-                if hasattr(self, 'discriminator_scheduler'):
-                    self.discriminator_scheduler.step()
-                    current_disc_lr = self.discriminator_scheduler.get_last_lr()[0]
-                    self.logger.info(f"Discriminator learning rate: {current_disc_lr:.6f}")
 
             # ===== Save checkpoints =====
             # Regular epoch checkpoint
