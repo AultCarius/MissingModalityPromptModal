@@ -1,5 +1,6 @@
 # 实验配置
-experiment_name: "mmimdb_test_image_text_std"
+
+experiment_name: "mmimdb_test_TransformerGen"
 
 # Model Configuration
 image_model_name: "openai/clip-vit-base-patch16" #[vit_base_patch16_224,openai/clip-vit-base-patch16]
@@ -60,6 +61,20 @@ test_missing_prob: 0.7
 initial_missing_prob: 0.7
 final_missing_prob: 0.7
 missing_prob_ramp_epochs: 5
+
+# Adversarial Training Configuration
+generator_lr: 0.00015  # Slightly increase (from 0.0001)
+discriminator_lr: 0.0003  # Slightly decrease (from 0.0004)
+generator_weight_decay: 0.00005  # Reduce to prevent overfitting
+discriminator_weight_decay: 0.0002  # Maintain regularization
+min_generator_lr: 0.000005
+min_discriminator_lr: 0.00001
+
+# Loss weights
+adv_loss_weight: 1.5  # Increase to improve generator output quality
+cycle_loss_weight: 15.0  # Increase for better reconstruction (from 10.0)
+distribution_loss_weight: 2.0  # Increase to better match distribution (from 1.0)
+feature_matching_weight: 8.0  # Increase to improve perceptual quality (from 5.0)
 
 # 评估指标设置
 metrics: ["accuracy", "macro_f1", "micro_f1"]

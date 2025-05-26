@@ -10,8 +10,9 @@ from transformers import RobertaModel
 from models.quality_aware_prompting import EnhancedModalityQualityEstimator, \
     QualityAwareFeatureFusion
 
-from .modality_generator import CycleGenerationModel, CrossModalGenerator
-
+# from .modality_generator import CycleGenerationModel, CrossModalGenerator
+# from models.improved_modality_generator import CycleGenerationModel
+from models.improved_modality_generator import ImprovedModalGenerator
 
 class InterLayerPromptBlock(nn.Module):
     def __init__(self, embed_dim, prompt_len):
@@ -283,13 +284,13 @@ class MultimodalPromptModel(nn.Module):
                 'image': self.image_dim,
                 'text': self.text_dim
             }
-            self.modality_generator = CycleGenerationModel(modality_dims, fusion_hidden_dim=fusion_dim)
+            # self.modality_generator = CycleGenerationModel(modality_dims, fusion_hidden_dim=fusion_dim)
+
+            self.modality_generator = ImprovedModalGenerator(modality_dims, fusion_hidden_dim=fusion_dim)
 
         # 使用增强的质量评估器替换原有评估器
         if use_quality_prompt:
             self.quality_estimator = EnhancedModalityQualityEstimator(self.image_dim, self.text_dim)
-
-
 
         # 模态内层间提示
         self.cross_modal_layer = nn.ModuleList([
@@ -780,7 +781,7 @@ class MultimodalPromptModel(nn.Module):
         is_text_missing = (missing_type == 2) | (missing_type == 3)
 
         # 提取原始特征的tokens用于重建损失计算
-        token_count = 5 # 每个模态使用的token数量
+        token_count = 1 # 每个模态使用的token数量
 
         # 修改: 使用零检测代替None检测
         # 如果模态缺失，则相应的张量应该是零填充的，但仍然存在
@@ -839,7 +840,7 @@ class MultimodalPromptModel(nn.Module):
                 }
 
                 # 生成缺失模态
-                sample_gen, sample_recon = self.modality_generator(sample_input, mt)
+                sample_gen, sample_recon , aux_output = self.modality_generator(sample_input, mt)
                 # 返回的是对应缺失模态的生成特征和重建特征
 
                 # 处理生成的图像特征
@@ -986,7 +987,7 @@ class MultimodalPromptModel(nn.Module):
             )
 
         return image_embed, text_embed, attention_mask, original_features, \
-            (generated_features, reconstructed_features) if self.use_modality_generator else (None, None)
+            (generated_features, reconstructed_features,aux_output) if self.use_modality_generator else (None, None)
 
     def forward(self, image=None, input_ids=None, attention_mask=None, missing_type=None):
         """
@@ -1048,7 +1049,7 @@ class MultimodalPromptModel(nn.Module):
         # 提取原始特征用于重建（确保即使模态缺失也有完整特征）
 
         # 处理模态（包括缺失模态的生成）
-        image_embed, text_embed, attention_mask, original_features, (generated_features, reconstructed_features) \
+        image_embed, text_embed, attention_mask, original_features, (generated_features, reconstructed_features,aux_output) \
             = (self._process_modalities
             (
             image_embed, text_embed, attention_mask, missing_type
@@ -1216,16 +1217,11 @@ class MultimodalPromptModel(nn.Module):
             post_norm_txt = text_embed[:, 0].detach()
             self.analyze_features_at_key_points("层归一化后", post_norm_img, post_norm_txt)
 
-
-
-
         # print(image_embed.shape,text_embed.shape)
         # 提取CLS token特征
         image_feat = image_embed[:, 0]  # [B, D_img]
         text_feat = text_embed[:, 0]  # [B, D_txt]
 
-        # image_feat_norm = F.normalize(image_feat, p=2, dim=1)  # L2归一化
-        # text_feat_norm = F.normalize(text_feat, p=2, dim=1)  # L2归一化
         image_feat_norm = F.layer_norm(image_feat, image_feat.shape[1:])
         text_feat_norm = F.layer_norm(text_feat, text_feat.shape[1:])
 
@@ -1273,8 +1269,6 @@ class MultimodalPromptModel(nn.Module):
             self.analyze_features_at_key_points("融合后", quality_guided_feat.detach(), None)
 
 
-
-        # Prepare features for concatenation
         features_to_concat = None
 
         # Add quality scores if enabled
@@ -1312,7 +1306,7 @@ class MultimodalPromptModel(nn.Module):
             # 或方法2: 使用LayerNorm
             base_norm = F.layer_norm(base_hidden, base_hidden.shape[1:])
             quality_norm = F.layer_norm(quality_guided_feat, quality_guided_feat.shape[1:])
-            alpha = 0  # Fixed weight or learnable parameter
+            alpha = 0.2  # Fixed weight or learnable parameter
             if should_analyze:
                 self.analyze_features_at_key_points("再次归一化后.前者为base_norm,后者为qualitu_norm", base_norm.detach(), quality_norm.detach())
 
@@ -1346,6 +1340,7 @@ class MultimodalPromptModel(nn.Module):
             'original_features': original_features,  # 原始特征（用于重建损失）
             'generated_features': generated_features,  # 生成的特征
             'reconstructed_features': reconstructed_features  # 重建的特征
+
         }
 
         return (logits, additional_info)

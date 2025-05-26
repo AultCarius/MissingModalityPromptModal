@@ -938,56 +938,109 @@ class QualityAwareFeatureFusion(nn.Module):
         return output_features, simple_weights
 
 
+class ImprovedQualityAwareFeatureFusion(nn.Module):
+    def __init__(self, image_dim, text_dim, fusion_dim, num_heads=8):
+        super().__init__()
 
-    # def forward(self, image_feat, text_feat, quality_scores=None):
-    #     batch_size = image_feat.size(0)
-    #     device = image_feat.device
-    #     fusion_dim = self.image_proj.out_features  # 获取融合维度
-    #
-    #     # 投影特征到融合空间
-    #     img_proj = self.image_proj(image_feat)  # [B, fusion_dim]
-    #     txt_proj = self.text_proj(text_feat)  # [B, fusion_dim]
-    #
-    #     # 准备堆叠的特征（与原始实现一致）
-    #     features = torch.stack([img_proj, txt_proj], dim=1)  # [B, 2, fusion_dim]
-    #
-    #     # 如果有质量分数，使用它们作为权重
-    #     if quality_scores is not None and 'image' in quality_scores and 'text' in quality_scores:
-    #         if 'final_score' in quality_scores['image'] and 'final_score' in quality_scores['text']:
-    #             img_quality = quality_scores['image']['final_score']  # [B, 1]
-    #             txt_quality = quality_scores['text']['final_score']  # [B, 1]
-    #
-    #             # 归一化权重确保它们的和为1
-    #             total_quality = img_quality + txt_quality + 1e-8  # 添加小值防止除零
-    #             norm_img_quality = img_quality / total_quality
-    #             norm_txt_quality = txt_quality / total_quality
-    #
-    #             # 使用质量分数加权融合
-    #             weighted_img = img_proj * norm_img_quality
-    #             weighted_txt = txt_proj * norm_txt_quality
-    #
-    #             # 创建质量加权的特征，形状与原始多头注意力输出一致
-    #             attn_output = torch.stack([weighted_img, weighted_txt], dim=1)  # [B, 2, fusion_dim]
-    #         else:
-    #             # 无质量分数时的备选方案
-    #             attn_output = features.clone()  # 简单复制
-    #     else:
-    #         # 无质量分数时的备选方案
-    #         attn_output = features.clone()  # 简单复制
-    #         norm_img_quality = torch.ones(batch_size, 1, device=device) * 0.5
-    #         norm_txt_quality = torch.ones(batch_size, 1, device=device) * 0.5
-    #
-    #     # 按照原始实现重塑特征
-    #     features_flat = features.reshape(batch_size, -1)  # [B, 2*fusion_dim]
-    #     attn_output_flat = attn_output.reshape(batch_size, -1)  # [B, 2*fusion_dim]
-    #
-    #     # 连接原始特征和加权特征（与原始实现保持一致的维度）
-    #     concat_features = torch.cat([features_flat, attn_output_flat], dim=1)  # [B, 4*fusion_dim]
-    #
-    #     # 最终投影
-    #     fused_features = self.output_proj(concat_features)
-    #
-    #     # 生成简化的权重返回（与原始实现一致）
-    #     simple_weights = torch.cat([norm_img_quality, norm_txt_quality], dim=1)  # [B, 2]
-    #
-    #     return fused_features, simple_weights
+        # Enhanced projection with more capacity
+        self.image_proj = nn.Sequential(
+            nn.LayerNorm(image_dim),
+            nn.Linear(image_dim, fusion_dim),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(fusion_dim, fusion_dim)
+        )
+
+        self.text_proj = nn.Sequential(
+            nn.LayerNorm(text_dim),
+            nn.Linear(text_dim, fusion_dim),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(fusion_dim, fusion_dim)
+        )
+
+        # Modality-specific attention weights based on quality
+        self.quality_attn = nn.MultiheadAttention(
+            embed_dim=fusion_dim,
+            num_heads=num_heads,
+            batch_first=True
+        )
+
+        # Quality-based gate to control feature importance
+        self.quality_gate = nn.Sequential(
+            nn.Linear(2, fusion_dim),
+            nn.Sigmoid()
+        )
+
+        # Specialized compensation for image-missing cases
+        self.image_compensation = nn.Sequential(
+            nn.Linear(fusion_dim, fusion_dim * 2),
+            nn.LayerNorm(fusion_dim * 2),
+            nn.GELU(),
+            nn.Dropout(0.2),
+            nn.Linear(fusion_dim * 2, fusion_dim)
+        )
+
+        # Output projection
+        self.output_proj = nn.Sequential(
+            nn.Linear(fusion_dim * 2, fusion_dim),
+            nn.LayerNorm(fusion_dim),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(fusion_dim, fusion_dim)
+        )
+
+    def forward(self, image_feat, text_feat, quality_scores=None):
+        # Project features
+        img_proj = self.image_proj(image_feat)
+        txt_proj = self.text_proj(text_feat)
+
+        # Quality-based weights
+        if quality_scores is None:
+            quality_vector = torch.ones(img_proj.size(0), 2, device=img_proj.device) * 0.5
+        else:
+            quality_vector = torch.cat([
+                quality_scores['image']['final_score'],
+                quality_scores['text']['final_score']
+            ], dim=1)
+
+        # Detect image-missing samples based on quality
+        is_image_missing = (quality_vector[:, 0:1] < 0.4).float()
+
+        # Apply quality gating
+        quality_gate_values = self.quality_gate(quality_vector)
+
+        # Stack features for cross-attention
+        stacked_feats = torch.stack([img_proj, txt_proj], dim=1)  # [B, 2, D]
+
+        # Apply quality-weighted attention
+        attn_output, _ = self.quality_attn(
+            query=stacked_feats,
+            key=stacked_feats,
+            value=stacked_feats
+        )
+
+        # Extract modality features
+        img_attn = attn_output[:, 0]
+        txt_attn = attn_output[:, 1]
+
+        # Apply image compensation for image-missing cases
+        # img_compensation = self.image_compensation(txt_attn) * is_image_missing
+        # img_attn = img_attn + img_compensation
+
+        # Combine using quality gates
+        fused_img = img_proj * quality_gate_values
+        fused_txt = txt_proj * quality_gate_values
+
+        # Quality-weighted fusion
+        fused_features = (fused_img + fused_txt) / 2.0
+
+        # Concatenate with attention output for final projection
+        output_features = self.output_proj(
+            torch.cat([fused_features, (img_attn + txt_attn) / 2.0], dim=1)
+        )
+
+        # Return fusion weights for visualization
+        fusion_weights = quality_vector
+
+        return output_features, fusion_weights
