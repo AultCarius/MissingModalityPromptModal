@@ -12,7 +12,8 @@ from models.quality_aware_prompting import EnhancedModalityQualityEstimator, \
 
 # from .modality_generator import CycleGenerationModel, CrossModalGenerator
 # from models.improved_modality_generator import CycleGenerationModel
-from models.improved_modality_generator import ImprovedModalGenerator
+from models.improved_modality_generator import CycleGenerationModel
+from models.modality_generator import EnhancedCycleGenerationModel
 
 class InterLayerPromptBlock(nn.Module):
     def __init__(self, embed_dim, prompt_len):
@@ -286,7 +287,12 @@ class MultimodalPromptModel(nn.Module):
             }
             # self.modality_generator = CycleGenerationModel(modality_dims, fusion_hidden_dim=fusion_dim)
 
-            self.modality_generator = ImprovedModalGenerator(modality_dims, fusion_hidden_dim=fusion_dim)
+            self.modality_generator = EnhancedCycleGenerationModel(
+                modality_dims,
+                fusion_hidden_dim=fusion_dim,
+                num_layers=3,  # Can be configured via a parameter
+                num_heads=4  # Can be configured via a parameter
+            )
 
         # 使用增强的质量评估器替换原有评估器
         if use_quality_prompt:
@@ -327,6 +333,8 @@ class MultimodalPromptModel(nn.Module):
             nn.Dropout(0.1)
         )
         self.classifier = nn.Linear(fusion_dim, num_classes)
+
+        print(len(self.image_blocks),len(self.text_blocks))
 
         # 冻结预训练参数（如果需要）
         if freeze_image_encoder:
@@ -755,51 +763,48 @@ class MultimodalPromptModel(nn.Module):
         return image_embed, text_embed, is_image_missing, is_text_missing
 
     def _process_modalities(self, image_embed, text_embed, attention_mask, missing_type):
-        """处理模态，包括模态缺失的情况，并使用原始特征进行重建"""
+        """处理模态，包括模态缺失的情况，并使用GAN生成缺失的模态特征"""
         batch_size = image_embed.size(0) if image_embed is not None else text_embed.size(0)
         device = next(self.parameters()).device
         missing_type = missing_type.to(device)
-        # Ensure missing_type is the correct shape and on the right device
+
+        # 确保missing_type形状正确并在正确的设备上
         if missing_type is None:
-            # Default to no missing modalities if not specified
+            # 如果未指定，假设所有样本都没有缺失模态
             missing_type = torch.zeros(batch_size, dtype=torch.long, device=device)
         elif isinstance(missing_type, int):
-            # If it's a single integer, expand to batch size
+            # 如果是单个整数，扩展到批次大小
             missing_type = torch.full((batch_size,), missing_type, dtype=torch.long, device=device)
         elif missing_type.size(0) != batch_size:
-            # If batch size doesn't match, this is a critical error
+            # 如果批次大小不匹配，这是一个严重错误
             raise ValueError(
                 f"missing_type batch size ({missing_type.size(0)}) doesn't match data batch size ({batch_size})")
-
-        # Make sure missing_type is on the same device as the model
 
         # 检测缺失的模态
         is_image_missing = (missing_type == 1) | (missing_type == 3)
         is_text_missing = (missing_type == 2) | (missing_type == 3)
 
-        # 提取原始特征的tokens用于重建损失计算
-        token_count = 1 # 每个模态使用的token数量
+        # 提取原始特征的tokens用于重建损失计算和GAN训练
+        # Track which modalities are detected as missing through zero check (for debugging)
+        image_is_zeros = torch.sum(torch.abs(image_embed.view(batch_size, -1)), dim=1) < 1e-6
+        text_is_zeros = torch.sum(torch.abs(text_embed.view(batch_size, -1)), dim=1) < 1e-6
 
-        # 修改: 使用零检测代替None检测
-        # 如果模态缺失，则相应的张量应该是零填充的，但仍然存在
-        image_is_zeros = (torch.sum(torch.abs(image_embed), dim=(1, 2)) < 1e-6)
-        text_is_zeros = (torch.sum(torch.abs(text_embed), dim=(1, 2)) < 1e-6)
+        # Extract token features for reconstruction (first few tokens of each modality)
+        token_count = 1  # Number of tokens to use per modality
 
-        # 保存原始特征用于重建损失
+        # Save original features for reconstruction loss
         original_features = {
             'image': image_embed[:, :token_count].reshape(batch_size, token_count, -1).detach(),
             'text': text_embed[:, :token_count].reshape(batch_size, token_count, -1).detach()
         }
-        # 创建掩码以跟踪哪些特征是真实的（非零）
+
+        # Create masks to track which features are real (non-zero)
         original_features_mask = {
             'image': ~image_is_zeros.unsqueeze(1).expand(-1, token_count),
             'text': ~text_is_zeros.unsqueeze(1).expand(-1, token_count)
         }
 
-        # ADDED: Analyze original features
-        # Only analyze features for 1% of batches to avoid log spam
-        # should_analyze = (torch.rand(1).item() < 0.01)
-        should_analyze = 0
+        should_analyze = (torch.rand(1).item() < 0.01)  # 1% chance to analyze
         if should_analyze:
             self.analyze_feature_distributions(
                 original_features,
@@ -809,103 +814,29 @@ class MultimodalPromptModel(nn.Module):
                 step="before_generation"
             )
 
-        # 处理模态生成
+        # Process modality generation
         generated_features = {'image': None, 'text': None}
         reconstructed_features = {'image': None, 'text': None}
+        cycle_features = None
 
         if self.use_modality_generator:
-            # 准备输入数据 - 使用可见的模态
-            # 这里实际上对于缺失的模态填充的零向量也会获取输入数据了
+            # Prepare input data
             gen_input = {
-                'image': None if image_embed is None else image_embed[:, :token_count].detach(),  # 使用多个token
-                'text': None if text_embed is None else text_embed[:, :token_count].detach()  # 使用多个token
+                'image': None if image_embed is None else image_embed[:, :token_count].detach(),
+                'text': None if text_embed is None else text_embed[:, :token_count].detach()
             }
 
+            # Flag for complete sample training
+            generate_all = self.training and not (is_image_missing.any() or is_text_missing.any())
 
-            # 对每个样本单独处理缺失情况
-            for b in range(batch_size):
-                mt = missing_type[b].item()
+            # Use improved batch processing in the generator
+            generated_features, reconstructed_features, cycle_features = self.modality_generator(
+                gen_input,
+                missing_type,
+                generate_all=generate_all
+            )
 
-                # 根据缺失类型准备单样本输入
-                # 如果对应的缺失,就传None,如果不缺失并且输入也正确存在就用这个
-                sample_input = {
-                    'image': None if mt in [1, 3] else (
-                        None if gen_input['image'] is None else gen_input['image'][b:b + 1]),
-                    'text': None if mt in [2, 3] else (
-                        None if gen_input['text'] is None else gen_input['text'][b:b + 1])
-                }
-
-                # 生成缺失模态
-                sample_gen, sample_recon , aux_output = self.modality_generator(sample_input, mt)
-                # 返回的是对应缺失模态的生成特征和重建特征
-
-                # 处理生成的图像特征
-                if mt in [1, 3] and 'image' in sample_gen and sample_gen['image'] is not None:
-                    if generated_features['image'] is None:
-                        # 创建存储空间，考虑到多个token
-                        # [batch_size, token_count, image_dim]
-                        token_dim = sample_gen['image'].size(-1)
-                        # 检查样本生成shape是 [1, token_count, dim] 还是 [token_count, dim]
-                        if sample_gen['image'].dim() == 3:  # [1, token_count, dim]
-                            tokens_per_sample = sample_gen['image'].size(1)
-                        else:  # [token_count, dim]
-                            tokens_per_sample = sample_gen['image'].size(0) if sample_gen['image'].dim() > 1 else 1
-                        generated_features['image'] = torch.zeros(batch_size, tokens_per_sample, token_dim,
-                                                                  device=device)
-
-                    # 正确处理单个token和多个token的情况
-                    if sample_gen['image'].dim() == 1:  # 单个token [image_dim]
-                        generated_features['image'][b, 0] = sample_gen['image']
-                    elif sample_gen['image'].dim() == 2:  # 多个token [token_count, image_dim]
-                        generated_features['image'][b] = sample_gen['image']
-                    else:  # 带batch维度 [1, token_count, image_dim]
-                        generated_features['image'][b] = sample_gen['image'].squeeze(0)
-
-                # 处理生成的文本特征
-                if mt in [2, 3] and 'text' in sample_gen and sample_gen['text'] is not None:
-                    if generated_features['text'] is None:
-                        # 创建存储空间，考虑到多个token
-                        # [batch_size, token_count, text_dim]
-                        token_dim = sample_gen['text'].size(-1)
-                        # 检查样本生成shape是 [1, token_count, dim] 还是 [token_count, dim]
-                        if sample_gen['text'].dim() == 3:  # [1, token_count, dim]
-                            tokens_per_sample = sample_gen['text'].size(1)
-                        else:  # [token_count, dim]
-                            tokens_per_sample = sample_gen['text'].size(0) if sample_gen['text'].dim() > 1 else 1
-                        generated_features['text'] = torch.zeros(batch_size, tokens_per_sample, token_dim,
-                                                                 device=device)
-
-                    # 正确处理单个token和多个token的情况
-                    if sample_gen['text'].dim() == 1:  # 单个token [text_dim]
-                        generated_features['text'][b, 0] = sample_gen['text']
-                    elif sample_gen['text'].dim() == 2:  # 多个token [token_count, text_dim]
-                        generated_features['text'][b] = sample_gen['text']
-                    else:  # 带batch维度 [1, token_count, text_dim]
-                        generated_features['text'][b] = sample_gen['text'].squeeze(0)
-
-                # 处理重建的特征
-                for mod in sample_recon:
-                    if sample_recon[mod] is not None:
-                        if reconstructed_features[mod] is None:
-                            # 创建存储空间，考虑到多个token
-                            token_dim = sample_recon[mod].size(-1)
-                            # 检查样本重建shape是 [1, token_count, dim] 还是 [token_count, dim]
-                            if sample_recon[mod].dim() == 3:  # [1, token_count, dim]
-                                tokens_per_sample = sample_recon[mod].size(1)
-                            else:  # [token_count, dim]
-                                tokens_per_sample = sample_recon[mod].size(0) if sample_recon[mod].dim() > 1 else 1
-                            reconstructed_features[mod] = torch.zeros(
-                                batch_size, tokens_per_sample, token_dim, device=device)
-
-                        # 正确处理单个token和多个token的情况
-                        if sample_recon[mod].dim() == 1:  # 单个token [dim]
-                            reconstructed_features[mod][b, 0] = sample_recon[mod]
-                        elif sample_recon[mod].dim() == 2:  # 多个token [token_count, dim]
-                            reconstructed_features[mod][b] = sample_recon[mod]
-                        else:  # 带batch维度 [1, token_count, dim]
-                            reconstructed_features[mod][b] = sample_recon[mod].squeeze(0)
-
-        # ADDED: Analyze features after generation
+        # Analyze features after generation
         if should_analyze:
             self.analyze_feature_distributions(
                 original_features,
@@ -915,75 +846,66 @@ class MultimodalPromptModel(nn.Module):
                 step="after_generation"
             )
 
-
-        # # 使用生成的特征替换缺失的模态
-        if is_image_missing.any() and generated_features['image'] is not None:
-
-            # 如果image_embed为None，创建新的
+        # Use generated features to replace missing modalities
+        if is_image_missing.any() and generated_features.get('image') is not None:
+            # If image_embed is None, create a new tensor
             if image_embed is None:
-                patch_count = 196  # 调整为您的实际patch数量
+                patch_count = 196  # Adjust to actual patch count
                 image_embed = torch.zeros(batch_size, 1 + patch_count, self.image_dim, device=device)
 
-            # 将生成的特征复制到适当的token位置
+            # Copy generated features to appropriate positions
             for b in range(batch_size):
-
                 if is_image_missing[b]:
-                    # token_count = min(generated_features['image'].size(1), token_count)
-                    # 将生成的前N个token替换到image_embed中
-                    # print("生成了图像特征替换")
-                    tokens_available = generated_features['image'].size(1)
-                    max_tokens_to_copy = min(tokens_available, image_embed.size(1))
+                    gen_image = generated_features['image']
+                    if gen_image.dim() == 3:  # [batch, tokens, dim]
+                        tokens_available = gen_image.size(1)
+                        max_tokens_to_copy = min(tokens_available, image_embed.size(1))
 
-                    for t in range(max_tokens_to_copy):
-                        if t < image_embed.size(1):  # 确保不超出范围
-                            image_embed[b, t] = generated_features['image'][b, t]
+                        for t in range(max_tokens_to_copy):
+                            if t < image_embed.size(1):
+                                image_embed[b, t] = gen_image[b, t]
+                    else:  # [batch, dim]
+                        image_embed[b, 0] = gen_image[b]
+
         # 使用生成的特征替换缺失的模态
-
-        if is_text_missing.any() and generated_features['text'] is not None:
-            # 如果text_embed为None，创建新的
+        if is_text_missing.any() and generated_features.get('text') is not None:
+            # If text_embed is None, create a new tensor
             if text_embed is None:
-                # 替换硬编码的序列长度77为可配置值
-                seq_len = self.max_length if hasattr(self, 'max_length') else 512  # RoBERTa默认最大长度为512
+                seq_len = 77  # Adjust to actual sequence length
                 text_embed = torch.zeros(batch_size, seq_len, self.text_dim, device=device)
-                # 也需要创建注意力掩码
-                if attention_mask is None:
-                    attention_mask = torch.zeros(batch_size, seq_len, device=device)
-                    attention_mask[:, :token_count] = 1  # 标记前token_count个token为有效
+                attention_mask = torch.zeros(batch_size, seq_len, dtype=torch.long, device=device)
 
-            # 将生成的特征复制到适当的token位置
+            # Copy generated features to appropriate positions
             for b in range(batch_size):
                 if is_text_missing[b]:
-                    # print("生成了文本特征替换")
-                    # token_count = min(generated_features['text'].size(1), token_count)
-                    # 将生成的前N个token替换到text_embed中
-                    tokens_available = generated_features['text'].size(1)
-                    max_tokens_to_copy = min(tokens_available, text_embed.size(1))
+                    gen_text = generated_features['text']
+                    if gen_text.dim() == 3:  # [batch, tokens, dim]
+                        tokens_available = gen_text.size(1)
+                        max_tokens_to_copy = min(tokens_available, text_embed.size(1))
 
-                    for t in range(max_tokens_to_copy):
-                        if t < text_embed.size(1):  # 确保不超出范围
-                            text_embed[b, t] = generated_features['text'][b, t]
-                            # 确保注意力掩码中对应token是有效的
-                            if attention_mask is not None:
-                                attention_mask[b, t] = 1
+                        for t in range(max_tokens_to_copy):
+                            if t < text_embed.size(1):
+                                text_embed[b, t] = gen_text[b, t]
+                                attention_mask[b, t] = 1  # Mark as attended
+                    else:  # [batch, dim]
+                        text_embed[b, 0] = gen_text[b]
+                        attention_mask[b, 0] = 1  # Mark as attended
 
-        # ADDED: Analyze features after replacement
-        if should_analyze:
-            # Create a dictionary of the final combined features
-            final_features = {
-                'image': image_embed[:, :token_count].reshape(batch_size, token_count, -1).detach(),
-                'text': text_embed[:, :token_count].reshape(batch_size, token_count, -1).detach()
-            }
+        # Prepare additional information for loss calculation and debugging
+        additional_info = {
+            'original_features': original_features,
+            'generated_features': generated_features,
+            'reconstructed_features': reconstructed_features,
+            'cycle_features': cycle_features,
+            'missing_type': missing_type,
+            'is_image_missing': is_image_missing,
+            'is_text_missing': is_text_missing,
+            'original_features_mask': original_features_mask,
+            'image_is_zeros': image_is_zeros,
+            'text_is_zeros': text_is_zeros
+        }
 
-            self.analyze_feature_distributions(
-                original_features,
-                generated_features,
-                final_features,  # Use the combined features as "reconstructed"
-                missing_type,
-                step="after_replacement"
-            )
-
-        return image_embed, text_embed, attention_mask, original_features, \
-            (generated_features, reconstructed_features,aux_output) if self.use_modality_generator else (None, None)
+        return image_embed, text_embed, attention_mask, additional_info
 
     def forward(self, image=None, input_ids=None, attention_mask=None, missing_type=None):
         """
@@ -1040,25 +962,34 @@ class MultimodalPromptModel(nn.Module):
             txt_cls = text_embed[:, 0].detach()
             self.analyze_features_at_key_points("原始提取的特征", img_cls, txt_cls)
 
-        original_image_embed = image_embed.clone()
-        original_text_embed = text_embed.clone()
-        # 提取原始特征用于重建（确保即使模态缺失也有完整特征）
+        original_image_embed = image_embed.clone() if image_embed is not None else None
+        original_text_embed = text_embed.clone() if text_embed is not None else None
 
-        # 处理模态（包括缺失模态的生成）
-        image_embed, text_embed, attention_mask, original_features, (generated_features, reconstructed_features,aux_output) \
-            = (self._process_modalities
-            (
+        # Process modalities - this includes generation of missing modalities
+        image_embed, text_embed, attention_mask, additional_info = self._process_modalities(
             image_embed, text_embed, attention_mask, missing_type
-
-        ))
+        )
 
         # 初始化提示
         image_prompt = self.image_init_prompt.expand(batch_size, -1, -1)  # [B, prompt_len, D_img]
         text_prompt = self.text_init_prompt.expand(batch_size, -1, -1)  # [B, prompt_len, D_txt]
 
+        if 'original_full_embeddings' not in additional_info:
+            additional_info['original_full_embeddings'] = {
+                'image': original_image_embed,
+                'text': original_text_embed
+            }
+
         # 获取初步特征用于质量评估
         temp_img = image_embed.clone()
         temp_txt = text_embed.clone()
+
+        # Debug: check embeddings after processing
+        if should_analyze:
+            pre_img_feature = image_embed[:, 0].detach() if image_embed.size(1) > 0 else None
+            pre_text_feature = text_embed[:, 0].detach() if text_embed.size(1) > 0 else None
+            if pre_img_feature is not None and pre_text_feature is not None:
+                self.analyze_features_at_key_points("模态处理后", pre_img_feature, pre_text_feature)
 
         for i in range(2):  # 使用前两层获取初步特征
             # 修改处理CLIP视觉层的部分（在forward方法中）
@@ -1100,9 +1031,10 @@ class MultimodalPromptModel(nn.Module):
 
         # 2. 在应用Transformer层前
         if should_analyze:
-            pre_img_feature = image_embed[:, 0].detach()
-            pre_text_feature = text_embed[:, 0].detach()
-            self.analyze_features_at_key_points("经过Transformer前", pre_img_feature, pre_text_feature)
+            pre_trans_img = image_embed[:, 0].detach() if image_embed.size(1) > 0 else None
+            pre_trans_txt = text_embed[:, 0].detach() if text_embed.size(1) > 0 else None
+            if pre_trans_img is not None and pre_trans_txt is not None:
+                self.analyze_features_at_key_points("Before transformer", pre_trans_img, pre_trans_txt)
 
         # 计算模态质量（如果启用）
         quality_scores = None
@@ -1204,6 +1136,8 @@ class MultimodalPromptModel(nn.Module):
             pre_norm_img = image_embed[:, 0].detach()
             pre_norm_txt = text_embed[:, 0].detach()
             self.analyze_features_at_key_points("层归一化前", pre_norm_img, pre_norm_txt)
+
+
         # 应用最终的层归一化
         image_embed = self.image_norm(image_embed)
         text_embed = self.text_norm(text_embed)
@@ -1258,6 +1192,7 @@ class MultimodalPromptModel(nn.Module):
         quality_guided_feat = None
         if self.use_quality_prompt and self.use_cross_modal_prompt:
             quality_guided_feat, fusion_weights = self.feature_fusion(image_feat, text_feat, quality_scores)
+
 
 
         # 6. 融合后的特征
@@ -1325,22 +1260,17 @@ class MultimodalPromptModel(nn.Module):
 
         logits = self.classifier(hidden)
 
-        # 返回额外信息用于分析和损失计算
-        additional_info = {
+        additional_info.update({
             'quality_scores': quality_scores,
             'fusion_weights': fusion_weights,
             'generated_modalities': {
-                'image': image is None,  # 标记图像是否为生成的
-                'text': input_ids is None  # 标记文本是否为生成的
-            },
-            'original_features': original_features,  # 原始特征（用于重建损失）
-            'generated_features': generated_features,  # 生成的特征
-            'reconstructed_features': reconstructed_features  # 重建的特征
-
-        }
+                'image': is_image_missing,  # Mask indicating which images were generated
+                'text': is_text_missing  # Mask indicating which texts were generated
+            }
+        })
 
         return (logits, additional_info)
-        # return logits if not self.training else (logits, additional_info)
+
 
 
 

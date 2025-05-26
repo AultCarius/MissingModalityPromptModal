@@ -1,6 +1,6 @@
 # 实验配置
 
-experiment_name: "mmimdb_test_GAN_to_make_gen_better"
+experiment_name: "mmimdb_test"
 
 # Model Configuration
 image_model_name: "openai/clip-vit-base-patch16" #[vit_base_patch16_224,openai/clip-vit-base-patch16]
@@ -45,6 +45,7 @@ asl_gamma_neg: 4.0
 asl_ramp_epochs: 3
 asl_clip: 0.05
 
+add_distribution_supervision: True
 
 # Data Configuration
 dataset: "mmimdb"
