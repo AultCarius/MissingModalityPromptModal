@@ -346,6 +346,7 @@ class MultimodalPromptModel(nn.Module):
                 for param in module.parameters():
                     param.requires_grad = False
 
+
     def analyze_feature_distributions(self, original_features, generated_features, reconstructed_features, missing_type,
                                       step="before_processing"):
         """
@@ -721,12 +722,14 @@ class MultimodalPromptModel(nn.Module):
                     non_missing_mask = attention_mask[non_missing] if attention_mask is not None else None
 
 
+
                     if self.use_clip_encoders:
                         try:
                             if hasattr(self.text_encoder, 'embeddings'):
                                 non_missing_embeds = self.text_encoder.embeddings(
                                     non_missing_ids
                                 )
+
                             else:
                                 # 回退方案
                                 non_missing_embeds = self.text_embeddings(non_missing_ids)
@@ -784,6 +787,7 @@ class MultimodalPromptModel(nn.Module):
         # 如果模态缺失，则相应的张量应该是零填充的，但仍然存在
         image_is_zeros = (torch.sum(torch.abs(image_embed), dim=(1, 2)) < 1e-6)
         text_is_zeros = (torch.sum(torch.abs(text_embed), dim=(1, 2)) < 1e-6)
+
 
         # 保存原始特征用于重建损失
         original_features = {

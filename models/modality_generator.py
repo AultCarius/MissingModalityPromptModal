@@ -49,31 +49,19 @@ class CrossModalGenerator(nn.Module):
         for source_mod in self.modalities:
             for target_mod in self.modalities:
                 if source_mod != target_mod:
-                    if source_mod == 'text' and target_mod == 'image':
-                        # 增强的文本→图像生成器
-                        self.generators[f"{source_mod}_to_{target_mod}"] = nn.Sequential(
-                            nn.Linear(fusion_hidden_dim, fusion_hidden_dim * 2),
-                            nn.LayerNorm(fusion_hidden_dim * 2),
-                            nn.GELU(),
-                            nn.Dropout(0.1),
-                            # 添加更多层和残差连接提高表达能力
-                            ResidualBlock(fusion_hidden_dim * 2),
-                            ResidualBlock(fusion_hidden_dim * 2),
-                            nn.Linear(fusion_hidden_dim * 2, fusion_hidden_dim),
-                            nn.LayerNorm(fusion_hidden_dim),
-                            nn.GELU(),
-                            nn.Linear(fusion_hidden_dim, modality_dims[target_mod]),
-                            nn.Tanh()  # 稳定输出
-                        )
-                    else:
-                        # 其他路径保持原样
-                        self.generators[f"{source_mod}_to_{target_mod}"] = nn.Sequential(
-                            nn.Linear(fusion_hidden_dim, fusion_hidden_dim),
-                            nn.LayerNorm(fusion_hidden_dim),
-                            nn.GELU(),
-                            nn.Linear(fusion_hidden_dim, modality_dims[target_mod]),
-                            nn.Tanh()
-                        )
+                    self.generators[f"{source_mod}_to_{target_mod}"] = nn.Sequential(
+                        nn.Linear(fusion_hidden_dim, fusion_hidden_dim * 2),
+                        nn.LayerNorm(fusion_hidden_dim * 2),
+                        nn.GELU(),
+                        nn.Dropout(0.1),
+                        ResidualBlock(fusion_hidden_dim * 2),
+                        ResidualBlock(fusion_hidden_dim * 2),
+                        nn.Linear(fusion_hidden_dim * 2, fusion_hidden_dim),
+                        nn.LayerNorm(fusion_hidden_dim),
+                        nn.GELU(),
+                        nn.Linear(fusion_hidden_dim, modality_dims[target_mod]),
+                        nn.Tanh()  # TODO:这个应该换掉，因为导致了生成和真实的分布不匹配
+                    )
 
         # 对于"both"情况（双模态缺失）需要的先验生成器
         self.prior_generators = nn.ModuleDict({
@@ -85,13 +73,9 @@ class CrossModalGenerator(nn.Module):
                 nn.LayerNorm(fusion_hidden_dim),
                 nn.GELU(),
                 nn.Linear(fusion_hidden_dim, dim),
-                nn.Tanh()
+                nn.Tanh() # TODO:这个应该换掉，因为导致了生成和真实的分布不匹配
             ) for mod_name, dim in modality_dims.items()
         })
-
-    # 添加辅助方法用于创建残差块
-    # 在modality_generator.py中添加这个类
-
 
     def encode(self, features, modality):
         """将特定模态的特征编码到共享空间"""
@@ -190,12 +174,12 @@ class ModReconstructor(nn.Module):
 
     def __init__(self, modality_dims):
         """
-        初始化模态重建器
 
         Args:
             modality_dims: 字典，键为模态名称，值为该模态的特征维度
         """
         super().__init__()
+        # TODO: 应该加强一下重建器
         self.decoders = nn.ModuleDict({
             mod_name: nn.Sequential(
                 nn.Linear(dim, dim),
@@ -215,6 +199,11 @@ class ModReconstructor(nn.Module):
         """重建各模态特征"""
         if not isinstance(features, dict):
             raise ValueError(f"ModReconstructor expects input features as a dict, got {type(features)}")
+        # TODO：应修改重建的逻辑。
+        # 对于完整样本，都重建来训练重建器
+        # 对于图像缺失样本，已有根据原始文本特征生成的生成图片特征。文本->图像->文本。由生成图片特征重建文本特征并与原始文本特征计算损失来训练生成器和重建器
+        # 对于文本缺失样本，已有根据原始图像特征生成的生成文本特征。图像->文本->图像。
+        
 
         outputs = {}
         for mod, feat in features.items():
@@ -333,6 +322,8 @@ class CycleGenerationModel(nn.Module):
                     generated[mod] = features[mod].clone()
             else:
                 generated[mod] = None
+
+        # TODO:这里应该添加方法，对于不缺失的情况都生成用于训练生成器和重建
 
         # 根据缺失类型生成特征
         if missing_type == 1:  # 图像缺失

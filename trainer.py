@@ -502,6 +502,7 @@ class Trainer:
                     # 对不同缺失类型分别处理
                     if 'original_features' in additional_info and 'reconstructed_features' in additional_info:
                         orig_features = additional_info['original_features']
+
                         recon_features = additional_info['reconstructed_features']
                         gen_features = additional_info.get('generated_features', {})
 
@@ -678,6 +679,7 @@ class Trainer:
                                 train_discriminator=train_discriminator
                             )
 
+
                             # Update additional_info with generated features
                             additional_info['generated_features'] = gen_features
                             additional_info['reconstructed_features'] = recon_features
@@ -849,6 +851,7 @@ class Trainer:
                         total_batch_loss = total_batch_loss + recon_weight * recon_loss
 
 
+
                 else:
                     # Simple case: output is just logits without additional info
                     logits = output
@@ -934,8 +937,9 @@ class Trainer:
                     preds = torch.zeros_like(logits)
                     preds.scatter_(1, pred_indices.unsqueeze(1), 1.0)
                 else:
-                    # Multi-label - apply threshold
+
                     preds = (logits > 0.5).float()  # Simple threshold at 0
+
 
                 # Collect for later metric calculation
                 all_preds.append(preds.cpu().detach())
@@ -1940,6 +1944,7 @@ class Trainer:
 
         return results
 
+
         # """计算多种评估指标"""
         # results = {}
         #
@@ -2009,6 +2014,7 @@ class Trainer:
         #
         # return results
 
+
     # 在test或evaluate函数中添加以下代码
     def examine_logits(self, logits, missing_type, labels=None, prefix=""):
         """
@@ -2057,6 +2063,7 @@ class Trainer:
                              f"max={stats['max']:.4f}, positive%={stats['positive%']:.2f}%")
 
             # 每个类别的详细统计
+
             if mt_name in ['image', 'none', 'text']:
                 self.logger.info(f"    Per-class logits for {mt_name}:")
 
@@ -2159,7 +2166,7 @@ class Trainer:
                     preds.scatter_(1, pred_indices.unsqueeze(1), 1.0)
                 else:
                     # 多标签分类 - 使用阈值
-                    preds = (logits > 0.5).float()
+                    preds = (logits > -0.2).float()
 
                 # 收集总体预测和标签
                 all_preds.append(preds.cpu())
@@ -2868,7 +2875,7 @@ class Trainer:
                     preds.scatter_(1, pred_indices.unsqueeze(1), 1.0)
                 else:
                     # Multi-label classification (MMIMDB) - use threshold
-                    preds = (logits > 0.5).float()
+                    preds = (logits > -0.2).float()
 
                 # Collect overall predictions and labels
                 all_preds.append(preds.cpu())
