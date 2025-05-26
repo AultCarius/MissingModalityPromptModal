@@ -545,7 +545,7 @@ class ImprovedModalGenerator(nn.Module):
 
     def _generate_for_sample(self, features, missing_type):
         """Generate features for a single sample based on missing type"""
-        token_count = 5  # Number of tokens to use
+        token_count = 1  # Number of tokens to use
         device = next(self.parameters()).device
 
         # Prepare features and handle multi-token case
@@ -589,49 +589,20 @@ class ImprovedModalGenerator(nn.Module):
                 text_feat = processed_features["text"]
                 generated["image"] = self.generate(text_feat, "text", "image")
 
-                # Run discriminator on generated image if in training mode
-                if self.training:
-                    # Detach first to avoid backprop through generator for disc loss
-                    gen_img = generated["image"].detach()
-                    gen_img_flat = gen_img.reshape(-1, gen_img.size(-1))
-                    fake_img_score = self.discriminators["image"](gen_img_flat)
-                    aux_outputs['disc_fake_scores']["image"] = fake_img_score
 
         elif missing_type == 2:  # Text missing, image present
             if processed_features.get("image") is not None:
                 image_feat = processed_features["image"]
                 generated["text"] = self.generate(image_feat, "image", "text")
 
-                # Run discriminator on generated text if in training mode
-                if self.training:
-                    # Detach first to avoid backprop through generator for disc loss
-                    gen_txt = generated["text"].detach()
-                    gen_txt_flat = gen_txt.reshape(-1, gen_txt.size(-1))
-                    fake_txt_score = self.discriminators["text"](gen_txt_flat)
-                    aux_outputs['disc_fake_scores']["text"] = fake_txt_score
 
         elif missing_type == 3:  # Both missing
             # Generate both modalities from noise
             noise = torch.randn(1, 256, device=device)
             generated["image"] = self.generate(None, None, "image")
-
             # Use the generated image to create matching text
             generated["text"] = self.generate(generated["image"], "image", "text")
 
-            # Run discriminators if in training mode
-            if self.training:
-                # Detach to avoid backprop through generator for disc loss
-                gen_img = generated["image"].detach()
-                gen_txt = generated["text"].detach()
-
-                img_flat = gen_img.reshape(-1, gen_img.size(-1))
-                txt_flat = gen_txt.reshape(-1, gen_txt.size(-1))
-
-                fake_img_score = self.discriminators["image"](img_flat)
-                fake_txt_score = self.discriminators["text"](txt_flat)
-
-                aux_outputs['disc_fake_scores']["image"] = fake_img_score
-                aux_outputs['disc_fake_scores']["text"] = fake_txt_score
 
         # Run discriminators on real features if available
         if self.training:
@@ -650,15 +621,10 @@ class ImprovedModalGenerator(nn.Module):
             # Image → Text → Image
             img2txt = self.generate(processed_features["image"], "image", "text", add_noise=False)
             txt2img = self.generate(img2txt, "text", "image", add_noise=False)
-            img_cycle_loss = F.mse_loss(txt2img, processed_features["image"])
 
             # Text → Image → Text
             txt2img = self.generate(processed_features["text"], "text", "image", add_noise=False)
             img2txt = self.generate(txt2img, "image", "text", add_noise=False)
-            txt_cycle_loss = F.mse_loss(img2txt, processed_features["text"])
-
-            cycle_loss = img_cycle_loss + txt_cycle_loss
-            aux_outputs['cycle_consistency_loss'] = cycle_loss
 
             reconstructed["image"] = txt2img
             reconstructed["text"] = img2txt
@@ -666,15 +632,11 @@ class ImprovedModalGenerator(nn.Module):
         elif missing_type == 1:  # Image missing - reconstruct text
             if generated["image"] is not None and processed_features["text"] is not None:
                 img2txt = self.generate(generated["image"], "image", "text", add_noise=False)
-                txt_recon_loss = F.mse_loss(img2txt, processed_features["text"])
-                aux_outputs['cycle_consistency_loss'] = txt_recon_loss
                 reconstructed["text"] = img2txt
 
         elif missing_type == 2:  # Text missing - reconstruct image
             if generated["text"] is not None and processed_features["image"] is not None:
                 txt2img = self.generate(generated["text"], "text", "image", add_noise=False)
-                img_recon_loss = F.mse_loss(txt2img, processed_features["image"])
-                aux_outputs['cycle_consistency_loss'] = img_recon_loss
                 reconstructed["image"] = txt2img
 
         # Compute distribution matching loss if training
@@ -687,7 +649,7 @@ class ImprovedModalGenerator(nn.Module):
                 # Get statistics - use prototypes as reference
                 ref_img = self.image_prototypes.mean(dim=0, keepdim=True)
                 img_dist_loss = self._distribution_matching_loss(gen_img, ref_img)
-                dist_loss += img_dist_loss
+                dist_loss = dist_loss + img_dist_loss
 
             # Check if we have generated text features
             if generated["text"] is not None and processed_features.get("text") is None:
@@ -695,7 +657,7 @@ class ImprovedModalGenerator(nn.Module):
                 # Get statistics - use prototypes as reference
                 ref_txt = self.text_prototypes.mean(dim=0, keepdim=True)
                 txt_dist_loss = self._distribution_matching_loss(gen_txt, ref_txt)
-                dist_loss += txt_dist_loss
+                dist_loss =dist_loss + txt_dist_loss
 
             aux_outputs['distribution_loss'] = dist_loss
 
@@ -733,7 +695,7 @@ class ImprovedModalGenerator(nn.Module):
             # Fallback for single sample
             return mean_loss + 0.5 * var_loss
 
-    def compute_losses(self, real_features, generated_features, aux_outputs, missing_type):
+    def compute_generator_losses(self, real_features, generated_features, aux_outputs, missing_type):
         """
         Compute all losses for generator training
 
@@ -877,244 +839,7 @@ class ImprovedModalGenerator(nn.Module):
         losses['total_loss'] = total_loss
         return losses
 
-    def compute_discriminator_loss(self, aux_outputs):
-        """
-        Compute discriminator loss
-
-        Args:
-            aux_outputs: Auxiliary outputs from forward pass
-
-        Returns:
-            Dictionary of discriminator losses
-        """
-        disc_losses = {}
-        total_disc_loss = 0.0
-
-        for mod in self.modalities:
-            # Skip modalities without discriminator scores
-            if (mod not in aux_outputs['disc_real_scores'] or aux_outputs['disc_real_scores'][mod] is None or
-                    mod not in aux_outputs['disc_fake_scores'] or aux_outputs['disc_fake_scores'][mod] is None):
-                continue
-
-            # Get scores
-            real_scores = aux_outputs['disc_real_scores'][mod]
-            fake_scores = aux_outputs['disc_fake_scores'][mod]
-
-            # Compute hinge loss
-            real_loss = torch.relu(1.0 - real_scores).mean()
-            fake_loss = torch.relu(1.0 + fake_scores).mean()
-
-            disc_loss = real_loss + fake_loss
-            disc_losses[f'disc_{mod}_loss'] = disc_loss
-            total_disc_loss += disc_loss
-
-        disc_losses['total_disc_loss'] = total_disc_loss
-        return disc_losses
-
-    def train_step(self, real_features, missing_type, generator_optimizer, discriminator_optimizer,
-                   train_generator=True, train_discriminator=True):
-        """
-        Perform a complete training step
-
-        Args:
-            real_features: Dictionary of real features
-            missing_type: Tensor indicating missing modality type for each sample
-            generator_optimizer: Optimizer for generator parameters
-            discriminator_optimizer: Optimizer for discriminator parameters
-            train_generator: Whether to train the generator in this step
-            train_discriminator: Whether to train the discriminator in this step
-
-        Returns:
-            Dictionary of losses
-        """
-        # Zero gradients
-        if train_generator:
-            generator_optimizer.zero_grad()
-        if train_discriminator:
-            discriminator_optimizer.zero_grad()
-
-        # Forward pass - detach real_features to avoid in-place modifications affecting original tensors
-        detached_real_features = {}
-        for mod in real_features:
-            if real_features[mod] is not None:
-                detached_real_features[mod] = real_features[mod].clone()
-            else:
-                detached_real_features[mod] = None
-
-        # Run forward pass with detached inputs
-        generated_features, reconstructed_features, aux_outputs = self(detached_real_features, missing_type)
-
-        # Create separate dictionaries for losses to avoid in-place modifications
-        disc_losses = {}
-        gen_losses = {}
-
-        # Train discriminator
-        if train_discriminator:
-            disc_losses = self.compute_discriminator_loss(aux_outputs)
-            if 'total_disc_loss' in disc_losses:
-                # Use clone to avoid in-place operations
-                loss_to_backward = disc_losses['total_disc_loss'].clone()
-                loss_to_backward.backward(retain_graph=train_generator)
-                discriminator_optimizer.step()
-
-        # Train generator
-        if train_generator:
-            gen_losses = self.compute_losses(detached_real_features, generated_features, aux_outputs, missing_type)
-            if 'total_loss' in gen_losses:
-                # Use clone to avoid in-place operations
-                loss_to_backward = gen_losses['total_loss'].clone()
-                loss_to_backward.backward()
-                generator_optimizer.step()
-
-        # Combine all losses
-        all_losses = {}
-        all_losses.update(disc_losses)
-        all_losses.update(gen_losses)
-
-        return all_losses, generated_features, reconstructed_features
-
-
-# This provides a complete fix for the in-place modification issue
-# This is a comprehensive replacement for the CycleGenerationModel class
-
-class CycleGenerationModel(nn.Module):
-    """Enhanced cycle generation model with improved architecture and adversarial training"""
-
-    def __init__(self, modality_dims, fusion_hidden_dim=512):
-        super().__init__()
-        self.modality_dims = modality_dims
-        self.generator = ImprovedModalGenerator(modality_dims, fusion_hidden_dim)
-
-        # Track separate parameters for generator and discriminator
-        generator_params = []
-        discriminator_params = []
-
-        for name, param in self.generator.named_parameters():
-            if 'discriminator' in name:
-                discriminator_params.append(param)
-            else:
-                generator_params.append(param)
-
-        self.generator_params = generator_params
-        self.discriminator_params = discriminator_params
-
-    def forward(self, features, missing_type):
-        """
-        Forward pass for feature generation and reconstruction
-
-        Args:
-            features: Dictionary of modality features
-            missing_type: Missing modality type indicator
-
-        Returns:
-            Tuple of (generated_features, reconstructed_features)
-        """
-        # Disable adversarial components during inference
-        self.generator.eval()
-
-        # Create copies of features to avoid in-place modifications
-        features_copy = {}
-        for mod, feat in features.items():
-            if feat is not None:
-                features_copy[mod] = feat.clone().detach()
-            else:
-                features_copy[mod] = None
-
-        # Forward pass without computing adversarial loss
-        with torch.no_grad():
-            generated, reconstructed, _ = self.generator(features_copy, missing_type)
-
-        # Re-enable training mode if needed
-        if self.training:
-            self.generator.train()
-
-        return generated, reconstructed
-
-    def train_step(self, features, missing_type, generator_optimizer, discriminator_optimizer,
-                   train_generator=True, train_discriminator=True):
-        """
-        Perform a complete training step with improved separation of concerns
-
-        Args:
-            features: Dictionary of real features
-            missing_type: Tensor indicating missing modality type for each sample
-            generator_optimizer: Optimizer for generator parameters
-            discriminator_optimizer: Optimizer for discriminator parameters
-            train_generator: Whether to train the generator in this step
-            train_discriminator: Whether to train the discriminator in this step
-
-        Returns:
-            Dictionary of losses
-        """
-        # Create deep copies to avoid in-place modifications affecting original tensors
-        original_features = {}
-        for mod, feat in features.items():
-            if feat is not None:
-                original_features[mod] = feat.clone().detach()  # Detach to break gradient flow
-            else:
-                original_features[mod] = None
-
-        # Dictionary to store all losses
-        all_losses = {}
-
-        # ===== DISCRIMINATOR TRAINING =====
-        if train_discriminator:
-            discriminator_optimizer.zero_grad()
-
-            # Generate features without gradients to train discriminator
-            with torch.no_grad():
-                self.generator.eval()  # Set to eval mode for stable features
-                gen_features, _, _ = self.generator(original_features, missing_type)
-                self.generator.train()  # Set back to train mode
-
-            # Compute discriminator loss
-            disc_losses = self._compute_discriminator_loss(original_features, gen_features, missing_type)
-
-            # Backward and optimize
-            if 'total_disc_loss' in disc_losses and disc_losses['total_disc_loss'] > 0:
-                disc_losses['total_disc_loss'].backward()
-                # Apply gradient clipping to stabilize training
-                torch.nn.utils.clip_grad_norm_(self.discriminator_params, 1.0)
-                discriminator_optimizer.step()
-
-            # Add to all losses
-            all_losses.update(disc_losses)
-
-        # ===== GENERATOR TRAINING =====
-        generated_features = None
-        reconstructed_features = None
-
-        if train_generator:
-            generator_optimizer.zero_grad()
-
-            # Run forward pass with gradients
-            gen_features, recon_features, aux_outputs = self.generator(original_features, missing_type)
-
-            # Compute generator losses
-            gen_losses = self._compute_generator_loss(original_features, gen_features, aux_outputs, missing_type)
-
-            # Backward and optimize
-            if 'total_gen_loss' in gen_losses and gen_losses['total_gen_loss'] > 0:
-                gen_losses['total_gen_loss'].backward()
-                # Apply gradient clipping to stabilize training
-                torch.nn.utils.clip_grad_norm_(self.generator_params, 1.0)
-                generator_optimizer.step()
-
-            # Save generated features for return
-            generated_features = gen_features
-            reconstructed_features = recon_features
-
-            # Add to all losses
-            all_losses.update(gen_losses)
-
-        # If we didn't train the generator, get features for return value
-        if generated_features is None:
-            with torch.no_grad():
-                generated_features, reconstructed_features, _ = self.generator(original_features, missing_type)
-
-        return all_losses, generated_features, reconstructed_features
-
-    def _compute_discriminator_loss(self, real_features, gen_features, missing_type):
+    def compute_discriminator_loss(self,  real_features, gen_features, missing_type):
         """
         Compute discriminator loss without affecting generator graph
 
@@ -1140,7 +865,7 @@ class CycleGenerationModel(nn.Module):
                 continue
 
             # Get the discriminator
-            discriminator = self.generator.discriminators[mod]
+            discriminator = self.discriminators[mod]
 
             # Create masks for real and fake features
             if mod == 'image':
@@ -1185,10 +910,7 @@ class CycleGenerationModel(nn.Module):
 
             # Real loss: max(0, 1 - D(x))
             if real_scores is not None and len(real_scores) > 0:
-                real_loss = F.binary_cross_entropy_with_logits(
-                    real_scores,
-                    torch.ones_like(real_scores)
-                )
+                real_loss = torch.nn.functional.relu(1.0 - real_scores).mean()
                 disc_loss += real_loss
                 losses[f'disc_{mod}_real_loss'] = real_loss.item()
 
@@ -1196,10 +918,7 @@ class CycleGenerationModel(nn.Module):
             if fake_mask.any():
                 fake_scores_masked = fake_scores[fake_mask]
                 if len(fake_scores_masked) > 0:
-                    fake_loss = F.binary_cross_entropy_with_logits(
-                        fake_scores_masked,
-                        torch.zeros_like(fake_scores_masked)
-                    )
+                    fake_loss = torch.nn.functional.relu(1.0 + fake_scores_masked).mean()
                     disc_loss += fake_loss
                     losses[f'disc_{mod}_fake_loss'] = fake_loss.item()
 
@@ -1213,124 +932,64 @@ class CycleGenerationModel(nn.Module):
 
         return losses
 
-    def _compute_generator_loss(self, real_features, gen_features, aux_outputs, missing_type):
+    def train_step(self, real_features, missing_type, generator_optimizer, discriminator_optimizer,
+                   train_generator=True, train_discriminator=True):
         """
-        Compute generator loss
+        Perform a complete training step
 
         Args:
             real_features: Dictionary of real features
-            gen_features: Dictionary of generated features
-            aux_outputs: Auxiliary outputs from generator forward pass
-            missing_type: Tensor of missing modality types
+            missing_type: Tensor indicating missing modality type for each sample
+            generator_optimizer: Optimizer for generator parameters
+            discriminator_optimizer: Optimizer for discriminator parameters
+            train_generator: Whether to train the generator in this step
+            train_discriminator: Whether to train the discriminator in this step
 
         Returns:
-            Dictionary of generator losses
+            Dictionary of losses
         """
-        batch_size = missing_type.size(0)
-        device = missing_type.device
-        losses = {}
+        # Zero gradients
+        if train_generator:
+            generator_optimizer.zero_grad()
+        if train_discriminator:
+            discriminator_optimizer.zero_grad()
 
-        # Initialize loss components
-        adv_loss = 0.0
-        cycle_loss = aux_outputs.get('cycle_consistency_loss', 0.0)
-        distribution_loss = aux_outputs.get('distribution_loss', 0.0)
-        feature_matching_loss = 0.0
+        # Forward pass - detach real_features to avoid in-place modifications affecting original tensors
+        detached_real_features = {}
+        for mod in real_features:
+            if real_features[mod] is not None:
+                detached_real_features[mod] = real_features[mod].clone()
+            else:
+                detached_real_features[mod] = None
 
-        # 1. Adversarial loss: -D(G(z))
-        for mod in self.modality_dims:
-            # Skip if no discriminator scores
-            if 'disc_fake_scores' not in aux_outputs or mod not in aux_outputs['disc_fake_scores']:
-                continue
+        # Run forward pass with detached inputs
+        generated_features, reconstructed_features, aux_outputs = self(detached_real_features, missing_type)
 
-            # Get fake scores
-            fake_scores = aux_outputs['disc_fake_scores'][mod]
+        # Create separate dictionaries for losses to avoid in-place modifications
+        disc_losses = {}
+        gen_losses = {}
 
-            # Skip if no fake scores
-            if fake_scores is None or len(fake_scores) == 0:
-                continue
+        # Train discriminator
+        if train_discriminator:
+            disc_losses = self.compute_discriminator_loss(detached_real_features,generated_features,missing_type)
+            if 'total_disc_loss' in disc_losses:
+                # Use clone to avoid in-place operations
+                loss_to_backward = disc_losses['total_disc_loss'].clone()
+                loss_to_backward.backward(retain_graph=train_generator)
+                discriminator_optimizer.step()
 
-            # Calculate adversarial loss: -D(G(z))
-            mod_adv_loss = F.binary_cross_entropy_with_logits(
-                fake_scores,
-                torch.ones_like(fake_scores)
-            )
-            adv_loss += mod_adv_loss
-            losses[f'gen_{mod}_adv_loss'] = mod_adv_loss.item()
+        # Train generator
+        if train_generator:
+            gen_losses = self.compute_generator_losses(detached_real_features, generated_features, aux_outputs, missing_type)
+            if 'total_loss' in gen_losses:
+                # Use clone to avoid in-place operations
+                loss_to_backward = gen_losses['total_loss'].clone()
+                loss_to_backward.backward()
+                generator_optimizer.step()
 
-        # 2. Feature matching loss
-        for mod in self.modality_dims:
-            # Skip if no generated features for this modality
-            if mod not in gen_features or gen_features[mod] is None:
-                continue
+        # Combine all losses
+        all_losses = {}
+        all_losses.update(disc_losses)
+        all_losses.update(gen_losses)
 
-            # Get missing mask for this modality
-            if mod == 'image':
-                # Image is missing in types 1 and 3
-                missing_mask = (missing_type == 1) | (missing_type == 3)
-            elif mod == 'text':
-                # Text is missing in types 2 and 3
-                missing_mask = (missing_type == 2) | (missing_type == 3)
-
-            # Skip if no missing features
-            if not missing_mask.any():
-                continue
-
-            # Get real features (excluding missing ones)
-            real_mask = ~missing_mask
-            if real_mask.any() and mod in real_features and real_features[mod] is not None:
-                real_feats = real_features[mod][real_mask]
-
-                # Handle multi-token case
-                if real_feats.dim() > 2:
-                    real_feats = real_feats.mean(dim=1)
-
-                # Get generated features for this modality
-                gen_feats = gen_features[mod][missing_mask]
-
-                # Handle multi-token case
-                if gen_feats.dim() > 2:
-                    gen_feats = gen_feats.mean(dim=1)
-
-                # Skip if no features
-                if len(real_feats) == 0 or len(gen_feats) == 0:
-                    continue
-
-                # Compute mean and variance matching
-                real_mean = real_feats.mean(dim=0)
-                real_var = real_feats.var(dim=0)
-
-                gen_mean = gen_feats.mean(dim=0)
-                gen_var = gen_feats.var(dim=0)
-
-                # Compute loss
-                mean_loss = F.mse_loss(gen_mean, real_mean)
-                var_loss = F.mse_loss(gen_var, real_var)
-
-                # Add to feature matching loss
-                mod_feat_loss = mean_loss + 0.5 * var_loss
-                feature_matching_loss += mod_feat_loss
-                losses[f'gen_{mod}_feat_match_loss'] = mod_feat_loss.item()
-
-        # Store individual loss components
-        losses['gen_adv_loss'] = adv_loss.item()
-        losses['gen_cycle_loss'] = cycle_loss.item() if isinstance(cycle_loss, torch.Tensor) else cycle_loss
-        losses['gen_distribution_loss'] = distribution_loss.item() if isinstance(distribution_loss,
-                                                                                 torch.Tensor) else distribution_loss
-        losses['gen_feature_matching_loss'] = feature_matching_loss.item()
-
-        # Compute total generator loss with weights
-        adv_weight = 1.0
-        cycle_weight = 10.0
-        dist_weight = 1.0
-        feat_weight = 5.0
-
-        total_gen_loss = (
-                adv_weight * adv_loss +
-                cycle_weight * cycle_loss +
-                dist_weight * distribution_loss +
-                feat_weight * feature_matching_loss
-        )
-
-        losses['total_gen_loss'] = total_gen_loss
-
-        return losses
+        return all_losses, generated_features, reconstructed_features

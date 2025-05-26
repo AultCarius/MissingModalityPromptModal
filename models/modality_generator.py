@@ -315,7 +315,7 @@ class CycleGenerationModel(nn.Module):
 
     def _generate_for_sample(self, features, missing_type):
         """针对单个样本生成缺失模态特征"""
-        token_count = 5  # 使用的token数量
+        token_count = 1  # 使用的token数量
 
         generated = {}
         for mod in self.modality_dims.keys():

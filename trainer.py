@@ -28,7 +28,7 @@ from scipy.special import softmax
 # from sklearn.metrics import f1_score, roc_auc_score, accuracy_score
 from torchmetrics.functional import f1_score, auroc, accuracy
 
-# torch.autograd.set_detect_anomaly(True)
+torch.autograd.set_detect_anomaly(True)
 GENRE_CLASS = [
     'Drama', 'Comedy', 'Romance', 'Thriller', 'Crime', 'Action', 'Adventure',
     'Horror', 'Documentary', 'Mystery', 'Sci-Fi', 'Fantasy', 'Family',
@@ -324,21 +324,16 @@ class Trainer:
 
     def _setup_adversarial_optimizers(self):
         """Initialize optimizers for adversarial training"""
-        if not hasattr(self.model, 'modality_generator') or not hasattr(self.model.modality_generator, 'generator'):
-            self.logger.warning("Cannot setup adversarial optimizers: model does not have modality_generator")
-            return
+        if hasattr(self.model, 'modality_generator'):
+            # Split parameters for generator and discriminator
+            generator_params = []
+            discriminator_params = []
 
-        generator = self.model.modality_generator.generator
-
-        # Split parameters for generator and discriminator
-        generator_params = []
-        discriminator_params = []
-
-        for name, param in generator.named_parameters():
-            if 'discriminator' in name:
-                discriminator_params.append(param)
-            else:
-                generator_params.append(param)
+            for name, param in self.model.modality_generator.named_parameters():
+                if 'discriminator' in name:
+                    discriminator_params.append(param)
+                else:
+                    generator_params.append(param)
 
         # Create optimizers
         from torch.optim import Adam
@@ -392,9 +387,7 @@ class Trainer:
         self.is_single_label = dataset_type == "food101"
 
         # 检查是否使用改进的模态生成器进行对抗训练
-        use_adversarial = hasattr(self.model, 'modality_generator') and hasattr(self.model.modality_generator,
-                                                                                'generator') and \
-                          hasattr(self.model.modality_generator.generator, 'discriminators')
+        use_adversarial = hasattr(self.model, 'modality_generator') and hasattr(self.model.modality_generator, 'discriminators')
 
         if use_adversarial:
             self.logger.info("Using improved modality generator with adversarial training")
