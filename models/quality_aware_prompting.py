@@ -957,4 +957,4 @@ class ImprovedQualityAwareFeatureFusion(nn.Module):
             }
         }
 
-        return output_features, debug_info
+        return output_features, debug_info['fusion_weights']

@@ -2280,9 +2280,9 @@ class Trainer:
                         quality_data['missing_types'].append(missing_type.cpu())
 
                     # 收集融合权重
-                    if additional_info and 'fusion_weights' in additional_info and additional_info[
-                        'fusion_weights'] is not None:
-                        quality_data['fusion_weights'].append(additional_info['fusion_weights'].cpu())
+                    # if additional_info and 'fusion_weights' in additional_info and additional_info[
+                    #     'fusion_weights'] is not None:
+                    #     quality_data['fusion_weights'].append(additional_info['fusion_weights'].cpu())
                 else:
                     logits = output
 
