@@ -1,4 +1,6 @@
+
 import os.path
+
 import re
 import matplotlib.pyplot as plt
 import numpy as np
@@ -45,12 +47,14 @@ def parse_log_file(log_path):
                 'image': float(groups[12]),  # image类型的macro_f1
                 'text': float(groups[19]),  # text类型的macro_f1
                 'total': float(groups[-2])  # 总体macro_f1
+
             },
             'acc':{
                 'none': float(groups[4]),  # none类型的macro_f1
                 'image': float(groups[11]),  # image类型的macro_f1
                 'text': float(groups[18]),  # text类型的macro_f1
                 'total': float(groups[-3])  # 总体macro_f1
+
             }
         }
         epochs_data.append(epoch_data)
@@ -99,6 +103,7 @@ def plot_macro_f1(epochs_data, output_path='macro_f1_trend.png'):
 
     # 显示图表
     plt.show()
+
 
 def plot_acc(epochs_data, output_path='macro_f1_trend.png'):
     """绘制Macro-F1指标随Epoch的变化趋势图"""
@@ -152,5 +157,7 @@ if __name__ == "__main__":
     epochs_data = parse_log_file(log_file_path)
 
     # 绘制并保存图表
+
     plot_macro_f1(epochs_data, os.path.join(output_path,macro_f1))
     plot_acc(epochs_data,os.path.join(output_path,acc))
+

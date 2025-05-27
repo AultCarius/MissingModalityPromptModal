@@ -143,6 +143,7 @@ class EnhancedCrossModalGenerator(nn.Module):
         for source_mod in self.modalities:
             for target_mod in self.modalities:
                 if source_mod != target_mod:
+
                     # Create cross-attention based generator
                     layers = []
                     # First add cross-attention to condition on source modality
@@ -169,6 +170,7 @@ class EnhancedCrossModalGenerator(nn.Module):
             # Initial projection from noise
             layers.append(nn.Sequential(
                 nn.Linear(256, fusion_hidden_dim),  # Larger noise dimension
+
                 nn.LayerNorm(fusion_hidden_dim),
                 nn.GELU(),
                 nn.Dropout(0.1)
@@ -182,6 +184,7 @@ class EnhancedCrossModalGenerator(nn.Module):
             layers.append(nn.Sequential(
                 nn.LayerNorm(fusion_hidden_dim),
                 nn.Linear(fusion_hidden_dim, dim),
+
             ))
 
             self.prior_generators[mod_name] = nn.ModuleList(layers)
@@ -204,6 +207,7 @@ class EnhancedCrossModalGenerator(nn.Module):
         Returns:
             Encoded features in the common space
         """
+
         if features is None:
             return None
 
@@ -401,7 +405,6 @@ class TransformerReconstructor(nn.Module):
 
     def __init__(self, modality_dims, fusion_dim=512, num_layers=2, num_heads=8):
         """
-        Initialize the transformer-based reconstructor
 
         Args:
             modality_dims: Dictionary mapping modality names to their dimensions
@@ -410,11 +413,13 @@ class TransformerReconstructor(nn.Module):
             num_heads: Number of attention heads
         """
         super().__init__()
+
         self.modality_dims = modality_dims
         self.modalities = list(modality_dims.keys())
 
         # Encoders (shared with generator or separate)
         self.encoders = nn.ModuleDict({
+
             mod_name: nn.Sequential(
                 nn.Linear(dim, fusion_dim),
                 nn.LayerNorm(fusion_dim),
@@ -533,7 +538,9 @@ class TransformerReconstructor(nn.Module):
             Dictionary of reconstructed features
         """
         if not isinstance(features, dict):
+
             raise ValueError("Expected dictionary of features")
+
 
         reconstructed = {}
 
@@ -688,6 +695,7 @@ class EnhancedCycleGenerationModel(nn.Module):
         # Generate missing modalities
         generated = {}
 
+
         if mt == 1:  # Image missing
             if 'text' in features and features['text'] is not None:
                 generated['image'] = self.generator.generate(
@@ -717,3 +725,4 @@ class EnhancedCycleGenerationModel(nn.Module):
         reconstructed = self.reconstructor(combined)
 
         return generated, reconstructed
+
