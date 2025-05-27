@@ -1237,7 +1237,7 @@ class MultimodalPromptModel(nn.Module):
             # 或方法2: 使用LayerNorm
             base_norm = F.layer_norm(base_hidden, base_hidden.shape[1:])
             quality_norm = F.layer_norm(quality_guided_feat, quality_guided_feat.shape[1:])
-            alpha = 0.2  # Fixed weight or learnable parameter
+            alpha = 0.0  # Fixed weight or learnable parameter
             if should_analyze:
                 self.analyze_features_at_key_points("再次归一化后.前者为base_norm,后者为qualitu_norm", base_norm.detach(), quality_norm.detach())
 

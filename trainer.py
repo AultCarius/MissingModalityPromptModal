@@ -9,9 +9,6 @@ import numpy as np
 from torch.utils.tensorboard import SummaryWriter
 from datetime import datetime
 
-import math
-from torch.optim import Adam
-from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from transformers import get_linear_schedule_with_warmup
 import torch.nn.functional as F
@@ -29,6 +26,9 @@ from scipy.special import softmax
 
 # from sklearn.metrics import f1_score, roc_auc_score, accuracy_score
 from torchmetrics.functional import f1_score, auroc, accuracy
+
+from utils.loss_utils import combined_reconstruction_loss
+
 
 # torch.autograd.set_detect_anomaly(True)
 GENRE_CLASS = [
@@ -585,7 +585,7 @@ class Trainer:
 
                                         # Calculate cycle consistency loss (text -> gen image -> recon text)
                                         if text_recon.shape == text_orig.shape:
-                                            text_cycle_loss = F.mse_loss(text_recon, text_orig)
+                                            text_cycle_loss,_ = combined_reconstruction_loss(text_recon, text_orig)
                                             cycle_components.append(text_cycle_loss)
 
                                             # Log metrics
@@ -612,7 +612,7 @@ class Trainer:
 
                                         # Calculate cycle consistency loss (image -> gen text -> recon image)
                                         if image_recon.shape == image_orig.shape:
-                                            image_cycle_loss = F.mse_loss(image_recon, image_orig)
+                                            image_cycle_loss,_ = combined_reconstruction_loss(image_recon, image_orig)
                                             cycle_components.append(image_cycle_loss)
 
                                             # Log metrics
@@ -638,8 +638,8 @@ class Trainer:
 
                                                 # Calculate reconstruction loss (how well image->text works)
                                                 if txt_from_img.shape == txt_orig.shape:
-                                                    txt_gen_loss = F.mse_loss(txt_from_img, txt_orig)
-                                                    recon_components.append(txt_gen_loss)
+                                                    txt_gen_loss,_ = combined_reconstruction_loss(txt_from_img, txt_orig)
+                                                    recon_components.append(txt_gen_loss*2)
                                                     recon_loss_sum += txt_gen_loss.item()
 
                                         elif key == 'image_from_text' and features is not None:
@@ -650,13 +650,13 @@ class Trainer:
 
                                                 # Calculate reconstruction loss (how well text->image works)
                                                 if img_from_txt.shape == img_orig.shape:
-                                                    img_gen_loss = F.mse_loss(img_from_txt, img_orig)
-                                                    recon_components.append(img_gen_loss)
+                                                    img_gen_loss,_ = combined_reconstruction_loss(img_from_txt, img_orig)
+                                                    recon_components.append(img_gen_loss*2)
                                                     recon_loss_sum += img_gen_loss.item()
 
                             # === 2.4 Calculate combined reconstruction and cycle losses ===
                             if recon_components:
-                                reconstruction_loss = sum(recon_components) / len(recon_components)
+                                reconstruction_loss = sum(recon_components)
 
                             if cycle_components:
                                 cycle_loss = sum(cycle_components) / len(cycle_components)
@@ -2323,7 +2323,6 @@ class Trainer:
         metrics = self._compute_metrics(all_preds, all_labels)
 
         # 详细统计信息
-        # self._detailed_statistics(all_logits, all_labels, all_preds, "Overall")
         if self.is_single_label:
             # 使用Food101的详细统计函数
             self._detailed_statistics_food101(all_logits, all_labels, all_preds, "Overall")
@@ -2690,6 +2689,106 @@ class Trainer:
         except Exception as e:
             self.logger.warning(f"Failed to create fusion weights visualization: {str(e)}")
 
+    def _detailed_statistics(self, logits, labels, preds, missing_type=None, prefix=""):
+        """
+        Compute and print detailed statistics, optionally by missing_type.
+
+        Args:
+            logits: Tensor [B, C]
+            labels: Tensor [B, C]
+            preds: Tensor [B, C]
+            missing_type: Optional Tensor [B,] with values 0, 1, 2, 3
+            prefix: Logging prefix
+        """
+        import numpy as np
+        logits_np = logits.detach().cpu().numpy()
+        labels_np = labels.detach().cpu().numpy()
+        preds_np = preds.detach().cpu().numpy()
+
+        total_samples = labels_np.shape[0]
+        positive_counts = labels_np.sum(axis=0)
+        pred_counts = preds_np.sum(axis=0)
+
+        class_metrics = []
+
+        for i, genre in enumerate(GENRE_CLASS):
+            true_pos = ((preds_np[:, i] > 0.5) & (labels_np[:, i] > 0.5)).sum()
+            false_pos = ((preds_np[:, i] > 0.5) & (labels_np[:, i] <= 0.5)).sum()
+            false_neg = ((preds_np[:, i] <= 0.5) & (labels_np[:, i] > 0.5)).sum()
+            true_neg = ((preds_np[:, i] <= 0.5) & (labels_np[:, i] <= 0.5)).sum()
+
+            precision = true_pos / (true_pos + false_pos) if (true_pos + false_pos) > 0 else 0
+            recall = true_pos / (true_pos + false_neg) if (true_pos + false_neg) > 0 else 0
+            f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+            accuracy = (true_pos + true_neg) / total_samples
+
+            mean_logit = logits_np[:, i].mean()
+            pos_logit = logits_np[labels_np[:, i] > 0.5, i].mean() if (labels_np[:, i] > 0.5).any() else float('nan')
+            neg_logit = logits_np[labels_np[:, i] <= 0.5, i].mean() if (labels_np[:, i] <= 0.5).any() else float('nan')
+
+            class_metrics.append({
+                'genre': genre,
+                'pos_count': int(positive_counts[i]),
+                'pred_count': int(pred_counts[i]),
+                'accuracy': accuracy,
+                'precision': precision,
+                'recall': recall,
+                'f1': f1,
+                'mean_logit': mean_logit,
+                'pos_logit': pos_logit,
+                'neg_logit': neg_logit
+            })
+
+        self.logger.info(f"\n{prefix} Detailed Statistics:")
+        self.logger.info(f"Total samples: {total_samples}")
+        self.logger.info(f"Average labels per sample: {labels_np.sum() / total_samples:.2f}")
+        self.logger.info(f"Average predictions per sample: {preds_np.sum() / total_samples:.2f}")
+
+        # 打印类别级别统计
+        headers = ["Genre", "Pos%", "PredCnt", "Acc", "Prec", "Rec", "F1", "AvgLog", "PosLog", "NegLog"]
+        format_row = "{:12} {:6} {:8} {:6} {:6} {:6} {:6} {:7} {:7} {:7}"
+        self.logger.info(f"\nClass-level metrics [{prefix}]:")
+        self.logger.info(format_row.format(*headers))
+        for cm in sorted(class_metrics, key=lambda x: x['pos_count'], reverse=True):
+            pos_percent = cm['pos_count'] / total_samples * 100
+            self.logger.info(format_row.format(
+                cm['genre'][:12],
+                f"{pos_percent:.1f}%",
+                cm['pred_count'],
+                f"{cm['accuracy'] * 100:.2f}",
+                f"{cm['precision'] * 100:.2f}",
+                f"{cm['recall'] * 100:.2f}",
+                f"{cm['f1'] * 100:.2f}",
+                f"{cm['mean_logit']:.2f}",
+                f"{0 if np.isnan(cm['pos_logit']) else cm['pos_logit']:.2f}",
+                f"{0 if np.isnan(cm['neg_logit']) else cm['neg_logit']:.2f}",
+            ))
+
+        # 额外统计预测为0的样本数
+        zero_pred = (preds_np.sum(axis=1) == 0).sum()
+        if zero_pred > 0:
+            self.logger.info(f"\n警告: {zero_pred}个样本({zero_pred / total_samples * 100:.2f}%)没有任何正向预测!")
+
+        # 统计预测数量分布
+        pred_counts_per_sample = preds_np.sum(axis=1)
+        for i in range(min(5, int(pred_counts_per_sample.max())) + 1):
+            count = (pred_counts_per_sample == i).sum()
+            self.logger.info(f"样本有{i}个预测: {count}个 ({count / total_samples * 100:.2f}%)")
+
+        # ========== 【新增】按缺失类型分组统计 ==========
+        if missing_type is not None:
+            mt = missing_type.cpu().numpy()
+            for mtype in [0, 1, 2, 3]:
+                idx = (mt == mtype)
+                if idx.sum() == 0:
+                    continue
+                mean_logits_per_class = logits_np[idx].mean(axis=0)
+                pred_rate = preds_np[idx].sum(axis=0) / idx.sum()
+                self.logger.info(f"\n[{prefix}] MissingType={mtype} ({idx.sum()} samples):")
+                for i, genre in enumerate(GENRE_CLASS):
+                    self.logger.info(
+                        f"  {genre:12s} | MeanLogit: {mean_logits_per_class[i]:.3f} | Pred%: {pred_rate[i] * 100:.2f}%")
+
     def _detailed_statistics(self, logits, labels, preds, prefix=""):
         """计算并打印详细的预测统计信息"""
         # 转为numpy方便处理
@@ -2781,6 +2880,8 @@ class Trainer:
         for i in range(min(5, int(max(pred_counts_per_sample))) + 1):
             count = (pred_counts_per_sample == i).sum()
             self.logger.info(f"样本有{i}个预测: {count}个 ({count / total_samples * 100:.2f}%)")
+
+
 
     def _detailed_statistics_food101(self, logits, labels, preds, prefix=""):
         """计算并打印Food101数据集的详细预测统计信息"""
