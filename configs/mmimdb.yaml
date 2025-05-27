@@ -20,7 +20,7 @@ max_length: 77
 
 # Training Configuration
 epochs: 40
-batch_size: 4
+batch_size: 16
 num_workers: 4
 image_size: 224
 patch_size: 16

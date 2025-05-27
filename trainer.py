@@ -86,7 +86,7 @@ class Trainer:
         # Initialize loss weights for different components
         self.loss_weights = {
             'classification': 1.0,
-            'reconstruction': 3.0,
+            'reconstruction': 2.0,
             'cycle': 2.0,
             'contrastive': 0.2,
             'quality': 0.1

@@ -958,6 +958,14 @@ class MultimodalPromptModel(nn.Module):
         image_embed, text_embed, is_image_missing, is_text_missing = self._extract_features(
             image, input_ids, attention_mask, missing_type
         )
+        from utils.debugutils import print_tensor_shapes
+        # print("原始特征")
+        # print("image",image.shape)
+        # print("input_ids",input_ids.shape)
+        # print("attention_mask",attention_mask.shape)
+        # print("image_embed",image_embed.shape)
+        # print("text_embed",text_embed.shape)
+
 
         # 1. 在提取特征后，分析原始特征分布
         # 创建一个随机采样检查标志，避免分析所有批次
@@ -973,20 +981,24 @@ class MultimodalPromptModel(nn.Module):
         original_image_embed = image_embed.clone() if image_embed is not None else None
         original_text_embed = text_embed.clone() if text_embed is not None else None
 
+        # TODO: 这里暂时注释,改为晚期CLSTOKEN的重建
         # Process modalities - this includes generation of missing modalities
-        image_embed, text_embed, attention_mask, additional_info = self._process_modalities(
-            image_embed, text_embed, attention_mask, missing_type
-        )
+        # image_embed, text_embed, attention_mask, additional_info = self._process_modalities(
+        #     image_embed, text_embed, attention_mask, missing_type
+        # )
+
+        # print("重建特征,只重建了最后一个token,额外信息返回的原始特征也只保留了最后一个toekn")
+        # print("attention_mask",attention_mask.shape)
+        # print("image_embed",image_embed.shape)
+        # print("text_embed",text_embed.shape)
+        # print("gen_image",additional_info['generated_features']['image'].shape)
+        # print("gen_text",additional_info['generated_features']['text'].shape)
+        # print("ingen_return_origin",additional_info['original_features']['image'].shape)
+        # print("ingen_return_origin",additional_info['original_features']['text'].shape)
 
         # 初始化提示
         image_prompt = self.image_init_prompt.expand(batch_size, -1, -1)  # [B, prompt_len, D_img]
         text_prompt = self.text_init_prompt.expand(batch_size, -1, -1)  # [B, prompt_len, D_txt]
-
-        if 'original_full_embeddings' not in additional_info:
-            additional_info['original_full_embeddings'] = {
-                'image': original_image_embed,
-                'text': original_text_embed
-            }
 
         # 获取初步特征用于质量评估
         temp_img = image_embed.clone()
@@ -1181,6 +1193,32 @@ class MultimodalPromptModel(nn.Module):
 
         image_feat = image_feat_norm
         text_feat = text_feat_norm
+
+        features_for_generation = {
+            'image': image_feat.unsqueeze(1) if image_feat is not None else None,  # [B, 1, D_img]
+            'text': text_feat.unsqueeze(1) if text_feat is not None else None  # [B, 1, D_txt]
+        }
+
+        # 在这里生成cls token
+        processed_image,processed_text,processed_attenmask , additional_info = self._process_modalities(
+            features_for_generation['image'],
+            features_for_generation['text'],
+            attention_mask,
+            missing_type
+        )
+        generated_features = additional_info.get('generated_features', {})
+
+        # 用生成特征替换原始clstoken
+        if is_image_missing.any() and 'image' in generated_features and generated_features['image'] is not None:
+            for b in range(batch_size):
+                if is_image_missing[b]:
+                    image_feat[b] = generated_features['image'][b].squeeze(0)
+
+        if is_text_missing.any() and 'text' in generated_features and generated_features['text'] is not None:
+            for b in range(batch_size):
+                if is_text_missing[b]:
+                    text_feat[b] = generated_features['text'][b].squeeze(0)
+
 
         # 5. 在质量评估和特征融合前
         if should_analyze:
