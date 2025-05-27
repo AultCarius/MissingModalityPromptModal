@@ -1,7 +1,7 @@
 # 实验配置
 
 
-experiment_name: "mmimdb_test_TransformerGen"
+experiment_name: "mmimdb_test_delete_v2_nogen"
 
 
 # Model Configuration
@@ -63,6 +63,7 @@ test_missing_prob: 0.7
 # Add after missing_prob line
 initial_missing_prob: 0.7
 final_missing_prob: 0.7
+use_curriculum: false
 missing_prob_ramp_epochs: 5
 
 # Adversarial Training Configuration

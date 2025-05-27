@@ -320,7 +320,8 @@ class MultimodalPromptModel(nn.Module):
 
         # 使用质量引导的特征融合替换跨模态提示
         if use_cross_modal_prompt:
-            self.feature_fusion = QualityAwareFeatureFusion(
+            from models.quality_aware_prompting import ImprovedQualityAwareFeatureFusion
+            self.feature_fusion = ImprovedQualityAwareFeatureFusion(
                 self.image_dim,
                 self.text_dim,
                 fusion_dim
@@ -334,7 +335,15 @@ class MultimodalPromptModel(nn.Module):
         )
         self.classifier = nn.Linear(fusion_dim, num_classes)
 
-        print(len(self.image_blocks),len(self.text_blocks))
+        self.image_feat_norm = nn.LayerNorm(self.image_dim)
+        self.text_feat_norm = nn.LayerNorm(self.text_dim)
+        self.base_fusion_norm = nn.LayerNorm(fusion_dim)
+        self.quality_fusion_norm = nn.LayerNorm(fusion_dim)
+
+        # 为图像特征使用较小的初始权重，抑制其影响
+        self.image_feat_norm.weight.data.fill_(0.8)  # 默认是1.0
+        # 为文本特征使用较大的初始权重，增强其影响
+        self.text_feat_norm.weight.data.fill_(1.2)  # 默认是1.0
 
         # 冻结预训练参数（如果需要）
         if freeze_image_encoder:
@@ -806,8 +815,8 @@ class MultimodalPromptModel(nn.Module):
             'text': ~text_is_zeros.unsqueeze(1).expand(-1, token_count)
         }
 
-        should_analyze = (torch.rand(1).item() < 0.01)  # 1% chance to analyze
-        if should_analyze:
+        should_analyze_gen = (torch.rand(1).item() < 0.01)  # 1% chance to analyze
+        if should_analyze_gen:
             self.analyze_feature_distributions(
                 original_features,
                 None,  # No generated features yet
@@ -832,14 +841,14 @@ class MultimodalPromptModel(nn.Module):
             generate_all = self.training and not (is_image_missing.any() or is_text_missing.any())
 
             # Use improved batch processing in the generator
-            generated_features, reconstructed_features, cycle_features = self.modality_generator(
+            generated_features, reconstructed_features, _ = self.modality_generator(
                 gen_input,
                 missing_type,
                 generate_all=generate_all
             )
 
         # Analyze features after generation
-        if should_analyze:
+        if should_analyze_gen:
             self.analyze_feature_distributions(
                 original_features,
                 generated_features,
@@ -952,10 +961,18 @@ class MultimodalPromptModel(nn.Module):
         image_embed, text_embed, is_image_missing, is_text_missing = self._extract_features(
             image, input_ids, attention_mask, missing_type
         )
+        from utils.debugutils import print_tensor_shapes
+        # print("原始特征")
+        # print("image",image.shape)
+        # print("input_ids",input_ids.shape)
+        # print("attention_mask",attention_mask.shape)
+        # print("image_embed",image_embed.shape)
+        # print("text_embed",text_embed.shape)
+
 
         # 1. 在提取特征后，分析原始特征分布
         # 创建一个随机采样检查标志，避免分析所有批次
-        should_analyze = (torch.rand(1).item() < 0.001)  # 1%的批次进行分析
+        should_analyze = (torch.rand(1).item() < 0.01)  # 1%的批次进行分析
         shoule_analyze_fusion = (torch.rand(1).item() < 0.01)
         # 特征分布分析
         if should_analyze and image_embed is not None and text_embed is not None:
@@ -967,20 +984,24 @@ class MultimodalPromptModel(nn.Module):
         original_image_embed = image_embed.clone() if image_embed is not None else None
         original_text_embed = text_embed.clone() if text_embed is not None else None
 
+        # TODO: 这里暂时注释,改为晚期CLSTOKEN的重建
         # Process modalities - this includes generation of missing modalities
-        image_embed, text_embed, attention_mask, additional_info = self._process_modalities(
-            image_embed, text_embed, attention_mask, missing_type
-        )
+        # image_embed, text_embed, attention_mask, additional_info = self._process_modalities(
+        #     image_embed, text_embed, attention_mask, missing_type
+        # )
+
+        # print("重建特征,只重建了最后一个token,额外信息返回的原始特征也只保留了最后一个toekn")
+        # print("attention_mask",attention_mask.shape)
+        # print("image_embed",image_embed.shape)
+        # print("text_embed",text_embed.shape)
+        # print("gen_image",additional_info['generated_features']['image'].shape)
+        # print("gen_text",additional_info['generated_features']['text'].shape)
+        # print("ingen_return_origin",additional_info['original_features']['image'].shape)
+        # print("ingen_return_origin",additional_info['original_features']['text'].shape)
 
         # 初始化提示
         image_prompt = self.image_init_prompt.expand(batch_size, -1, -1)  # [B, prompt_len, D_img]
         text_prompt = self.text_init_prompt.expand(batch_size, -1, -1)  # [B, prompt_len, D_txt]
-
-        if 'original_full_embeddings' not in additional_info:
-            additional_info['original_full_embeddings'] = {
-                'image': original_image_embed,
-                'text': original_text_embed
-            }
 
         # 获取初步特征用于质量评估
         temp_img = image_embed.clone()
@@ -1154,8 +1175,8 @@ class MultimodalPromptModel(nn.Module):
         image_feat = image_embed[:, 0]  # [B, D_img]
         text_feat = text_embed[:, 0]  # [B, D_txt]
 
-        image_feat_norm = F.layer_norm(image_feat, image_feat.shape[1:])
-        text_feat_norm = F.layer_norm(text_feat, text_feat.shape[1:])
+        image_feat_norm = self.image_feat_norm(image_feat)
+        text_feat_norm = self.text_feat_norm(text_feat)
 
         # 收集模态特征用于epoch分析（在训练时且随机采样）
         if self.training and hasattr(self, 'fusion_analyzer') and self.fusion_analyzer is not None:
@@ -1175,6 +1196,32 @@ class MultimodalPromptModel(nn.Module):
 
         image_feat = image_feat_norm
         text_feat = text_feat_norm
+
+        features_for_generation = {
+            'image': image_feat.unsqueeze(1) if image_feat is not None else None,  # [B, 1, D_img]
+            'text': text_feat.unsqueeze(1) if text_feat is not None else None  # [B, 1, D_txt]
+        }
+
+        # 在这里生成cls token
+        processed_image,processed_text,processed_attenmask , additional_info = self._process_modalities(
+            features_for_generation['image'],
+            features_for_generation['text'],
+            attention_mask,
+            missing_type
+        )
+        generated_features = additional_info.get('generated_features', {})
+
+        # 用生成特征替换原始clstoken
+        if is_image_missing.any() and 'image' in generated_features and generated_features['image'] is not None:
+            for b in range(batch_size):
+                if is_image_missing[b]:
+                    image_feat[b] = generated_features['image'][b].squeeze(0)
+
+        if is_text_missing.any() and 'text' in generated_features and generated_features['text'] is not None:
+            for b in range(batch_size):
+                if is_text_missing[b]:
+                    text_feat[b] = generated_features['text'][b].squeeze(0)
+
 
         # 5. 在质量评估和特征融合前
         if should_analyze:
@@ -1236,10 +1283,9 @@ class MultimodalPromptModel(nn.Module):
         hidden = None
         if quality_guided_feat is not None:
 
-            # 或方法2: 使用LayerNorm
-            base_norm = F.layer_norm(base_hidden, base_hidden.shape[1:])
-            quality_norm = F.layer_norm(quality_guided_feat, quality_guided_feat.shape[1:])
-            alpha = 0.2  # Fixed weight or learnable parameter
+            base_norm = self.base_fusion_norm(base_hidden)
+            quality_norm = self.quality_fusion_norm(quality_guided_feat)
+            alpha = 0.0  # Fixed weight or learnable parameter
             if should_analyze:
                 self.analyze_features_at_key_points("再次归一化后.前者为base_norm,后者为qualitu_norm", base_norm.detach(), quality_norm.detach())
 
@@ -1270,6 +1316,12 @@ class MultimodalPromptModel(nn.Module):
                 'text': is_text_missing  # Mask indicating which texts were generated
             }
         })
+
+        if should_analyze:  # 每5个epoch检查一次
+            print(f"Image LayerNorm weights: {self.image_feat_norm.weight.mean().item():.4f}")
+            print(f"Text LayerNorm weights: {self.text_feat_norm.weight.mean().item():.4f}")
+            print(f"Image LayerNorm weights: {self.base_fusion_norm.weight.mean().item():.4f}")
+            print(f"Text LayerNorm weights: {self.quality_fusion_norm.weight.mean().item():.4f}")
 
         return (logits, additional_info)
 

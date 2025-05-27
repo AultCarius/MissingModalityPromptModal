@@ -9,9 +9,6 @@ import numpy as np
 from torch.utils.tensorboard import SummaryWriter
 from datetime import datetime
 
-import math
-from torch.optim import Adam
-from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from transformers import get_linear_schedule_with_warmup
 import torch.nn.functional as F
@@ -29,6 +26,9 @@ from scipy.special import softmax
 
 # from sklearn.metrics import f1_score, roc_auc_score, accuracy_score
 from torchmetrics.functional import f1_score, auroc, accuracy
+
+from utils.loss_utils import combined_reconstruction_loss
+
 
 # torch.autograd.set_detect_anomaly(True)
 GENRE_CLASS = [
@@ -86,8 +86,8 @@ class Trainer:
         # Initialize loss weights for different components
         self.loss_weights = {
             'classification': 1.0,
-            'reconstruction': 0.5,
-            'cycle': 0.3,
+            'reconstruction': 2.0,
+            'cycle': 2.0,
             'contrastive': 0.2,
             'quality': 0.1
         }
@@ -585,7 +585,7 @@ class Trainer:
 
                                         # Calculate cycle consistency loss (text -> gen image -> recon text)
                                         if text_recon.shape == text_orig.shape:
-                                            text_cycle_loss = F.mse_loss(text_recon, text_orig)
+                                            text_cycle_loss,_ = combined_reconstruction_loss(text_recon, text_orig)
                                             cycle_components.append(text_cycle_loss)
 
                                             # Log metrics
@@ -612,7 +612,7 @@ class Trainer:
 
                                         # Calculate cycle consistency loss (image -> gen text -> recon image)
                                         if image_recon.shape == image_orig.shape:
-                                            image_cycle_loss = F.mse_loss(image_recon, image_orig)
+                                            image_cycle_loss,_ = combined_reconstruction_loss(image_recon, image_orig)
                                             cycle_components.append(image_cycle_loss)
 
                                             # Log metrics
@@ -622,14 +622,14 @@ class Trainer:
 
                             # === 2.3 Process complete samples (both modalities present) ===
                             # For complete samples, we can train the generator with direct reconstruction
-                            if both_modalities.any() and cycle_features:
+                            if both_modalities.any() and recon_features:
                                 # Extract original features for complete samples
                                 if 'image' in orig_features and 'text' in orig_features:
                                     img_orig = orig_features['image'][both_modalities]
                                     txt_orig = orig_features['text'][both_modalities]
 
                                     # Check which cycle features we have
-                                    for key, features in cycle_features.items():
+                                    for key, features in recon_features.items():
                                         if key == 'text_from_image' and features is not None:
                                             # Get generated text from image
                                             txt_from_img = features
@@ -638,8 +638,8 @@ class Trainer:
 
                                                 # Calculate reconstruction loss (how well image->text works)
                                                 if txt_from_img.shape == txt_orig.shape:
-                                                    txt_gen_loss = F.mse_loss(txt_from_img, txt_orig)
-                                                    recon_components.append(txt_gen_loss)
+                                                    txt_gen_loss,_ = combined_reconstruction_loss(txt_from_img, txt_orig)
+                                                    recon_components.append(txt_gen_loss*2)
                                                     recon_loss_sum += txt_gen_loss.item()
 
                                         elif key == 'image_from_text' and features is not None:
@@ -650,13 +650,13 @@ class Trainer:
 
                                                 # Calculate reconstruction loss (how well text->image works)
                                                 if img_from_txt.shape == img_orig.shape:
-                                                    img_gen_loss = F.mse_loss(img_from_txt, img_orig)
-                                                    recon_components.append(img_gen_loss)
+                                                    img_gen_loss,_ = combined_reconstruction_loss(img_from_txt, img_orig)
+                                                    recon_components.append(img_gen_loss*2)
                                                     recon_loss_sum += img_gen_loss.item()
 
                             # === 2.4 Calculate combined reconstruction and cycle losses ===
                             if recon_components:
-                                reconstruction_loss = sum(recon_components) / len(recon_components)
+                                reconstruction_loss = sum(recon_components)
 
                             if cycle_components:
                                 cycle_loss = sum(cycle_components) / len(cycle_components)
@@ -666,7 +666,7 @@ class Trainer:
                             contrastive_components = []
 
                             # Only calculate contrastive loss for complete samples
-                            if both_modalities.any() and cycle_features:
+                            if both_modalities.any() and recon_features:
                                 # Original features
                                 img_orig = orig_features['image'][
                                     both_modalities] if 'image' in orig_features else None
@@ -674,8 +674,8 @@ class Trainer:
                                     both_modalities] if 'text' in orig_features else None
 
                                 # Generated features
-                                img_gen = cycle_features.get('image_from_text')
-                                txt_gen = cycle_features.get('text_from_image')
+                                img_gen = recon_features.get('image_from_text')
+                                txt_gen = recon_features.get('text_from_image')
 
                                 if img_orig is not None and txt_orig is not None and img_gen is not None and txt_gen is not None:
                                     # Prepare features for contrastive loss (flatten multi-token features)
@@ -717,46 +717,86 @@ class Trainer:
                     # ===== 质量评估器训练 =====
                     # ===== 4. Quality Assessment Loss =====
                     quality_loss = 0.0
-                    quality_components = []
 
-                    # Calculate quality assessment loss for complete samples
-                    if both_modalities.any() and 'quality_scores' in additional_info:
-                        quality_scores = additional_info['quality_scores']
+                    if quality_scores is not None and 'image' in quality_scores and 'text' in quality_scores:
+                        # 创建基于缺失类型的质量目标
+                        image_quality_target = torch.ones_like(quality_scores['image']['final_score'])
+                        text_quality_target = torch.ones_like(quality_scores['text']['final_score'])
+                        consistency_target = torch.ones_like(quality_scores['cross_consistency'])
 
-                        # For complete samples, we expect high quality
-                        target_quality = torch.ones(both_modalities.sum(), 1, device=self.device) * 0.9
+                        # 根据缺失类型调整目标质量分数
+                        # 1. 图像缺失样本
+                        img_missing = is_image_missing & (~is_text_missing)
+                        if img_missing.any():
+                            # 图像缺失时：图像质量应低，文本质量应高，一致性适中
+                            image_quality_target[img_missing] = 0.5  # 生成的图像质量低
+                            text_quality_target[img_missing] = 0.9  # 真实文本质量高
+                            consistency_target[img_missing] = 0.5  # 一致性适中
 
-                        # Get quality scores for complete samples
-                        img_quality = quality_scores['image']['final_score'][both_modalities]
-                        txt_quality = quality_scores['text']['final_score'][both_modalities]
-                        consistency = quality_scores['cross_consistency'][both_modalities]
+                        # 2. 文本缺失样本
+                        txt_missing = (~is_image_missing) & is_text_missing
+                        if txt_missing.any():
+                            # 文本缺失时：图像质量应高，文本质量应低，一致性适中
+                            image_quality_target[txt_missing] = 0.9  # 真实图像质量高
+                            text_quality_target[txt_missing] = 0.5  # 生成的文本质量低
+                            consistency_target[txt_missing] = 0.5  # 一致性适中
 
-                        # Calculate quality prediction loss
-                        img_quality_loss = F.mse_loss(img_quality, target_quality)
-                        txt_quality_loss = F.mse_loss(txt_quality, target_quality)
-                        consistency_loss = F.mse_loss(consistency, target_quality)
+                        # 3. 两个模态都缺失
+                        both_missing = is_image_missing & is_text_missing
+                        if both_missing.any():
+                            # 两个模态都缺失时：两个质量都应低，一致性低
+                            image_quality_target[both_missing] = 0.2
+                            text_quality_target[both_missing] = 0.2
+                            consistency_target[both_missing] = 0.3
 
-                        quality_components.extend([img_quality_loss, txt_quality_loss, consistency_loss])
+                        # 4. 完整样本
+                        complete = (~is_image_missing) & (~is_text_missing)
+                        if complete.any():
+                            # 完整样本：两个质量都应高，一致性高
+                            image_quality_target[complete] = 0.9
+                            text_quality_target[complete] = 0.9
+                            consistency_target[complete] = 0.9
 
-                        # For missing modality samples, generated features should have lower quality
-                        if text_only.any():
-                            # Image is missing - generated image should have lower quality
-                            gen_img_quality = quality_scores['image']['final_score'][text_only]
-                            target_gen_quality = torch.ones(text_only.sum(), 1, device=self.device) * 0.6
-                            gen_img_quality_loss = F.mse_loss(gen_img_quality, target_gen_quality)
-                            quality_components.append(gen_img_quality_loss)
+                        # 计算质量评估损失
+                        img_quality_loss = F.mse_loss(
+                            quality_scores['image']['final_score'],
+                            image_quality_target
+                        )
 
-                        if image_only.any():
-                            # Text is missing - generated text should have lower quality
-                            gen_txt_quality = quality_scores['text']['final_score'][image_only]
-                            target_gen_quality = torch.ones(image_only.sum(), 1, device=self.device) * 0.6
-                            gen_txt_quality_loss = F.mse_loss(gen_txt_quality, target_gen_quality)
-                            quality_components.append(gen_txt_quality_loss)
+                        txt_quality_loss = F.mse_loss(
+                            quality_scores['text']['final_score'],
+                            text_quality_target
+                        )
 
-                    # Calculate average quality loss
-                    if quality_components:
-                        quality_loss = sum(quality_components) / len(quality_components)
+                        consistency_loss = F.mse_loss(
+                            quality_scores['cross_consistency'],
+                            consistency_target
+                        )
+
+                        # 组合质量损失
+                        quality_loss = img_quality_loss + txt_quality_loss + consistency_loss
                         quality_loss_sum += quality_loss.item()
+
+                        # 添加分布一致性约束 - 确保质量分数分布合理
+                        # 这将鼓励质量评估器对相似质量的特征给出相似的分数
+                        if epoch > 5:  # 在训练初期阶段跳过此损失
+                            # 使用相同缺失类型样本的质量分数方差作为正则化项
+                            reg_loss = 0.0
+
+                            # 对每种缺失类型计算质量分数分布约束
+                            for mask in [img_missing, txt_missing, complete, both_missing]:
+                                if mask.sum() > 1:  # 至少需要两个样本
+                                    # 图像质量分数方差
+                                    img_quality_var = torch.var(quality_scores['image']['final_score'][mask])
+                                    # 文本质量分数方差
+                                    txt_quality_var = torch.var(quality_scores['text']['final_score'][mask])
+                                    reg_weight = 0.05 + 0.15 * min(1.0, epoch / 5)  # 随着训练进行逐渐增加权重
+                                    reg_loss += reg_weight * (img_quality_var + txt_quality_var)
+                                    # 加权平均方差 - 鼓励同类样本质量分数一致
+                                    reg_loss += 0.2 * (img_quality_var + txt_quality_var)
+
+                            # 添加到质量损失
+                            quality_loss = quality_loss + reg_loss
 
                     # ===== 5. Collect Quality Assessment Data =====
                     if 'quality_scores' in additional_info:
@@ -767,10 +807,10 @@ class Trainer:
                             quality_scores['cross_consistency'].mean().item())
 
                     # Collect fusion weights data
-                    if 'fusion_weights' in additional_info and additional_info[
-                        'fusion_weights'] is not None:
-                        fusion_weights = additional_info['fusion_weights']
-                        fusion_weights_stats.append(fusion_weights.mean(dim=0).cpu().detach().numpy())
+                    # if 'fusion_weights' in additional_info and additional_info[
+                    #     'fusion_weights'] is not None:
+                    #     fusion_weights = additional_info['fusion_weights']
+                    #     fusion_weights_stats.append(fusion_weights.mean(dim=0).cpu().detach().numpy())
 
 
 
@@ -807,8 +847,8 @@ class Trainer:
                                         mean_loss = F.mse_loss(gen_mean, real_mean)
 
                                         # 方差匹配
-                                        real_var = torch.var(real_img_feats, dim=0)
-                                        gen_var = torch.var(gen_img_feats, dim=0)
+                                        real_var = torch.var(real_img_feats, dim=0,unbiased=False)
+                                        gen_var = torch.var(gen_img_feats, dim=0,unbiased=False)
                                         var_loss = F.mse_loss(gen_var, real_var)
 
                                         # 添加到分布损失
@@ -836,8 +876,8 @@ class Trainer:
                                         mean_loss = F.mse_loss(gen_mean, real_mean)
 
                                         # 方差匹配
-                                        real_var = torch.var(real_txt_feats, dim=0)
-                                        gen_var = torch.var(gen_txt_feats, dim=0)
+                                        real_var = torch.var(real_txt_feats, dim=0,unbiased=False)
+                                        gen_var = torch.var(gen_txt_feats, dim=0,unbiased=False)
                                         var_loss = F.mse_loss(gen_var, real_var)
 
                                         # 添加到分布损失
@@ -851,7 +891,7 @@ class Trainer:
 
                     # 添加分布损失到总损失
                     if 'distribution_loss' in locals() and distribution_loss> 0:
-                        distribution_loss_weight = 0.5  # 调整权重
+                        distribution_loss_weight = 1.0  # 调整权重
                         total_batch_loss = total_batch_loss + distribution_loss_weight * distribution_loss
                         distribution_loss_sum += distribution_loss.item()
 
@@ -930,10 +970,10 @@ class Trainer:
                 postfix_dict = {
                     "total": f"{total_batch_loss.item():.4f}",
                     "cls": f"{classification_loss.item():.4f}",
-                    "lr": f"{current_lr:.6f}",
                     "recon" : f"{reconstruction_loss:.4f}",
                     "cycle_loss":f"{cycle_loss:.4f}",
-                    "contra":f"{contrastive_loss:.4f}"
+                    "contra":f"{contrastive_loss:.4f}",
+                    "dis" : f"{distribution_loss.item():.4f}"
                 }
 
                 # 如果有质量损失，添加到显示
@@ -988,7 +1028,7 @@ class Trainer:
                 if additional_info and 'fusion_weights' in additional_info and additional_info[
                     'fusion_weights'] is not None:
                     fusion_weights = additional_info['fusion_weights']
-                    fusion_weights_stats.append(fusion_weights.mean(dim=0).cpu().detach().numpy())
+                    # fusion_weights_stats.append(fusion_weights.mean(dim=0).cpu().detach().numpy())
 
                 # Collect feature samples for analysis (limited number)
                 if batch_idx % 10 == 0 and len(all_features['missing_types']) < 1000:
@@ -1224,7 +1264,7 @@ class Trainer:
             # 使用threshold将logits转换为二值预测
             threshold = 0.5  # 与您原始代码中相同的阈值
             preds_sigmoid = torch.sigmoid(preds)
-            binary_preds = (preds > threshold).float()
+            binary_preds = (preds_sigmoid > threshold).float()
 
             try:
                 # 计算多标签准确率（元素级匹配）
@@ -1453,7 +1493,6 @@ class Trainer:
         metrics = self._compute_metrics(all_preds, all_labels)
 
         # 详细统计信息
-        # self._detailed_statistics(all_logits, all_labels, all_preds, "Overall")
         if self.is_single_label:
             # 使用Food101的详细统计函数
             self._detailed_statistics_food101(all_logits, all_labels, all_preds, "Overall")
@@ -1820,6 +1859,106 @@ class Trainer:
         except Exception as e:
             self.logger.warning(f"Failed to create fusion weights visualization: {str(e)}")
 
+    def _detailed_statistics(self, logits, labels, preds, missing_type=None, prefix=""):
+        """
+        Compute and print detailed statistics, optionally by missing_type.
+
+        Args:
+            logits: Tensor [B, C]
+            labels: Tensor [B, C]
+            preds: Tensor [B, C]
+            missing_type: Optional Tensor [B,] with values 0, 1, 2, 3
+            prefix: Logging prefix
+        """
+        import numpy as np
+        logits_np = logits.detach().cpu().numpy()
+        labels_np = labels.detach().cpu().numpy()
+        preds_np = preds.detach().cpu().numpy()
+
+        total_samples = labels_np.shape[0]
+        positive_counts = labels_np.sum(axis=0)
+        pred_counts = preds_np.sum(axis=0)
+
+        class_metrics = []
+
+        for i, genre in enumerate(GENRE_CLASS):
+            true_pos = ((preds_np[:, i] > 0.5) & (labels_np[:, i] > 0.5)).sum()
+            false_pos = ((preds_np[:, i] > 0.5) & (labels_np[:, i] <= 0.5)).sum()
+            false_neg = ((preds_np[:, i] <= 0.5) & (labels_np[:, i] > 0.5)).sum()
+            true_neg = ((preds_np[:, i] <= 0.5) & (labels_np[:, i] <= 0.5)).sum()
+
+            precision = true_pos / (true_pos + false_pos) if (true_pos + false_pos) > 0 else 0
+            recall = true_pos / (true_pos + false_neg) if (true_pos + false_neg) > 0 else 0
+            f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+            accuracy = (true_pos + true_neg) / total_samples
+
+            mean_logit = logits_np[:, i].mean()
+            pos_logit = logits_np[labels_np[:, i] > 0.5, i].mean() if (labels_np[:, i] > 0.5).any() else float('nan')
+            neg_logit = logits_np[labels_np[:, i] <= 0.5, i].mean() if (labels_np[:, i] <= 0.5).any() else float('nan')
+
+            class_metrics.append({
+                'genre': genre,
+                'pos_count': int(positive_counts[i]),
+                'pred_count': int(pred_counts[i]),
+                'accuracy': accuracy,
+                'precision': precision,
+                'recall': recall,
+                'f1': f1,
+                'mean_logit': mean_logit,
+                'pos_logit': pos_logit,
+                'neg_logit': neg_logit
+            })
+
+        self.logger.info(f"\n{prefix} Detailed Statistics:")
+        self.logger.info(f"Total samples: {total_samples}")
+        self.logger.info(f"Average labels per sample: {labels_np.sum() / total_samples:.2f}")
+        self.logger.info(f"Average predictions per sample: {preds_np.sum() / total_samples:.2f}")
+
+        # 打印类别级别统计
+        headers = ["Genre", "Pos%", "PredCnt", "Acc", "Prec", "Rec", "F1", "AvgLog", "PosLog", "NegLog"]
+        format_row = "{:12} {:6} {:8} {:6} {:6} {:6} {:6} {:7} {:7} {:7}"
+        self.logger.info(f"\nClass-level metrics [{prefix}]:")
+        self.logger.info(format_row.format(*headers))
+        for cm in sorted(class_metrics, key=lambda x: x['pos_count'], reverse=True):
+            pos_percent = cm['pos_count'] / total_samples * 100
+            self.logger.info(format_row.format(
+                cm['genre'][:12],
+                f"{pos_percent:.1f}%",
+                cm['pred_count'],
+                f"{cm['accuracy'] * 100:.2f}",
+                f"{cm['precision'] * 100:.2f}",
+                f"{cm['recall'] * 100:.2f}",
+                f"{cm['f1'] * 100:.2f}",
+                f"{cm['mean_logit']:.2f}",
+                f"{0 if np.isnan(cm['pos_logit']) else cm['pos_logit']:.2f}",
+                f"{0 if np.isnan(cm['neg_logit']) else cm['neg_logit']:.2f}",
+            ))
+
+        # 额外统计预测为0的样本数
+        zero_pred = (preds_np.sum(axis=1) == 0).sum()
+        if zero_pred > 0:
+            self.logger.info(f"\n警告: {zero_pred}个样本({zero_pred / total_samples * 100:.2f}%)没有任何正向预测!")
+
+        # 统计预测数量分布
+        pred_counts_per_sample = preds_np.sum(axis=1)
+        for i in range(min(5, int(pred_counts_per_sample.max())) + 1):
+            count = (pred_counts_per_sample == i).sum()
+            self.logger.info(f"样本有{i}个预测: {count}个 ({count / total_samples * 100:.2f}%)")
+
+        # ========== 【新增】按缺失类型分组统计 ==========
+        if missing_type is not None:
+            mt = missing_type.cpu().numpy()
+            for mtype in [0, 1, 2, 3]:
+                idx = (mt == mtype)
+                if idx.sum() == 0:
+                    continue
+                mean_logits_per_class = logits_np[idx].mean(axis=0)
+                pred_rate = preds_np[idx].sum(axis=0) / idx.sum()
+                self.logger.info(f"\n[{prefix}] MissingType={mtype} ({idx.sum()} samples):")
+                for i, genre in enumerate(GENRE_CLASS):
+                    self.logger.info(
+                        f"  {genre:12s} | MeanLogit: {mean_logits_per_class[i]:.3f} | Pred%: {pred_rate[i] * 100:.2f}%")
+
     def _detailed_statistics(self, logits, labels, preds, prefix=""):
         """计算并打印详细的预测统计信息"""
         # 转为numpy方便处理
@@ -1911,6 +2050,8 @@ class Trainer:
         for i in range(min(5, int(max(pred_counts_per_sample))) + 1):
             count = (pred_counts_per_sample == i).sum()
             self.logger.info(f"样本有{i}个预测: {count}个 ({count / total_samples * 100:.2f}%)")
+
+
 
     def _detailed_statistics_food101(self, logits, labels, preds, prefix=""):
         """计算并打印Food101数据集的详细预测统计信息"""

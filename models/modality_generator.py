@@ -302,6 +302,22 @@ class EnhancedCrossModalGenerator(nn.Module):
         if inference and generated.size(1) == 1:
             return generated.squeeze(1)  # Remove token dimension if single token
 
+        # 增加特征
+        if generated is not None and self.training:
+            # 打破弧形分布的关键步骤
+            batch_size = generated.size(0)
+
+            # 添加结构化噪声
+            noise_std = 0.03  # 调整这个值
+            structured_noise = torch.randn_like(generated) * noise_std
+
+            # 为不同样本添加不同的扰动模式
+            for i in range(batch_size):
+                random_rotation = torch.randn(generated.size(-1)) * 0.05
+                generated[i] = generated[i] + random_rotation
+
+            generated = generated + structured_noise
+
         return generated
 
     def forward(self, features, missing_type=None):
@@ -372,6 +388,19 @@ class EnhancedCrossModalGenerator(nn.Module):
                         gen_feat = self.generate(None, None, mod, inference=True)
                         generated_features[mod][b] = gen_feat
 
+                elif mt == 0:
+                    if 'text' in sample_features and sample_features['text'] is not None:
+                        img_feat = self.generate(
+                            sample_features['text'], 'text', 'image', inference=True
+                        )
+                        generated_features['image'][b] = img_feat
+                    if 'image' in sample_features and sample_features['image'] is not None:
+                        txt_feat = self.generate(
+                            sample_features['image'], 'image', 'text', inference=True
+                        )
+                        generated_features['text'][b] = txt_feat
+
+
                 # For mt == 0 (none missing), keep original features
 
         else:
@@ -394,6 +423,16 @@ class EnhancedCrossModalGenerator(nn.Module):
                 # Generate both modalities from priors
                 for mod in self.modalities:
                     generated_features[mod] = self.generate(None, None, mod)
+
+            elif mt == 0:
+                if 'text' in features and features['text'] is not None:
+                    generated_features['image'] = self.generate(
+                        features['text'], 'text', 'image'
+                    )
+                if 'image' in features and features['image'] is not None:
+                    generated_features['text'] = self.generate(
+                        features['image'], 'image', 'text'
+                    )
 
         return generated_features
 
@@ -455,23 +494,6 @@ class TransformerReconstructor(nn.Module):
 
                     self.decoders[f"{source_mod}_to_{target_mod}"] = nn.ModuleList(layers)
 
-        # Self-reconstruction paths (for complete modality samples)
-        for mod_name in self.modalities:
-            layers = []
-
-            # Add transformer layers
-            for _ in range(num_layers):
-                layers.append(TransformerEncoderLayer(
-                    fusion_dim, num_heads
-                ))
-
-            # Final projection
-            layers.append(nn.Sequential(
-                nn.LayerNorm(fusion_dim),
-                nn.Linear(fusion_dim, modality_dims[mod_name]),
-            ))
-
-            self.decoders[f"{mod_name}_to_{mod_name}"] = nn.ModuleList(layers)
 
     def reconstruct(self, features, source_modality, target_modality, source_mask=None):
         """
@@ -628,18 +650,22 @@ class EnhancedCycleGenerationModel(nn.Module):
             else:
                 features_copy[key] = None
 
-        generated_features = self.generator(features_copy, missing_type)
+        generated_features = self.generator(features_copy, missing_type)# 已修改
 
         # Combine original and generated features without modifying originals
+        # 这里疑似没啥用
         combined_features = {}
         for mod in self.modalities:
-            if mod in features and features[mod] is not None:
-                combined_features[mod] = features[mod].clone().detach()
-            elif mod in generated_features and generated_features[mod] is not None:
+            if mod in generated_features and generated_features[mod] is not None:
                 combined_features[mod] = generated_features[mod].clone().detach()
+            elif mod in features and features[mod] is not None:
+                combined_features[mod] = features[mod].clone().detach()
 
         # Phase 2: Reconstruct for cycle consistency
         reconstructed_features = self.reconstructor(combined_features)
+
+
+
 
         # Phase 3 (optional): Generate all modalities for training
         cycle_features = None
