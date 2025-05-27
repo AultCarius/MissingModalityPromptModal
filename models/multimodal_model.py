@@ -830,7 +830,7 @@ class MultimodalPromptModel(nn.Module):
             generate_all = self.training and not (is_image_missing.any() or is_text_missing.any())
 
             # Use improved batch processing in the generator
-            generated_features, reconstructed_features, cycle_features = self.modality_generator(
+            generated_features, reconstructed_features, _ = self.modality_generator(
                 gen_input,
                 missing_type,
                 generate_all=generate_all

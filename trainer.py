@@ -86,8 +86,8 @@ class Trainer:
         # Initialize loss weights for different components
         self.loss_weights = {
             'classification': 1.0,
-            'reconstruction': 0.5,
-            'cycle': 0.3,
+            'reconstruction': 3.0,
+            'cycle': 2.0,
             'contrastive': 0.2,
             'quality': 0.1
         }
@@ -622,14 +622,14 @@ class Trainer:
 
                             # === 2.3 Process complete samples (both modalities present) ===
                             # For complete samples, we can train the generator with direct reconstruction
-                            if both_modalities.any() and cycle_features:
+                            if both_modalities.any() and recon_features:
                                 # Extract original features for complete samples
                                 if 'image' in orig_features and 'text' in orig_features:
                                     img_orig = orig_features['image'][both_modalities]
                                     txt_orig = orig_features['text'][both_modalities]
 
                                     # Check which cycle features we have
-                                    for key, features in cycle_features.items():
+                                    for key, features in recon_features.items():
                                         if key == 'text_from_image' and features is not None:
                                             # Get generated text from image
                                             txt_from_img = features
@@ -666,7 +666,7 @@ class Trainer:
                             contrastive_components = []
 
                             # Only calculate contrastive loss for complete samples
-                            if both_modalities.any() and cycle_features:
+                            if both_modalities.any() and recon_features:
                                 # Original features
                                 img_orig = orig_features['image'][
                                     both_modalities] if 'image' in orig_features else None
@@ -674,8 +674,8 @@ class Trainer:
                                     both_modalities] if 'text' in orig_features else None
 
                                 # Generated features
-                                img_gen = cycle_features.get('image_from_text')
-                                txt_gen = cycle_features.get('text_from_image')
+                                img_gen = recon_features.get('image_from_text')
+                                txt_gen = recon_features.get('text_from_image')
 
                                 if img_orig is not None and txt_orig is not None and img_gen is not None and txt_gen is not None:
                                     # Prepare features for contrastive loss (flatten multi-token features)
@@ -717,46 +717,86 @@ class Trainer:
                     # ===== 质量评估器训练 =====
                     # ===== 4. Quality Assessment Loss =====
                     quality_loss = 0.0
-                    quality_components = []
 
-                    # Calculate quality assessment loss for complete samples
-                    if both_modalities.any() and 'quality_scores' in additional_info:
-                        quality_scores = additional_info['quality_scores']
+                    if quality_scores is not None and 'image' in quality_scores and 'text' in quality_scores:
+                        # 创建基于缺失类型的质量目标
+                        image_quality_target = torch.ones_like(quality_scores['image']['final_score'])
+                        text_quality_target = torch.ones_like(quality_scores['text']['final_score'])
+                        consistency_target = torch.ones_like(quality_scores['cross_consistency'])
 
-                        # For complete samples, we expect high quality
-                        target_quality = torch.ones(both_modalities.sum(), 1, device=self.device) * 0.9
+                        # 根据缺失类型调整目标质量分数
+                        # 1. 图像缺失样本
+                        img_missing = is_image_missing & (~is_text_missing)
+                        if img_missing.any():
+                            # 图像缺失时：图像质量应低，文本质量应高，一致性适中
+                            image_quality_target[img_missing] = 0.2  # 生成的图像质量低
+                            text_quality_target[img_missing] = 0.9  # 真实文本质量高
+                            consistency_target[img_missing] = 0.5  # 一致性适中
 
-                        # Get quality scores for complete samples
-                        img_quality = quality_scores['image']['final_score'][both_modalities]
-                        txt_quality = quality_scores['text']['final_score'][both_modalities]
-                        consistency = quality_scores['cross_consistency'][both_modalities]
+                        # 2. 文本缺失样本
+                        txt_missing = (~is_image_missing) & is_text_missing
+                        if txt_missing.any():
+                            # 文本缺失时：图像质量应高，文本质量应低，一致性适中
+                            image_quality_target[txt_missing] = 0.9  # 真实图像质量高
+                            text_quality_target[txt_missing] = 0.2  # 生成的文本质量低
+                            consistency_target[txt_missing] = 0.5  # 一致性适中
 
-                        # Calculate quality prediction loss
-                        img_quality_loss = F.mse_loss(img_quality, target_quality)
-                        txt_quality_loss = F.mse_loss(txt_quality, target_quality)
-                        consistency_loss = F.mse_loss(consistency, target_quality)
+                        # 3. 两个模态都缺失
+                        both_missing = is_image_missing & is_text_missing
+                        if both_missing.any():
+                            # 两个模态都缺失时：两个质量都应低，一致性低
+                            image_quality_target[both_missing] = 0.2
+                            text_quality_target[both_missing] = 0.2
+                            consistency_target[both_missing] = 0.3
 
-                        quality_components.extend([img_quality_loss, txt_quality_loss, consistency_loss])
+                        # 4. 完整样本
+                        complete = (~is_image_missing) & (~is_text_missing)
+                        if complete.any():
+                            # 完整样本：两个质量都应高，一致性高
+                            image_quality_target[complete] = 0.9
+                            text_quality_target[complete] = 0.9
+                            consistency_target[complete] = 0.9
 
-                        # For missing modality samples, generated features should have lower quality
-                        if text_only.any():
-                            # Image is missing - generated image should have lower quality
-                            gen_img_quality = quality_scores['image']['final_score'][text_only]
-                            target_gen_quality = torch.ones(text_only.sum(), 1, device=self.device) * 0.6
-                            gen_img_quality_loss = F.mse_loss(gen_img_quality, target_gen_quality)
-                            quality_components.append(gen_img_quality_loss)
+                        # 计算质量评估损失
+                        img_quality_loss = F.mse_loss(
+                            quality_scores['image']['final_score'],
+                            image_quality_target
+                        )
 
-                        if image_only.any():
-                            # Text is missing - generated text should have lower quality
-                            gen_txt_quality = quality_scores['text']['final_score'][image_only]
-                            target_gen_quality = torch.ones(image_only.sum(), 1, device=self.device) * 0.6
-                            gen_txt_quality_loss = F.mse_loss(gen_txt_quality, target_gen_quality)
-                            quality_components.append(gen_txt_quality_loss)
+                        txt_quality_loss = F.mse_loss(
+                            quality_scores['text']['final_score'],
+                            text_quality_target
+                        )
 
-                    # Calculate average quality loss
-                    if quality_components:
-                        quality_loss = sum(quality_components) / len(quality_components)
+                        consistency_loss = F.mse_loss(
+                            quality_scores['cross_consistency'],
+                            consistency_target
+                        )
+
+                        # 组合质量损失
+                        quality_loss = img_quality_loss + txt_quality_loss + consistency_loss
                         quality_loss_sum += quality_loss.item()
+
+                        # 添加分布一致性约束 - 确保质量分数分布合理
+                        # 这将鼓励质量评估器对相似质量的特征给出相似的分数
+                        if epoch > 5:  # 在训练初期阶段跳过此损失
+                            # 使用相同缺失类型样本的质量分数方差作为正则化项
+                            reg_loss = 0.0
+
+                            # 对每种缺失类型计算质量分数分布约束
+                            for mask in [img_missing, txt_missing, complete, both_missing]:
+                                if mask.sum() > 1:  # 至少需要两个样本
+                                    # 图像质量分数方差
+                                    img_quality_var = torch.var(quality_scores['image']['final_score'][mask])
+                                    # 文本质量分数方差
+                                    txt_quality_var = torch.var(quality_scores['text']['final_score'][mask])
+                                    reg_weight = 0.05 + 0.15 * min(1.0, epoch / 5)  # 随着训练进行逐渐增加权重
+                                    reg_loss += reg_weight * (img_quality_var + txt_quality_var)
+                                    # 加权平均方差 - 鼓励同类样本质量分数一致
+                                    reg_loss += 0.2 * (img_quality_var + txt_quality_var)
+
+                            # 添加到质量损失
+                            quality_loss = quality_loss + reg_loss
 
                     # ===== 5. Collect Quality Assessment Data =====
                     if 'quality_scores' in additional_info:
