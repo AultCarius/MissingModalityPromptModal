@@ -334,7 +334,15 @@ class MultimodalPromptModel(nn.Module):
         )
         self.classifier = nn.Linear(fusion_dim, num_classes)
 
-        print(len(self.image_blocks),len(self.text_blocks))
+        self.image_feat_norm = nn.LayerNorm(self.image_dim)
+        self.text_feat_norm = nn.LayerNorm(self.text_dim)
+        self.base_fusion_norm = nn.LayerNorm(fusion_dim)
+        self.quality_fusion_norm = nn.LayerNorm(fusion_dim)
+
+        # 为图像特征使用较小的初始权重，抑制其影响
+        self.image_feat_norm.weight.data.fill_(0.8)  # 默认是1.0
+        # 为文本特征使用较大的初始权重，增强其影响
+        self.text_feat_norm.weight.data.fill_(1.2)  # 默认是1.0
 
         # 冻结预训练参数（如果需要）
         if freeze_image_encoder:
@@ -804,8 +812,8 @@ class MultimodalPromptModel(nn.Module):
             'text': ~text_is_zeros.unsqueeze(1).expand(-1, token_count)
         }
 
-        should_analyze = (torch.rand(1).item() < 0.01)  # 1% chance to analyze
-        if should_analyze:
+        should_analyze_gen = (torch.rand(1).item() < 0.01)  # 1% chance to analyze
+        if should_analyze_gen:
             self.analyze_feature_distributions(
                 original_features,
                 None,  # No generated features yet
@@ -837,7 +845,7 @@ class MultimodalPromptModel(nn.Module):
             )
 
         # Analyze features after generation
-        if should_analyze:
+        if should_analyze_gen:
             self.analyze_feature_distributions(
                 original_features,
                 generated_features,
@@ -953,7 +961,7 @@ class MultimodalPromptModel(nn.Module):
 
         # 1. 在提取特征后，分析原始特征分布
         # 创建一个随机采样检查标志，避免分析所有批次
-        should_analyze = (torch.rand(1).item() < 0.001)  # 1%的批次进行分析
+        should_analyze = (torch.rand(1).item() < 0.01)  # 1%的批次进行分析
         shoule_analyze_fusion = (torch.rand(1).item() < 0.01)
         # 特征分布分析
         if should_analyze and image_embed is not None and text_embed is not None:
@@ -1152,8 +1160,8 @@ class MultimodalPromptModel(nn.Module):
         image_feat = image_embed[:, 0]  # [B, D_img]
         text_feat = text_embed[:, 0]  # [B, D_txt]
 
-        image_feat_norm = F.layer_norm(image_feat, image_feat.shape[1:])
-        text_feat_norm = F.layer_norm(text_feat, text_feat.shape[1:])
+        image_feat_norm = self.image_feat_norm(image_feat)
+        text_feat_norm = self.text_feat_norm(text_feat)
 
         # 收集模态特征用于epoch分析（在训练时且随机采样）
         if self.training and hasattr(self, 'fusion_analyzer') and self.fusion_analyzer is not None:
@@ -1234,9 +1242,8 @@ class MultimodalPromptModel(nn.Module):
         hidden = None
         if quality_guided_feat is not None:
 
-            # 或方法2: 使用LayerNorm
-            base_norm = F.layer_norm(base_hidden, base_hidden.shape[1:])
-            quality_norm = F.layer_norm(quality_guided_feat, quality_guided_feat.shape[1:])
+            base_norm = self.base_fusion_norm(base_hidden)
+            quality_norm = self.quality_fusion_norm(quality_guided_feat)
             alpha = 0.0  # Fixed weight or learnable parameter
             if should_analyze:
                 self.analyze_features_at_key_points("再次归一化后.前者为base_norm,后者为qualitu_norm", base_norm.detach(), quality_norm.detach())
@@ -1268,6 +1275,12 @@ class MultimodalPromptModel(nn.Module):
                 'text': is_text_missing  # Mask indicating which texts were generated
             }
         })
+
+        if should_analyze:  # 每5个epoch检查一次
+            print(f"Image LayerNorm weights: {self.image_feat_norm.weight.mean().item():.4f}")
+            print(f"Text LayerNorm weights: {self.text_feat_norm.weight.mean().item():.4f}")
+            print(f"Image LayerNorm weights: {self.base_fusion_norm.weight.mean().item():.4f}")
+            print(f"Text LayerNorm weights: {self.quality_fusion_norm.weight.mean().item():.4f}")
 
         return (logits, additional_info)
 

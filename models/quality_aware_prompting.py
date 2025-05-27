@@ -747,7 +747,7 @@ class QualityAwareFeatureFusion(nn.Module):
 
         # 基于质量的加权平均
         weighted_img = img_proj * quality_scores['image']['final_score']
-        weighted_txt = txt_proj * quality_scores['text']['final_score']
+        weighted_txt = txt_proj * quality_scores['text']['final_score'] * 1.5
 
         if log_details:
             print(f"Weighted features: img={weighted_img.mean().item():.6f}, txt={weighted_txt.mean().item():.6f}")

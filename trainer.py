@@ -974,7 +974,7 @@ class Trainer:
 
                     # 添加分布损失到总损失
                     if 'distribution_loss' in locals() and distribution_loss> 0:
-                        distribution_loss_weight = 0.5  # 调整权重
+                        distribution_loss_weight = 1.0  # 调整权重
                         total_batch_loss = total_batch_loss + distribution_loss_weight * distribution_loss
                         distribution_loss_sum += distribution_loss.item()
 
@@ -1052,10 +1052,10 @@ class Trainer:
                 postfix_dict = {
                     "total": f"{total_batch_loss.item():.4f}",
                     "cls": f"{classification_loss.item():.4f}",
-                    "lr": f"{current_lr:.6f}",
                     "recon" : f"{reconstruction_loss:.4f}",
                     "cycle_loss":f"{cycle_loss:.4f}",
-                    "contra":f"{contrastive_loss:.4f}"
+                    "contra":f"{contrastive_loss:.4f}",
+                    "dis" : f"{distribution_loss.item():.4f}"
                 }
 
                 # 如果有质量损失，添加到显示
