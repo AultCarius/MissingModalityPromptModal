@@ -1,995 +1,754 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
+import numpy as np
+import random
+from typing import Dict, Tuple, List, Optional, Union, Any
 
 
-class ResidualBlock(nn.Module):
-    """Enhanced residual block with normalization and dropout"""
+class EncoderBlock(nn.Module):
+    """
+    Encoder block for cross-modal generation
+    """
 
-    def __init__(self, dim, dropout=0.1, use_layer_norm=True):
+    def __init__(self, input_dim, hidden_dim):
         super().__init__()
-        self.use_layer_norm = use_layer_norm
-        if use_layer_norm:
-            self.norm = nn.LayerNorm(dim)
-
         self.layers = nn.Sequential(
-            nn.Linear(dim, dim * 2),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(dim * 2, dim),
-            nn.Dropout(dropout)
-        )
-
-        # Initialize with smaller weights for stability
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_normal_(m.weight, gain=0.5)
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-
-    def forward(self, x):
-        if self.use_layer_norm:
-            return x + self.layers(self.norm(x))
-        return x + self.layers(x)
-
-
-class SelfAttentionBlock(nn.Module):
-    """Self-attention block for capturing long-range dependencies"""
-
-    def __init__(self, dim, num_heads=8, dropout=0.1):
-        super().__init__()
-        self.norm = nn.LayerNorm(dim)
-        self.attention = nn.MultiheadAttention(
-            embed_dim=dim,
-            num_heads=num_heads,
-            dropout=dropout,
-            batch_first=True
-        )
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x):
-        x_norm = self.norm(x)
-        attn_out, _ = self.attention(x_norm, x_norm, x_norm)
-        return x + self.dropout(attn_out)
-
-
-class FeatureDiscriminator(nn.Module):
-    """Discriminator for adversarial training to improve generation quality"""
-
-    def __init__(self, feature_dim, hidden_dim=256, use_spectral_norm=True):
-        super().__init__()
-
-        # Spectral normalization helps stabilize GAN training
-        norm_fn = nn.utils.spectral_norm if use_spectral_norm else lambda x: x
-
-        self.main = nn.Sequential(
-            norm_fn(nn.Linear(feature_dim, hidden_dim)),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Dropout(0.3),
-
-            norm_fn(nn.Linear(hidden_dim, hidden_dim // 2)),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Dropout(0.3),
-
-            norm_fn(nn.Linear(hidden_dim // 2, hidden_dim // 4)),
-            nn.LeakyReLU(0.2, inplace=True),
-
-            nn.Linear(hidden_dim // 4, 1)
-        )
-
-        # Initialize weights for better gradient flow
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.kaiming_normal_(m.weight, a=0.2)
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-
-    def forward(self, x):
-        # For multi-token features, average across tokens
-        if x.dim() > 2:
-            x = x.mean(dim=1)  # [batch_size, tokens, dim] -> [batch_size, dim]
-
-        return self.main(x)
-
-
-class ImprovedModalGenerator(nn.Module):
-    """Enhanced cross-modal generator with advanced architecture and training techniques"""
-
-    def __init__(self, modality_dims, fusion_hidden_dim=512, num_blocks=3):
-        """
-        Initialize improved cross-modal generator
-
-        Args:
-            modality_dims: Dictionary mapping modality names to feature dimensions
-                           e.g., {'image': 768, 'text': 512}
-            fusion_hidden_dim: Hidden dimension for fusion layers
-            num_blocks: Number of residual blocks in encoders and generators
-        """
-        super().__init__()
-        self.modality_dims = modality_dims
-        self.modalities = list(modality_dims.keys())
-        self.fusion_hidden_dim = fusion_hidden_dim
-
-        # Create enhanced encoders for each modality
-        self.encoders = nn.ModuleDict({
-            mod_name: self._build_encoder(dim, fusion_hidden_dim, num_blocks)
-            for mod_name, dim in modality_dims.items()
-        })
-
-        # Create enhanced generators for each modality pair
-        self.generators = nn.ModuleDict()
-        for source_mod in self.modalities:
-            for target_mod in self.modalities:
-                if source_mod != target_mod:
-                    self.generators[f"{source_mod}_to_{target_mod}"] = self._build_generator(
-                        fusion_hidden_dim,
-                        modality_dims[target_mod],
-                        num_blocks + (1 if source_mod == 'text' and target_mod == 'image' else 0)
-                        # Extra capacity for text→image
-                    )
-
-        # Create prior generators for when both modalities are missing
-        self.prior_generators = nn.ModuleDict({
-            mod_name: self._build_prior_generator(dim, fusion_hidden_dim)
-            for mod_name, dim in modality_dims.items()
-        })
-
-        # Create discriminators for adversarial training
-        self.discriminators = nn.ModuleDict({
-            mod_name: FeatureDiscriminator(dim)
-            for mod_name, dim in modality_dims.items()
-        })
-
-        # Create distribution statistics trackers
-        self.register_buffer('image_mean', torch.zeros(modality_dims['image']))
-        self.register_buffer('image_std', torch.ones(modality_dims['image']))
-        self.register_buffer('text_mean', torch.zeros(modality_dims['text']))
-        self.register_buffer('text_std', torch.ones(modality_dims['text']))
-
-        # Reference embeddings for prototype-based generation
-        self.register_buffer('image_prototypes', torch.zeros(10, modality_dims['image']))
-        self.register_buffer('text_prototypes', torch.zeros(10, modality_dims['text']))
-
-        # Track training statistics
-        self.register_buffer('steps', torch.tensor(0))
-
-        # Initialize mixup coefficients for feature interpolation
-        self.alpha = 0.2
-
-        # Initialize with smaller weights
-        self._init_weights()
-
-    def _init_weights(self):
-        """Initialize weights with smaller values for stability"""
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight, gain=0.5)
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-
-    def _build_encoder(self, input_dim, hidden_dim, num_blocks):
-        """Build an enhanced encoder with residual connections and normalization"""
-        layers = [
             nn.LayerNorm(input_dim),
             nn.Linear(input_dim, hidden_dim),
             nn.GELU(),
-            nn.Dropout(0.1)
-        ]
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
 
-        # Add residual blocks
-        for _ in range(num_blocks):
-            layers.append(ResidualBlock(hidden_dim))
+    def forward(self, x):
+        return self.layers(x)
 
-        # Add self-attention for tokens if needed
-        layers.append(SelfAttentionBlock(hidden_dim))
-        layers.append(nn.LayerNorm(hidden_dim))
 
-        return nn.Sequential(*layers)
+class DecoderBlock(nn.Module):
+    """
+    Decoder block for cross-modal generation
+    """
 
-    def _build_generator(self, input_dim, output_dim, num_blocks):
-        """Build an enhanced generator with residual connections"""
-        layers = [
+    def __init__(self, input_dim, output_dim, hidden_dim=None):
+        super().__init__()
+        if hidden_dim is None:
+            hidden_dim = input_dim * 2
+
+        self.layers = nn.Sequential(
             nn.LayerNorm(input_dim),
-            nn.Linear(input_dim, input_dim * 2),
-            nn.GELU(),
-            nn.Dropout(0.1)
-        ]
-
-        # Add residual blocks
-        for i in range(num_blocks):
-            layers.append(ResidualBlock(input_dim * 2, dropout=0.1))
-
-        # Add self-attention for better coherence
-        layers.append(SelfAttentionBlock(input_dim * 2))
-
-        # Output projection
-        layers.extend([
-            nn.LayerNorm(input_dim * 2),
-            nn.Linear(input_dim * 2, input_dim),
-            nn.GELU(),
-            nn.Linear(input_dim, output_dim),
-        ])
-
-        return nn.Sequential(*layers)
-
-    def _build_prior_generator(self, output_dim, hidden_dim):
-        """Build a generator that creates features from noise"""
-        return nn.Sequential(
-            nn.Linear(256, hidden_dim * 2),
-            nn.LayerNorm(hidden_dim * 2),
+            nn.Linear(input_dim, hidden_dim),
             nn.GELU(),
             nn.Dropout(0.1),
-            ResidualBlock(hidden_dim * 2),
-            ResidualBlock(hidden_dim * 2),
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
             nn.Linear(hidden_dim, output_dim)
         )
 
-    def update_distribution_statistics(self, features):
-        """Update running statistics of feature distributions"""
-        with torch.no_grad():
-            # Update for each modality if features are available
-            for mod in self.modalities:
-                if mod in features and features[mod] is not None:
-                    feat = features[mod]
+    def forward(self, x):
+        return self.layers(x)
 
-                    # For multi-token features, average across tokens
-                    if feat.dim() > 2:
-                        feat = feat.mean(dim=1)
 
-                    # Compute batch statistics
-                    batch_mean = feat.mean(dim=0)
-                    batch_std = feat.std(dim=0) + 1e-6  # Add epsilon to avoid division by zero
+class ModalityEncoder(nn.Module):
+    """
+    Encodes a modality into a shared latent space
+    """
 
-                    # Update running statistics with momentum
-                    momentum = min(0.9, (1.0 + self.steps.item()) / (10.0 + self.steps.item()))
+    def __init__(self, modality_dim, latent_dim, hidden_dim=None):
+        super().__init__()
+        if hidden_dim is None:
+            hidden_dim = modality_dim * 2
 
-                    if mod == 'image':
-                        self.image_mean = momentum * self.image_mean + (1 - momentum) * batch_mean
-                        self.image_std = momentum * self.image_std + (1 - momentum) * batch_std
-                    elif mod == 'text':
-                        self.text_mean = momentum * self.text_mean + (1 - momentum) * batch_mean
-                        self.text_std = momentum * self.text_std + (1 - momentum) * batch_std
+        self.encoder = EncoderBlock(modality_dim, hidden_dim)
+        self.projector = nn.Linear(hidden_dim, latent_dim)
 
-            # Increment step counter
-            self.steps += 1
+    def forward(self, x):
+        # Handle 3D tensors (batch_size, token_count, dim)
+        if x.dim() == 3:
+            batch_size, token_count, dim = x.shape
+            # Process each token separately
+            hidden = self.encoder(x.view(-1, dim)).view(batch_size, token_count, -1)
+            # Average over tokens
+            hidden = hidden.mean(dim=1)
+        else:
+            hidden = self.encoder(x)
 
-    def update_prototypes(self, features, missing_type):
-        """Update prototype features for each modality"""
-        with torch.no_grad():
-            # Get real features only
-            for mod in self.modalities:
-                if mod in features and features[mod] is not None:
-                    # Skip missing modalities
-                    if mod == 'image':
-                        real_mask = ~((missing_type == 1) | (missing_type == 3))
-                    elif mod == 'text':
-                        real_mask = ~((missing_type == 2) | (missing_type == 3))
-                    else:
-                        continue
+        latent = self.projector(hidden)
+        return latent
 
-                    if not real_mask.any():
-                        continue
 
-                    real_features = features[mod][real_mask]
+class ModalityDecoder(nn.Module):
+    """
+    Decodes from latent space back to a modality
+    """
 
-                    # For multi-token features, average across tokens
-                    if real_features.dim() > 2:
-                        real_features = real_features.mean(dim=1)
+    def __init__(self, latent_dim, modality_dim, hidden_dim=None, output_tokens=1):
+        super().__init__()
+        if hidden_dim is None:
+            hidden_dim = modality_dim * 2
 
-                    # Update prototypes with reservoir sampling
-                    num_prototypes = 10
-                    num_real = real_features.size(0)
+        self.decoder = DecoderBlock(latent_dim, hidden_dim)
+        self.projector = nn.Linear(hidden_dim, modality_dim * output_tokens)
+        self.output_tokens = output_tokens
+        self.modality_dim = modality_dim
 
-                    if num_real == 0:
-                        continue
+    def forward(self, z):
+        hidden = self.decoder(z)
+        output = self.projector(hidden)
 
-                    for i in range(min(num_real, num_prototypes)):
-                        # Simple update using the current batch
-                        prototype_tensor = getattr(self, f"{mod}_prototypes")
-                        momentum = 0.9
-                        prototype_tensor[i] = momentum * prototype_tensor[i] + (1 - momentum) * real_features[
-                            i % num_real]
+        # Reshape to handle multiple tokens if needed
+        if self.output_tokens > 1:
+            output = output.view(output.size(0), self.output_tokens, self.modality_dim)
 
-    def normalize_features(self, features, modality):
-        """Normalize features using stored statistics"""
-        if modality == 'image':
-            return (features - self.image_mean) / (self.image_std + 1e-6)
-        elif modality == 'text':
-            return (features - self.text_mean) / (self.text_std + 1e-6)
-        return features
+        return output
 
-    def denormalize_features(self, features, modality):
-        """Denormalize features using stored statistics"""
-        if modality == 'image':
-            return features * self.image_std + self.image_mean
-        elif modality == 'text':
-            return features * self.text_std + self.text_mean
-        return features
 
-    def encode(self, features, modality):
-        """Encode features of a specific modality to the shared space"""
+class Discriminator(nn.Module):
+    """
+    Discriminator for adversarial training that determines if a feature is real or generated
+    """
+
+    def __init__(self, feature_dim, hidden_dim=None):
+        super().__init__()
+        if hidden_dim is None:
+            hidden_dim = feature_dim // 2
+            hidden_dim = max(64, hidden_dim)  # Ensure minimum size
+
+        self.layers = nn.Sequential(
+            nn.LayerNorm(feature_dim),
+            nn.Linear(feature_dim, hidden_dim),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(0.3),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(0.3),
+            nn.Linear(hidden_dim // 2, 1)
+        )
+
+    def forward(self, x):
+        # For 3D input, average over tokens
+        if x.dim() == 3:
+            x = x.mean(dim=1)
+
+        return self.layers(x)
+
+
+class CrossModalGenerator(nn.Module):
+    """
+    Generator for cross-modality feature generation
+    """
+
+    def __init__(self, source_dim, target_dim, latent_dim=None, hidden_dim=None, output_tokens=1):
+        super().__init__()
+        if latent_dim is None:
+            latent_dim = min(source_dim, target_dim)
+
+        if hidden_dim is None:
+            hidden_dim = max(source_dim, target_dim)
+
+        self.encoder = ModalityEncoder(source_dim, latent_dim, hidden_dim)
+        self.decoder = ModalityDecoder(latent_dim, target_dim, hidden_dim, output_tokens)
+
+    def forward(self, x):
+        z = self.encoder(x)
+        y = self.decoder(z)
+        return y
+
+
+class CycleGenerationModel(nn.Module):
+    """
+    Improved cycle generation model for cross-modal feature generation and reconstruction
+    """
+
+    def __init__(
+            self,
+            modality_dims: Dict[str, int],
+            latent_dim: Optional[int] = None,
+            fusion_hidden_dim: Optional[int] = None,
+            output_tokens: int = 5,
+            noise_level: float = 0.1,
+            use_gan: bool = True
+    ):
+        super().__init__()
+
+        self.modality_dims = modality_dims
+        self.modalities = list(modality_dims.keys())
+        self.output_tokens = output_tokens
+        self.noise_level = noise_level
+        self.use_gan = use_gan
+
+        # Set latent dimension to be the minimum of modality dimensions
+        if latent_dim is None:
+            latent_dim = min(modality_dims.values())
+        self.latent_dim = latent_dim
+
+        # Set hidden dimension for fusion
+        if fusion_hidden_dim is None:
+            fusion_hidden_dim = max(modality_dims.values()) * 2
+        self.fusion_hidden_dim = fusion_hidden_dim
+
+        # Create generators for each modality pair
+        self.generators = nn.ModuleDict()
+        for source in self.modalities:
+            for target in self.modalities:
+                if source != target:
+                    self.generators[f"{source}2{target}"] = CrossModalGenerator(
+                        modality_dims[source],
+                        modality_dims[target],
+                        latent_dim,
+                        fusion_hidden_dim,
+                        output_tokens
+                    )
+
+        # Create reconstructor modules for cycle consistency
+        self.reconstructor = FeatureReconstructor(
+            modality_dims,
+            fusion_hidden_dim,
+            output_tokens
+        )
+
+        # Create discriminators for GAN training if enabled
+        if use_gan:
+            self.discriminators = nn.ModuleDict()
+            for modality in self.modalities:
+                self.discriminators[modality] = Discriminator(
+                    modality_dims[modality],
+                    fusion_hidden_dim // 2
+                )
+
+        # Training parameters
+        self.gan_weight = 0.3
+        self.cycle_weight = 1.0
+        self.identity_weight = 0.5
+
+        # For tracking statistics
+        self.register_buffer('gen_count', torch.zeros(1))
+        self.register_buffer('cycle_loss_avg', torch.zeros(1))
+
+    def generate(self, features, source_modality, target_modality, add_noise=True):
+        """
+        Generate features for target modality from source modality
+
+        Args:
+            features: Source modality features
+            source_modality: Source modality name (e.g., 'image', 'text')
+            target_modality: Target modality name
+            add_noise: Whether to add noise to the generated features
+
+        Returns:
+            Generated features for target modality
+        """
         if features is None:
             return None
 
-        # Handle multi-token features
-        if features.dim() > 2:  # [batch_size, tokens, dim]
-            batch_size, token_count, feat_dim = features.shape
+        # Get the appropriate generator
+        generator = self.generators.get(f"{source_modality}2{target_modality}")
+        if generator is None:
+            raise ValueError(f"No generator for {source_modality} to {target_modality}")
 
-            # Process each token through the encoder
-            features = features.view(-1, feat_dim)  # [batch_size*tokens, dim]
-            encoded = self.encoders[modality](features)
-            return encoded.view(batch_size, token_count, -1)  # [batch_size, tokens, hidden_dim]
-        else:
-            return self.encoders[modality](features)
+        # Shape checking and fixing for 2D vs 3D tensors
+        if features.dim() == 2 and self.output_tokens > 1:
+            # Expand to batch_size x 1 x dim
+            features = features.unsqueeze(1)
 
-    def generate(self, source_features, source_modality, target_modality, add_noise=True, temperature=1.0):
-        """Generate features of target modality from source modality features"""
-        # Check if source features are zeros or None
-        is_zeros = False
-        if source_features is not None:
-            is_zeros = torch.sum(torch.abs(source_features)) < 1e-6
-
-        if source_features is None or is_zeros:
-            # Use prototype-based generation with noise
-            batch_size = 1
-            if source_features is not None:
-                batch_size = source_features.size(0) if source_features.dim() > 1 else 1
-
-            # Generate from noise with prototype guidance
-            noise = torch.randn(batch_size, 256, device=self.image_mean.device)
-            raw_features = self.prior_generators[target_modality](noise)
-
-            # Add prototype information for more realistic features
-            prototype_idx = torch.randint(0, 10, (batch_size,), device=self.image_mean.device)
-            prototypes = getattr(self, f"{target_modality}_prototypes")[prototype_idx]
-
-            # Mix noise-based features with prototype features
-            mix_ratio = torch.rand(batch_size, 1, device=self.image_mean.device) * 0.7 + 0.15  # Between 0.15 and 0.85
-            if raw_features.dim() > 2 and prototypes.dim() < 3:
-                # Expand prototypes to match token dimension
-                prototypes = prototypes.unsqueeze(1).expand(-1, raw_features.size(1), -1)
-                mix_ratio = mix_ratio.unsqueeze(1)
-
-            mixed_features = mix_ratio * raw_features + (1 - mix_ratio) * prototypes
-            # Add small random variations to prototypes for diversity
-            prototype_noise = torch.randn_like(prototypes) * 0.05
-            mixed_features = mix_ratio * raw_features + (1 - mix_ratio) * (prototypes + prototype_noise)
-
-            # Apply denormalization to match the feature distribution
-            return self.denormalize_features(mixed_features, target_modality)
-
-        # Encode source features
-        encoded = self.encode(source_features, source_modality)
-
-        # Apply temperature scaling for controlled diversity
-        if temperature != 1.0:
-            encoded = encoded / temperature
-
-        # Generate target features
-        generator = self.generators[f"{source_modality}_to_{target_modality}"]
+        # Generate features
+        encoded = features
         generated = generator(encoded)
 
-        # Add controlled noise for diversity and robustness - adaptive noise level
-        if add_noise:
-            # Adaptive noise schedule based on training progress and feature magnitude
-            base_noise_level = 0.05  # Increased base noise level
-            decay_factor = 1000  # Controls noise decay rate with training
-            noise_level = base_noise_level * (1.0 - math.exp(-self.steps.item() / decay_factor))
-
-            # Scale noise by feature magnitude for balanced effect
-            feature_magnitude = generated.abs().mean().item()
-            scaled_noise_level = noise_level * min(1.0, feature_magnitude * 2)
-
-            # Generate noise and apply to features
-            noise = torch.randn_like(generated) * scaled_noise_level
+        # Apply random noise if requested
+        if add_noise and self.training:
+            noise_scale = self.noise_level * torch.rand(1, device=generated.device)
+            noise = torch.randn_like(generated) * noise_scale
+            # Add noise without in-place operation
             generated = generated + noise
-
-        # Apply feature statistics to match distribution
-        if self.steps.item() > 50:  # Reduced burn-in period
-            generated = self.denormalize_features(generated, target_modality)
 
         return generated
 
     def forward(self, features, missing_type):
         """
-        Forward pass for feature generation based on missing modalities
+        Forward pass for the cycle generation model
 
         Args:
             features: Dictionary of features for each modality
-            missing_type: Integer or tensor indicating missing modality type
-                         (0=none, 1=image, 2=text, 3=both)
+            missing_type: Type of missing modality (0=none, 1=image, 2=text, 3=both)
 
         Returns:
-            Tuple of (generated_features, reconstructed_features, aux_outputs)
-            - generated_features: Dictionary of generated features
-            - reconstructed_features: Dictionary of reconstructed features
-            - aux_outputs: Additional outputs for training (discriminator scores, etc.)
+            tuple (generated_features, reconstructed_features, auxiliary_outputs)
         """
-        # Process single sample vs. batch
-        batch_mode = isinstance(missing_type, torch.Tensor) and missing_type.dim() > 0
+        # Convert single-value missing_type to batch tensor if needed
+        if isinstance(missing_type, int):
+            missing_type = torch.full((1,), missing_type, device=next(self.parameters()).device)
 
-        if not batch_mode:
-            # Process single sample
-            missing_type = int(missing_type)
-            generated, reconstructed, aux_outputs = self._generate_for_sample(features, missing_type)
-            return generated, reconstructed, aux_outputs
-        else:
-            # Process batch
-            batch_size = missing_type.size(0)
-            device = missing_type.device
+        batch_size = missing_type.size(0)
+        device = missing_type.device
 
-            # Update distribution statistics if in training mode
-            if self.training:
-                # Create copies to avoid modifying input tensors
-                feature_copies = {}
-                for mod, feat in features.items():
-                    if feat is not None:
-                        feature_copies[mod] = feat.clone().detach()
-                    else:
-                        feature_copies[mod] = None
+        # Dictionary to store generated features
+        generated_features = {modality: None for modality in self.modalities}
 
-                self.update_distribution_statistics(feature_copies)
-                self.update_prototypes(feature_copies, missing_type)
+        # Dictionary to store reconstructed features
+        reconstructed_features = {modality: None for modality in self.modalities}
 
-            # Initialize output dictionaries with empty lists
-            generated_features = {mod: [] for mod in self.modality_dims.keys()}
-            reconstructed_features = {mod: [] for mod in self.modality_dims.keys()}
-
-            # Initialize auxiliary outputs
-            aux_outputs = {
-                'disc_real_scores': {mod: [] for mod in self.modality_dims.keys()},
-                'disc_fake_scores': {mod: [] for mod in self.modality_dims.keys()},
-                'distribution_loss': 0.0,
-                'cycle_consistency_loss': 0.0
-            }
-
-            # Process each sample individually to avoid in-place issues
-            for b in range(batch_size):
-                # Extract features for this sample
-                sample_features = {}
-                for mod in features:
-                    if features[mod] is not None:
-                        # Clone to prevent in-place modifications
-                        if features[mod].dim() > 1:
-                            sample_features[mod] = features[mod][b:b + 1].clone()
-                        else:
-                            sample_features[mod] = features[mod].unsqueeze(0).clone()
-                    else:
-                        sample_features[mod] = None
-
-                # Generate for this sample
-                mt = missing_type[b].item()
-                gen_sample, recon_sample, sample_aux = self._generate_for_sample(sample_features, mt)
-
-                # Collect generated features
-                for mod in gen_sample:
-                    if gen_sample[mod] is not None:
-                        generated_features[mod].append(gen_sample[mod])
-
-                # Collect reconstructed features
-                for mod in recon_sample:
-                    if recon_sample[mod] is not None:
-                        reconstructed_features[mod].append(recon_sample[mod])
-
-                # Accumulate auxiliary outputs
-                for mod in self.modality_dims.keys():
-                    if 'disc_real_scores' in sample_aux and mod in sample_aux['disc_real_scores']:
-                        aux_outputs['disc_real_scores'][mod].append(sample_aux['disc_real_scores'][mod])
-                    if 'disc_fake_scores' in sample_aux and mod in sample_aux['disc_fake_scores']:
-                        aux_outputs['disc_fake_scores'][mod].append(sample_aux['disc_fake_scores'][mod])
-
-                # Accumulate scalar losses (divide by batch_size at the end)
-                if 'distribution_loss' in sample_aux:
-                    aux_outputs['distribution_loss'] += sample_aux['distribution_loss'] / batch_size
-                if 'cycle_consistency_loss' in sample_aux:
-                    aux_outputs['cycle_consistency_loss'] += sample_aux['cycle_consistency_loss'] / batch_size
-
-            # Convert lists to tensors for each modality
-            for mod in self.modality_dims.keys():
-                # Process generated features
-                if generated_features[mod]:
-                    # Check if all tensors have the same shape
-                    shapes = [t.shape for t in generated_features[mod]]
-                    if all(s == shapes[0] for s in shapes):
-                        # If shapes match, concatenate along batch dimension
-                        generated_features[mod] = torch.cat(generated_features[mod], dim=0)
-                    else:
-                        # If shapes don't match, keep as list
-                        pass
-                else:
-                    generated_features[mod] = None
-
-                # Process reconstructed features
-                if reconstructed_features[mod]:
-                    # Check if all tensors have the same shape
-                    shapes = [t.shape for t in reconstructed_features[mod]]
-                    if all(s == shapes[0] for s in shapes):
-                        # If shapes match, concatenate along batch dimension
-                        reconstructed_features[mod] = torch.cat(reconstructed_features[mod], dim=0)
-                    else:
-                        # If shapes don't match, keep as list
-                        pass
-                else:
-                    reconstructed_features[mod] = None
-
-                # Process discriminator scores
-                if aux_outputs['disc_real_scores'][mod]:
-                    # Check if all tensors have the same shape
-                    shapes = [t.shape for t in aux_outputs['disc_real_scores'][mod]]
-                    if all(s == shapes[0] for s in shapes):
-                        # If shapes match, concatenate along batch dimension
-                        aux_outputs['disc_real_scores'][mod] = torch.cat(aux_outputs['disc_real_scores'][mod], dim=0)
-                    else:
-                        # If shapes don't match, keep as list
-                        pass
-                else:
-                    aux_outputs['disc_real_scores'][mod] = None
-
-                if aux_outputs['disc_fake_scores'][mod]:
-                    # Check if all tensors have the same shape
-                    shapes = [t.shape for t in aux_outputs['disc_fake_scores'][mod]]
-                    if all(s == shapes[0] for s in shapes):
-                        # If shapes match, concatenate along batch dimension
-                        aux_outputs['disc_fake_scores'][mod] = torch.cat(aux_outputs['disc_fake_scores'][mod], dim=0)
-                    else:
-                        # If shapes don't match, keep as list
-                        pass
-                else:
-                    aux_outputs['disc_fake_scores'][mod] = None
-
-            return generated_features, reconstructed_features, aux_outputs
-
-    def _generate_for_sample(self, features, missing_type):
-        """Generate features for a single sample based on missing type"""
-        token_count = 1  # Number of tokens to use
-        device = next(self.parameters()).device
-
-        # Prepare features and handle multi-token case
-        processed_features = {}
-        for mod in self.modality_dims.keys():
-            if mod in features and features[mod] is not None:
-                feat = features[mod]
-
-                # Handle different input shapes
-                if feat.dim() == 1:  # Single vector
-                    processed_features[mod] = feat.unsqueeze(0).clone()  # [1, dim]
-                elif feat.dim() == 2:
-                    if feat.size(0) == 1:  # Already [1, dim]
-                        processed_features[mod] = feat.clone()
-                    else:  # [tokens, dim] - take first token_count tokens
-                        processed_features[mod] = feat[:token_count].unsqueeze(0).clone()  # [1, tokens, dim]
-                elif feat.dim() == 3:  # [batch(1), tokens, dim]
-                    # Take first token_count tokens
-                    token_len = min(feat.size(1), token_count)
-                    processed_features[mod] = feat[:, :token_len].clone()
-                else:
-                    raise ValueError(f"Unexpected feature shape: {feat.shape}")
-            else:
-                processed_features[mod] = None
-
-        # Initialize outputs
-        generated = {mod: (processed_features[mod].clone() if processed_features[mod] is not None else None)
-                     for mod in self.modality_dims.keys()}
-
-        # Additional outputs for training
+        # Auxiliary outputs for loss computation
         aux_outputs = {
-            'disc_real_scores': {},
-            'disc_fake_scores': {},
-            'distribution_loss': 0.0,
-            'cycle_consistency_loss': 0.0
+            'cycle_losses': {},
+            'identity_losses': {},
+            'gan_losses': {},
+            'missing_types': missing_type.detach()
         }
 
-        # Generate missing modalities
-        if missing_type == 1:  # Image missing, text present
-            if processed_features.get("text") is not None:
-                text_feat = processed_features["text"]
-                generated["image"] = self.generate(text_feat, "text", "image")
+        # Process each sample in the batch separately to handle different missing types
+        for i in range(batch_size):
+            # Extract features for this sample
+            sample_features = {
+                modality: (None if features[modality] is None else
+                           features[modality][i:i + 1])
+                for modality in self.modalities
+            }
 
+            mt = missing_type[i].item()
 
-        elif missing_type == 2:  # Text missing, image present
-            if processed_features.get("image") is not None:
-                image_feat = processed_features["image"]
-                generated["text"] = self.generate(image_feat, "image", "text")
+            # Generate and reconstruct based on missing type
+            sample_generated, sample_reconstructed, sample_aux = self._generate_for_sample(
+                sample_features, mt
+            )
 
+            # Collect results
+            for modality in self.modalities:
+                if sample_generated[modality] is not None:
+                    if generated_features[modality] is None:
+                        # Initialize tensor with correct shape
+                        feat_shape = sample_generated[modality].shape
+                        if len(feat_shape) == 3 and feat_shape[0] == 1:
+                            # For 3D tensors [1, tokens, dim]
+                            generated_features[modality] = torch.zeros(
+                                batch_size, feat_shape[1], feat_shape[2], device=device
+                            )
+                        else:
+                            # For 2D tensors [1, dim]
+                            generated_features[modality] = torch.zeros(
+                                batch_size, feat_shape[1], device=device
+                            )
 
-        elif missing_type == 3:  # Both missing
-            # Generate both modalities from noise
-            noise = torch.randn(1, 256, device=device)
-            generated["image"] = self.generate(None, None, "image")
-            # Use the generated image to create matching text
-            generated["text"] = self.generate(generated["image"], "image", "text")
+                    # Copy generated features to the right position
+                    if len(sample_generated[modality].shape) == 3:
+                        generated_features[modality][i] = sample_generated[modality].squeeze(0)
+                    else:
+                        generated_features[modality][i] = sample_generated[modality]
 
+                # Same for reconstructed features
+                if sample_reconstructed[modality] is not None:
+                    if reconstructed_features[modality] is None:
+                        # Initialize tensor with correct shape
+                        feat_shape = sample_reconstructed[modality].shape
+                        if len(feat_shape) == 3 and feat_shape[0] == 1:
+                            # For 3D tensors [1, tokens, dim]
+                            reconstructed_features[modality] = torch.zeros(
+                                batch_size, feat_shape[1], feat_shape[2], device=device
+                            )
+                        else:
+                            # For 2D tensors [1, dim]
+                            reconstructed_features[modality] = torch.zeros(
+                                batch_size, feat_shape[1], device=device
+                            )
 
-        # Run discriminators on real features if available
-        if self.training:
-            for mod in self.modalities:
-                if processed_features.get(mod) is not None:
-                    real_feat = processed_features[mod].reshape(-1, processed_features[mod].size(-1))
-                    # Detach to ensure we don't update real features
-                    real_score = self.discriminators[mod](real_feat.detach())
-                    aux_outputs['disc_real_scores'][mod] = real_score
+                    # Copy reconstructed features to the right position
+                    if len(sample_reconstructed[modality].shape) == 3:
+                        reconstructed_features[modality][i] = sample_reconstructed[modality].squeeze(0)
+                    else:
+                        reconstructed_features[modality][i] = sample_reconstructed[modality]
 
-        # Calculate cycle consistency (reconstruction)
-        reconstructed = {}
-        cycle_loss = 0.0
+            # Collect auxiliary outputs for loss computation
+            for loss_type in ['cycle_losses', 'identity_losses', 'gan_losses']:
+                for key, value in sample_aux.get(loss_type, {}).items():
+                    if key not in aux_outputs[loss_type]:
+                        aux_outputs[loss_type][key] = []
+                    aux_outputs[loss_type][key].append(value)
 
-        if missing_type == 0:  # Both modalities present - can compute cycle consistency
-            # Image → Text → Image
-            img2txt = self.generate(processed_features["image"], "image", "text", add_noise=False)
-            txt2img = self.generate(img2txt, "text", "image", add_noise=False)
+        # Average losses across batch
+        for loss_type in ['cycle_losses', 'identity_losses', 'gan_losses']:
+            for key in list(aux_outputs[loss_type].keys()):
+                if aux_outputs[loss_type][key]:
+                    aux_outputs[loss_type][key] = sum(aux_outputs[loss_type][key]) / len(aux_outputs[loss_type][key])
+                else:
+                    del aux_outputs[loss_type][key]
 
-            # Text → Image → Text
-            txt2img = self.generate(processed_features["text"], "text", "image", add_noise=False)
-            img2txt = self.generate(txt2img, "image", "text", add_noise=False)
+        # Update statistics
+        with torch.no_grad():
+            self.gen_count += 1
+            if 'cycle_total' in aux_outputs.get('cycle_losses', {}):
+                self.cycle_loss_avg = (self.cycle_loss_avg * 0.9 +
+                                       aux_outputs['cycle_losses']['cycle_total'] * 0.1)
 
-            reconstructed["image"] = txt2img
-            reconstructed["text"] = img2txt
+        return generated_features, reconstructed_features, aux_outputs
 
-        elif missing_type == 1:  # Image missing - reconstruct text
-            if generated["image"] is not None and processed_features["text"] is not None:
-                img2txt = self.generate(generated["image"], "image", "text", add_noise=False)
-                reconstructed["text"] = img2txt
+    def _generate_for_sample(self, features, missing_type):
+        """
+        Generate and reconstruct features for a single sample
 
-        elif missing_type == 2:  # Text missing - reconstruct image
-            if generated["text"] is not None and processed_features["image"] is not None:
-                txt2img = self.generate(generated["text"], "text", "image", add_noise=False)
-                reconstructed["image"] = txt2img
+        Args:
+            features: Dictionary of features for one sample
+            missing_type: Missing modality type (0=none, 1=image, 2=text, 3=both)
 
-        # Compute distribution matching loss if training
-        if self.training:
-            dist_loss = 0.0
+        Returns:
+            tuple (generated_features, reconstructed_features, auxiliary_outputs)
+        """
+        generated = {modality: None for modality in self.modalities}
+        reconstructed = {modality: None for modality in self.modalities}
 
-            # Check if we have generated image features
-            if generated["image"] is not None and processed_features.get("image") is None:
-                gen_img = generated["image"].reshape(-1, generated["image"].size(-1))
-                # Get statistics - use prototypes as reference
-                ref_img = self.image_prototypes.mean(dim=0, keepdim=True)
-                img_dist_loss = self._distribution_matching_loss(gen_img, ref_img)
-                dist_loss = dist_loss + img_dist_loss
+        # Auxiliary outputs for loss computation
+        aux_outputs = {
+            'cycle_losses': {},
+            'identity_losses': {},
+            'gan_losses': {}
+        }
 
-            # Check if we have generated text features
-            if generated["text"] is not None and processed_features.get("text") is None:
-                gen_txt = generated["text"].reshape(-1, generated["text"].size(-1))
-                # Get statistics - use prototypes as reference
-                ref_txt = self.text_prototypes.mean(dim=0, keepdim=True)
-                txt_dist_loss = self._distribution_matching_loss(gen_txt, ref_txt)
-                dist_loss =dist_loss + txt_dist_loss
+        # Case: No missing modalities
+        if missing_type == 0:
+            # For complete samples, just pass through the reconstructor for training
+            reconstructed = self.reconstructor(features)
 
-            aux_outputs['distribution_loss'] = dist_loss
+            # Identity preservation loss (optional)
+            if self.training:
+                identity_losses = {}
+                for modality in self.modalities:
+                    other_modality = [m for m in self.modalities if m != modality][0]
+                    # Generate cross-modal and back
+                    cross_gen = self.generate(features[modality], modality, other_modality)
+                    back_gen = self.generate(cross_gen, other_modality, modality)
+
+                    # Identity loss
+                    if features[modality] is not None and back_gen is not None:
+                        identity_loss = F.mse_loss(back_gen, features[modality])
+                        identity_losses[f"{modality}_identity"] = identity_loss
+
+                if identity_losses:
+                    aux_outputs['identity_losses'] = identity_losses
+
+        # Case: Image missing
+        elif missing_type == 1 and 'image' in self.modalities and 'text' in self.modalities:
+            # Generate image from text
+            generated["image"] = self.generate(features["text"], "text", "image")
+
+            # For cycle consistency
+            if self.training:
+                # Generate text from generated image
+                cycle_text = self.generate(generated["image"], "image", "text")
+
+                # Cycle consistency loss
+                if features["text"] is not None and cycle_text is not None:
+                    cycle_loss = F.mse_loss(cycle_text, features["text"])
+                    aux_outputs['cycle_losses']["text_cycle"] = cycle_loss
+
+                # GAN loss if enabled
+                if self.use_gan and generated["image"] is not None:
+                    # Train discriminator to distinguish real from generated
+                    d_loss = self._compute_gan_loss(
+                        self.discriminators["image"],
+                        features["image"],  # None for missing modality
+                        generated["image"],
+                        is_real_batch=False
+                    )
+                    aux_outputs['gan_losses']["image_d"] = d_loss
+
+            # Reconstruct original text
+            reconstructed_input = {"image": generated["image"], "text": features["text"]}
+            reconstructed = self.reconstructor(reconstructed_input)
+
+        # Case: Text missing
+        elif missing_type == 2 and 'image' in self.modalities and 'text' in self.modalities:
+            # Generate text from image
+            generated["text"] = self.generate(features["image"], "image", "text")
+
+            # For cycle consistency
+            if self.training:
+                # Generate image from generated text
+                cycle_image = self.generate(generated["text"], "text", "image")
+
+                # Cycle consistency loss
+                if features["image"] is not None and cycle_image is not None:
+                    cycle_loss = F.mse_loss(cycle_image, features["image"])
+                    aux_outputs['cycle_losses']["image_cycle"] = cycle_loss
+
+                # GAN loss if enabled
+                if self.use_gan and generated["text"] is not None:
+                    # Train discriminator to distinguish real from generated
+                    d_loss = self._compute_gan_loss(
+                        self.discriminators["text"],
+                        features["text"],  # None for missing modality
+                        generated["text"],
+                        is_real_batch=False
+                    )
+                    aux_outputs['gan_losses']["text_d"] = d_loss
+
+            # Reconstruct original image
+            reconstructed_input = {"image": features["image"], "text": generated["text"]}
+            reconstructed = self.reconstructor(reconstructed_input)
+
+        # Case: Both modalities missing (rare edge case)
+        elif missing_type == 3:
+            # Not much we can do here except generate random features
+            # In practice, this should be rare
+            for modality in self.modalities:
+                # Create random features with appropriate dimensions
+                dim = self.modality_dims[modality]
+                if self.output_tokens > 1:
+                    generated[modality] = torch.randn(1, self.output_tokens, dim, device=next(self.parameters()).device)
+                else:
+                    generated[modality] = torch.randn(1, dim, device=next(self.parameters()).device)
+
+        # Sum up the cycle losses if any
+        if aux_outputs['cycle_losses']:
+            aux_outputs['cycle_losses']["cycle_total"] = sum(aux_outputs['cycle_losses'].values())
+
+        # Sum up the identity losses if any
+        if aux_outputs['identity_losses']:
+            aux_outputs['identity_losses']["identity_total"] = sum(aux_outputs['identity_losses'].values())
+
+        # Sum up the GAN losses if any
+        if aux_outputs['gan_losses']:
+            aux_outputs['gan_losses']["gan_total"] = sum(aux_outputs['gan_losses'].values())
 
         return generated, reconstructed, aux_outputs
 
-    def _distribution_matching_loss(self, generated, reference):
-        """Compute a loss to make generated features match reference distribution with improved diversity"""
-        # 1. Mean and variance matching - more precise distribution alignment
-        gen_mean = generated.mean(dim=0)
-        gen_var = generated.var(dim=0)
+    def _compute_gan_loss(self, discriminator, real_features, generated_features, is_real_batch=True):
+        """
+        Compute GAN loss for real or generated features
 
-        ref_mean = reference.mean(dim=0)
-        ref_var = reference.var(dim=0) + 1e-6
+        Args:
+            discriminator: Discriminator module
+            real_features: Real features (can be None)
+            generated_features: Generated features
+            is_real_batch: Whether we're processing real samples (True) or generated (False)
 
-        mean_loss = F.mse_loss(gen_mean, ref_mean)
-        var_loss = F.mse_loss(gen_var, ref_var)
+        Returns:
+            GAN loss value
+        """
+        if not self.use_gan:
+            return torch.tensor(0.0, device=next(self.parameters()).device)
 
-        # 2. Enhanced diversity regularization to prevent mode collapse
-        # Calculate feature covariance and use log-determinant as a diversity measure
-        # Higher determinant = more diverse/spread out features
-        if generated.size(0) > 1:  # Need at least 2 samples for covariance
-            # Add small identity matrix for numerical stability
-            gen_cov = torch.cov(generated.T) + torch.eye(generated.size(1), device=generated.device) * 1e-6
-            # Maximize log determinant (equivalent to minimizing negative log determinant)
-            diversity_loss = -torch.logdet(gen_cov)
+        # Skip if either is None
+        if real_features is None or generated_features is None:
+            return torch.tensor(0.0, device=next(self.parameters()).device)
 
-            # Feature correlation penalty - encourages independent features
-            gen_corr = gen_cov / (torch.sqrt(torch.diag(gen_cov).unsqueeze(0)) *
-                                  torch.sqrt(torch.diag(gen_cov).unsqueeze(1)) + 1e-6)
-            correlation_penalty = torch.norm(gen_corr - torch.eye(gen_corr.size(0), device=gen_corr.device), p='fro')
-
-            # Combined loss with balanced weights
-            return mean_loss + 0.5 * var_loss + 0.1 * diversity_loss + 0.05 * correlation_penalty
+        # Compute loss based on whether we're training on real or generated samples
+        if is_real_batch:
+            # Real samples should be classified as real (1)
+            real_pred = discriminator(real_features)
+            real_target = torch.ones_like(real_pred)
+            loss = F.binary_cross_entropy_with_logits(real_pred, real_target)
         else:
-            # Fallback for single sample
-            return mean_loss + 0.5 * var_loss
+            # Generated samples should be classified as fake (0)
+            fake_pred = discriminator(generated_features)
+            fake_target = torch.zeros_like(fake_pred)
+            loss = F.binary_cross_entropy_with_logits(fake_pred, fake_target)
 
-    def compute_generator_losses(self, real_features, generated_features, aux_outputs, missing_type):
+        return loss
+
+    def train_step(self, batch_data, optimizer):
         """
-        Compute all losses for generator training
+        Training step for the generator
 
         Args:
-            real_features: Dictionary of real features
-            generated_features: Dictionary of generated features
-            aux_outputs: Auxiliary outputs from forward pass
-            missing_type: Tensor indicating missing modality type for each sample
-
-        Returns:
-            Dictionary of loss components and total loss
-        """
-        device = next(self.parameters()).device
-        batch_size = missing_type.size(0)
-
-        # Initialize loss components
-        losses = {
-            'gen_adv_loss': 0.0,
-            'cycle_consistency_loss': aux_outputs['cycle_consistency_loss'],
-            'distribution_loss': aux_outputs['distribution_loss'],
-            'feature_matching_loss': 0.0,
-            'total_loss': 0.0
-        }
-
-        # 1. Adversarial loss for generator (fool the discriminator)
-        gen_adv_loss = 0.0
-
-        for mod in self.modalities:
-            if mod in aux_outputs['disc_fake_scores'] and aux_outputs['disc_fake_scores'][mod] is not None:
-                # Use hinge loss for GAN stability
-                fake_scores = aux_outputs['disc_fake_scores'][mod]
-                gen_adv_loss += -fake_scores.mean()
-
-        losses['gen_adv_loss'] = gen_adv_loss
-
-        # 2. Feature matching loss (match real and generated feature distributions)
-        feature_matching_loss = 0.0
-
-        # For image missing samples, match text-to-image generated features with real image features
-        is_image_missing = (missing_type == 1)
-        if is_image_missing.any() and 'image' in generated_features and generated_features['image'] is not None:
-            # Find samples with real image features
-            has_real_image = ~is_image_missing
-            if has_real_image.any() and 'image' in real_features and real_features['image'] is not None:
-                # Get real image features
-                real_img_feats = real_features['image'][has_real_image]
-
-                # Flatten if multi-token
-                if real_img_feats.dim() > 2:
-                    real_img_feats = real_img_feats.view(-1, real_img_feats.size(-1))
-
-                # Get generated image features
-                gen_img_feats = generated_features['image'][is_image_missing]
-
-                # Flatten if multi-token
-                if gen_img_feats.dim() > 2:
-                    gen_img_feats = gen_img_feats.view(-1, gen_img_feats.size(-1))
-
-                # Compute feature matching loss
-                if real_img_feats.size(0) > 0 and gen_img_feats.size(0) > 0:
-                    # Compute mean and covariance for real and generated features
-                    # Normalize features for more stable comparison
-                    real_norm = F.normalize(real_img_feats, p=2, dim=1)
-                    gen_norm = F.normalize(gen_img_feats, p=2, dim=1)
-
-                    real_mean = real_norm.mean(dim=0)
-                    real_cov = torch.cov(real_norm.T) + torch.eye(real_norm.size(1), device=device) * 1e-6
-
-                    gen_mean = gen_norm.mean(dim=0)
-                    gen_cov = torch.cov(gen_norm.T) + torch.eye(gen_norm.size(1), device=device) * 1e-6
-
-                    # Mean distance with cosine similarity
-                    mean_dist = 1.0 - F.cosine_similarity(gen_mean.unsqueeze(0), real_mean.unsqueeze(0)).mean()
-
-                    # Covariance difference with Frobenius norm
-                    cov_dist = torch.norm(real_cov - gen_cov, p='fro') / real_norm.size(1)
-
-                    feature_matching_loss += mean_dist + 0.2 * cov_dist
-
-        # Similarly for text missing samples
-        is_text_missing = (missing_type == 2)
-        if is_text_missing.any() and 'text' in generated_features and generated_features['text'] is not None:
-            # Find samples with real text features
-            has_real_text = ~is_text_missing
-            if has_real_text.any() and 'text' in real_features and real_features['text'] is not None:
-                # Get real text features
-                real_txt_feats = real_features['text'][has_real_text]
-
-                # Flatten if multi-token
-                if real_txt_feats.dim() > 2:
-                    real_txt_feats = real_txt_feats.view(-1, real_txt_feats.size(-1))
-
-                # Get generated text features
-                gen_txt_feats = generated_features['text'][is_text_missing]
-
-                # Flatten if multi-token
-                if gen_txt_feats.dim() > 2:
-                    gen_txt_feats = gen_txt_feats.view(-1, gen_txt_feats.size(-1))
-
-                # Compute feature matching loss
-                if real_txt_feats.size(0) > 0 and gen_txt_feats.size(0) > 0:
-                    # Normalize features for more stable comparison
-                    real_norm = F.normalize(real_txt_feats, p=2, dim=1)
-                    gen_norm = F.normalize(gen_txt_feats, p=2, dim=1)
-
-                    # Compute mean and covariance for real and generated features
-                    real_mean = real_norm.mean(dim=0)
-                    real_cov = torch.cov(real_norm.T) + torch.eye(real_norm.size(1), device=device) * 1e-6
-
-                    gen_mean = gen_norm.mean(dim=0)
-                    gen_cov = torch.cov(gen_norm.T) + torch.eye(gen_norm.size(1), device=device) * 1e-6
-
-                    # Mean distance with cosine similarity
-                    mean_dist = 1.0 - F.cosine_similarity(gen_mean.unsqueeze(0), real_mean.unsqueeze(0)).mean()
-
-                    # Covariance difference with Frobenius norm
-                    cov_dist = torch.norm(real_cov - gen_cov, p='fro') / real_norm.size(1)
-
-                    feature_matching_loss += mean_dist + 0.2 * cov_dist
-
-        losses['feature_matching_loss'] = feature_matching_loss
-
-        # 3. Combine all losses with weights
-        # Weights can be adjusted based on training progress
-        cycle_weight = 15.0  # Increased from 10.0
-        adv_weight = 1.5  # Increased from 1.0
-        distr_weight = 2.0  # Increased from 1.0
-        feat_weight = 8.0  # Increased from 5.0
-
-        # Adjust cycle consistency weight over time to focus more on adversarial loss
-        if self.steps.item() > 1000:
-            cycle_weight = max(5.0, 15.0 * math.exp(-self.steps.item() / 5000))
-
-        total_loss = (
-                adv_weight * gen_adv_loss +
-                cycle_weight * losses['cycle_consistency_loss'] +
-                distr_weight * losses['distribution_loss'] +
-                feat_weight * feature_matching_loss
-        )
-
-        losses['total_loss'] = total_loss
-        return losses
-
-    def compute_discriminator_loss(self,  real_features, gen_features, missing_type):
-        """
-        Compute discriminator loss without affecting generator graph
-
-        Args:
-            real_features: Dictionary of real features
-            gen_features: Dictionary of generated features
-            missing_type: Tensor of missing modality types
-
-        Returns:
-            Dictionary of discriminator losses
-        """
-        batch_size = missing_type.size(0)
-        device = missing_type.device
-        losses = {}
-
-        # Initialize total loss
-        total_disc_loss = 0.0
-
-        # For each modality
-        for mod in self.modality_dims:
-            # Skip if no generated features for this modality
-            if mod not in gen_features or gen_features[mod] is None:
-                continue
-
-            # Get the discriminator
-            discriminator = self.discriminators[mod]
-
-            # Create masks for real and fake features
-            if mod == 'image':
-                # Image is missing in types 1 and 3
-                fake_mask = (missing_type == 1) | (missing_type == 3)
-                real_mask = ~fake_mask
-            elif mod == 'text':
-                # Text is missing in types 2 and 3
-                fake_mask = (missing_type == 2) | (missing_type == 3)
-                real_mask = ~fake_mask
-
-            # Skip if no real or fake features
-            if not fake_mask.any() and not real_mask.any():
-                continue
-
-            # Get fake features and scores
-            fake_features = gen_features[mod]
-
-            # Prepare fake features for discriminator
-            if fake_features.dim() > 2:  # Handle multi-token case
-                fake_features = fake_features.mean(dim=1)  # Average across tokens
-
-            # Get fake scores - detach to avoid affecting generator
-            fake_scores = discriminator(fake_features.detach())
-
-            # Initialize real scores
-            real_scores = None
-
-            # Get real features and scores if available
-            if real_mask.any() and mod in real_features and real_features[mod] is not None:
-                real_feats = real_features[mod][real_mask]
-
-                # Handle multi-token case
-                if real_feats.dim() > 2:
-                    real_feats = real_feats.mean(dim=1)
-
-                # Get real scores
-                real_scores = discriminator(real_feats)
-
-            # Compute hinge loss for discriminator
-            disc_loss = 0.0
-
-            # Real loss: max(0, 1 - D(x))
-            if real_scores is not None and len(real_scores) > 0:
-                real_loss = torch.nn.functional.relu(1.0 - real_scores).mean()
-                disc_loss += real_loss
-                losses[f'disc_{mod}_real_loss'] = real_loss.item()
-
-            # Fake loss: max(0, 1 + D(G(z)))
-            if fake_mask.any():
-                fake_scores_masked = fake_scores[fake_mask]
-                if len(fake_scores_masked) > 0:
-                    fake_loss = torch.nn.functional.relu(1.0 + fake_scores_masked).mean()
-                    disc_loss += fake_loss
-                    losses[f'disc_{mod}_fake_loss'] = fake_loss.item()
-
-            # Add to total loss
-            if disc_loss > 0:
-                total_disc_loss += disc_loss
-                losses[f'disc_{mod}_loss'] = disc_loss.item()
-
-        # Store total loss
-        losses['total_disc_loss'] = total_disc_loss
-
-        return losses
-
-    def train_step(self, real_features, missing_type, generator_optimizer, discriminator_optimizer,
-                   train_generator=True, train_discriminator=True):
-        """
-        Perform a complete training step
-
-        Args:
-            real_features: Dictionary of real features
-            missing_type: Tensor indicating missing modality type for each sample
-            generator_optimizer: Optimizer for generator parameters
-            discriminator_optimizer: Optimizer for discriminator parameters
-            train_generator: Whether to train the generator in this step
-            train_discriminator: Whether to train the discriminator in this step
+            batch_data: Dictionary of features and missing types
+            optimizer: Optimizer for parameter updates
 
         Returns:
             Dictionary of losses
         """
-        # Zero gradients
-        if train_generator:
-            generator_optimizer.zero_grad()
-        if train_discriminator:
-            discriminator_optimizer.zero_grad()
+        features = batch_data['features']
+        missing_type = batch_data['missing_type']
 
-        # Forward pass - detach real_features to avoid in-place modifications affecting original tensors
-        detached_real_features = {}
-        for mod in real_features:
-            if real_features[mod] is not None:
-                detached_real_features[mod] = real_features[mod].clone()
-            else:
-                detached_real_features[mod] = None
+        # Forward pass
+        optimizer.zero_grad()
+        _, _, aux_outputs = self(features, missing_type)
 
-        # Run forward pass with detached inputs
-        generated_features, reconstructed_features, aux_outputs = self(detached_real_features, missing_type)
+        # Compute total loss
+        total_loss = 0.0
+        losses = {}
 
-        # Create separate dictionaries for losses to avoid in-place modifications
-        disc_losses = {}
-        gen_losses = {}
+        # Cycle consistency loss
+        if 'cycle_losses' in aux_outputs and 'cycle_total' in aux_outputs['cycle_losses']:
+            cycle_loss = aux_outputs['cycle_losses']['cycle_total']
+            total_loss += self.cycle_weight * cycle_loss
+            losses['cycle'] = cycle_loss.item()
 
-        # Train discriminator
-        if train_discriminator:
-            disc_losses = self.compute_discriminator_loss(detached_real_features,generated_features,missing_type)
-            if 'total_disc_loss' in disc_losses:
-                # Use clone to avoid in-place operations
-                loss_to_backward = disc_losses['total_disc_loss'].clone()
-                loss_to_backward.backward(retain_graph=train_generator)
-                discriminator_optimizer.step()
+        # Identity preservation loss
+        if 'identity_losses' in aux_outputs and 'identity_total' in aux_outputs['identity_losses']:
+            identity_loss = aux_outputs['identity_losses']['identity_total']
+            total_loss += self.identity_weight * identity_loss
+            losses['identity'] = identity_loss.item()
 
-        # Train generator
-        if train_generator:
-            gen_losses = self.compute_generator_losses(detached_real_features, generated_features, aux_outputs, missing_type)
-            if 'total_loss' in gen_losses:
-                # Use clone to avoid in-place operations
-                loss_to_backward = gen_losses['total_loss'].clone()
-                loss_to_backward.backward()
-                generator_optimizer.step()
+        # GAN loss
+        if 'gan_losses' in aux_outputs and 'gan_total' in aux_outputs['gan_losses']:
+            gan_loss = aux_outputs['gan_losses']['gan_total']
+            total_loss += self.gan_weight * gan_loss
+            losses['gan'] = gan_loss.item()
 
-        # Combine all losses
-        all_losses = {}
-        all_losses.update(disc_losses)
-        all_losses.update(gen_losses)
+        # Backward pass and optimizer step
+        if total_loss > 0:
+            total_loss.backward()
+            optimizer.step()
+            losses['total'] = total_loss.item()
 
-        return all_losses, generated_features, reconstructed_features
+        return losses
+
+    def train_discriminator_step(self, batch_data, optimizer):
+        """
+        Training step for the discriminator
+
+        Args:
+            batch_data: Dictionary of features and missing types
+            optimizer: Optimizer for discriminator parameters
+
+        Returns:
+            Dictionary of discriminator losses
+        """
+        if not self.use_gan:
+            return {'d_loss': 0.0}
+
+        features = batch_data['features']
+        missing_type = batch_data['missing_type']
+
+        # Generate features
+        optimizer.zero_grad()
+        generated_features, _, _ = self(features, missing_type)
+
+        # Compute discriminator loss
+        d_loss = 0.0
+        d_losses = {}
+
+        for modality in self.modalities:
+            if features[modality] is not None and generated_features[modality] is not None:
+                # Detach generated features to avoid training generator
+                gen_detached = generated_features[modality].detach()
+
+                # Train on real samples
+                real_loss = self._compute_gan_loss(
+                    self.discriminators[modality],
+                    features[modality],
+                    None,
+                    is_real_batch=True
+                )
+
+                # Train on generated samples
+                fake_loss = self._compute_gan_loss(
+                    self.discriminators[modality],
+                    None,
+                    gen_detached,
+                    is_real_batch=False
+                )
+
+                # Total loss for this modality
+                modality_loss = real_loss + fake_loss
+                d_loss += modality_loss
+                d_losses[f'd_{modality}'] = modality_loss.item()
+
+        # Backward pass and optimizer step
+        if d_loss > 0:
+            d_loss.backward()
+            optimizer.step()
+            d_losses['d_total'] = d_loss.item()
+
+        return d_losses
+
+
+class FeatureReconstructor(nn.Module):
+    """
+    Reconstructs original features from available modalities
+    """
+
+    def __init__(self, modality_dims, fusion_dim=None, output_tokens=1):
+        super().__init__()
+
+        self.modality_dims = modality_dims
+        self.modalities = list(modality_dims.keys())
+        self.output_tokens = output_tokens
+
+        # Set fusion dimension
+        if fusion_dim is None:
+            fusion_dim = sum(modality_dims.values())
+        self.fusion_dim = fusion_dim
+
+        # Create encoders for each modality
+        self.encoders = nn.ModuleDict({
+            modality: EncoderBlock(modality_dims[modality], fusion_dim)
+            for modality in self.modalities
+        })
+
+        # Create decoders for each modality
+        self.decoders = nn.ModuleDict({
+            modality: DecoderBlock(fusion_dim, modality_dims[modality] * output_tokens)
+            for modality in self.modalities
+        })
+
+        # Fusion layer
+        self.fusion = nn.Sequential(
+            nn.LayerNorm(fusion_dim),
+            nn.Linear(fusion_dim, fusion_dim),
+            nn.GELU(),
+            nn.Dropout(0.1)
+        )
+
+    def forward(self, features):
+        """
+        Reconstruct features for all modalities
+
+        Args:
+            features: Dictionary of features for each modality
+
+        Returns:
+            Dictionary of reconstructed features
+        """
+        batch_size = None
+        device = next(self.parameters()).device
+
+        # Find batch size from the first non-None feature
+        for modality in self.modalities:
+            if features[modality] is not None:
+                if features[modality].dim() == 3:
+                    batch_size = features[modality].size(0)
+                else:
+                    batch_size = features[modality].size(0)
+                break
+
+        if batch_size is None:
+            # No features available
+            return {modality: None for modality in self.modalities}
+
+        # Process each modality
+        encoded_features = {}
+        for modality in self.modalities:
+            if features[modality] is not None:
+                feat = features[modality]
+
+                # Handle 3D tensors (batch_size, token_count, dim)
+                if feat.dim() == 3:
+                    # For multi-token features, process each token and then average
+                    b, t, d = feat.shape
+                    feat_flat = feat.reshape(-1, d)
+                    encoded = self.encoders[modality](feat_flat).reshape(b, t, -1)
+                    encoded = encoded.mean(dim=1)  # Average over tokens
+                else:
+                    encoded = self.encoders[modality](feat)
+
+                encoded_features[modality] = encoded
+
+        # Fuse available modalities
+        if not encoded_features:
+            # No features available, return None for all modalities
+            return {modality: None for modality in self.modalities}
+
+        # Average available features
+        fused = torch.stack(list(encoded_features.values())).mean(dim=0)
+        fused = self.fusion(fused)
+
+        # Decode to each modality
+        reconstructed = {}
+        for modality in self.modalities:
+            output = self.decoders[modality](fused)
+
+            # Reshape output if needed
+            if self.output_tokens > 1:
+                output = output.reshape(-1, self.output_tokens, self.modality_dims[modality])
+
+            reconstructed[modality] = output
+
+        return reconstructed

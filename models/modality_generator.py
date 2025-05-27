@@ -3,355 +3,726 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class ResidualBlock(nn.Module):
-    """实现残差连接的块"""
+class TransformerEncoderLayer(nn.Module):
+    """Transformer encoder layer with self-attention for feature processing"""
 
-    def __init__(self, dim):
+    def __init__(self, dim, num_heads=8, dropout=0.1):
         super().__init__()
-        self.layers = nn.Sequential(
-            nn.LayerNorm(dim),
-            nn.Linear(dim, dim),
+        self.self_attn = nn.MultiheadAttention(embed_dim=dim, num_heads=num_heads, batch_first=True)
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
+        self.dropout = nn.Dropout(dropout)
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, dim * 4),
             nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(dim, dim)
+            nn.Dropout(dropout),
+            nn.Linear(dim * 4, dim),
+            nn.Dropout(dropout)
         )
 
-    def forward(self, x):
-        return x + self.layers(x)
+    def forward(self, x, attention_mask=None):
+        # Self-attention block - avoid inplace operations
+        attn_output, _ = self.self_attn(
+            query=x, key=x, value=x,
+            key_padding_mask=attention_mask if attention_mask is not None else None
+        )
+        # Use addition instead of inplace operations
+        x = x + self.dropout(attn_output)
+        x = self.norm1(x)
 
-class CrossModalGenerator(nn.Module):
-    """跨模态生成器 - 使用可用模态生成缺失模态的特征表示"""
+        # Feed-forward block
+        ffn_output = self.ffn(x)
+        x = x + ffn_output  # Not using inplace addition
+        x = self.norm2(x)
 
-    def __init__(self, modality_dims, fusion_hidden_dim=256):
+        return x
+
+
+# Fix for CrossAttentionLayer to avoid inplace operations
+class CrossAttentionLayer(nn.Module):
+    """Cross-attention layer for conditioning on the other modality"""
+
+    def __init__(self, query_dim, key_dim, num_heads=8, dropout=0.1):
+        super().__init__()
+        # Use projection layers if dimensions don't match
+        self.need_projection = query_dim != key_dim
+        if self.need_projection:
+            self.query_proj = nn.Linear(query_dim, key_dim)
+            self.out_proj = nn.Linear(key_dim, query_dim)
+            self.attn_dim = key_dim
+        else:
+            self.attn_dim = query_dim
+
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=self.attn_dim,
+            num_heads=num_heads,
+            batch_first=True,
+            dropout=dropout
+        )
+        self.norm1 = nn.LayerNorm(query_dim)
+        self.norm2 = nn.LayerNorm(query_dim)
+        self.dropout = nn.Dropout(dropout)
+        self.ffn = nn.Sequential(
+            nn.Linear(query_dim, query_dim * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(query_dim * 4, query_dim),
+            nn.Dropout(dropout)
+        )
+
+    def forward(self, query, key_value, query_mask=None, kv_mask=None):
+        # Make a copy of the input to avoid modifying it
+        query_copy = query.clone()
+
+        # Project query if needed
+        attn_query = self.query_proj(query_copy) if self.need_projection else query_copy
+
+        # Cross-attention block
+        attn_output, _ = self.cross_attn(
+            query=attn_query,
+            key=key_value,
+            value=key_value,
+            key_padding_mask=kv_mask if kv_mask is not None else None,
+            attn_mask=query_mask if query_mask is not None else None
+        )
+
+        # Project back if needed
+        if self.need_projection:
+            attn_output = self.out_proj(attn_output)
+
+        # Residual connection and norm - avoid inplace operations
+        query_copy = query_copy + self.dropout(attn_output)
+        query_copy = self.norm1(query_copy)
+
+        # Feed-forward block
+        ffn_output = self.ffn(query_copy)
+        query_copy = query_copy + ffn_output  # Not using inplace addition
+        query_copy = self.norm2(query_copy)
+
+        return query_copy
+
+
+class EnhancedCrossModalGenerator(nn.Module):
+    """Enhanced cross-modal generator using transformer architecture"""
+
+    def __init__(self, modality_dims, fusion_hidden_dim=512, num_layers=3, num_heads=8):
         """
-        初始化跨模态生成器
+        Initialize the enhanced cross-modal generator
 
         Args:
-            modality_dims: 字典，键为模态名称，值为该模态的特征维度
-                           例如: {'image': 768, 'text': 512}
-            fusion_hidden_dim: 融合层隐藏维度
+            modality_dims: Dictionary mapping modality names to their dimensions
+            fusion_hidden_dim: Dimension of the shared hidden space
+            num_layers: Number of transformer layers
+            num_heads: Number of attention heads
+        """
+        super().__init__()
+        self.modality_dims = modality_dims
+        self.modalities = list(modality_dims.keys())
+        self.fusion_dim = fusion_hidden_dim
+
+        # Modality encoders - project to common dimension
+        self.encoders = nn.ModuleDict({
+            mod_name: nn.Sequential(
+                nn.Linear(dim, fusion_hidden_dim),
+                nn.LayerNorm(fusion_hidden_dim),
+                nn.GELU(),
+                nn.Dropout(0.1)
+            ) for mod_name, dim in modality_dims.items()
+        })
+
+        # Shared transformer layers for initial encoding
+        self.shared_encoders = nn.ModuleDict({
+            mod_name: nn.ModuleList([
+                TransformerEncoderLayer(fusion_hidden_dim, num_heads)
+                for _ in range(num_layers // 2)  # Half the layers for encoding
+            ]) for mod_name in self.modalities
+        })
+
+        # Cross-modal generation transformers
+        self.generators = nn.ModuleDict()
+        for source_mod in self.modalities:
+            for target_mod in self.modalities:
+                if source_mod != target_mod:
+
+                    # Create cross-attention based generator
+                    layers = []
+                    # First add cross-attention to condition on source modality
+                    layers.append(CrossAttentionLayer(
+                        fusion_hidden_dim, fusion_hidden_dim, num_heads
+                    ))
+                    # Then add transformer layers to process the conditioned features
+                    for _ in range(num_layers - 1):
+                        layers.append(TransformerEncoderLayer(
+                            fusion_hidden_dim, num_heads
+                        ))
+                    # Final projection to target modality dimension
+                    layers.append(nn.Sequential(
+                        nn.LayerNorm(fusion_hidden_dim),
+                        nn.Linear(fusion_hidden_dim, modality_dims[target_mod]),
+                    ))
+
+                    self.generators[f"{source_mod}_to_{target_mod}"] = nn.ModuleList(layers)
+
+        # Prior generators for "both" missing case - more sophisticated with multiple layers
+        self.prior_generators = nn.ModuleDict()
+        for mod_name, dim in modality_dims.items():
+            layers = []
+            # Initial projection from noise
+            layers.append(nn.Sequential(
+                nn.Linear(256, fusion_hidden_dim),  # Larger noise dimension
+
+                nn.LayerNorm(fusion_hidden_dim),
+                nn.GELU(),
+                nn.Dropout(0.1)
+            ))
+            # Add transformer layers for processing
+            for _ in range(num_layers):
+                layers.append(TransformerEncoderLayer(
+                    fusion_hidden_dim, num_heads
+                ))
+            # Final projection to target modality dimension
+            layers.append(nn.Sequential(
+                nn.LayerNorm(fusion_hidden_dim),
+                nn.Linear(fusion_hidden_dim, dim),
+
+            ))
+
+            self.prior_generators[mod_name] = nn.ModuleList(layers)
+
+        # Special token for generation (like CLS token)
+        self.gen_tokens = nn.ParameterDict({
+            mod_name: nn.Parameter(torch.randn(1, 1, fusion_hidden_dim))
+            for mod_name in self.modalities
+        })
+
+    def encode(self, features, modality, attention_mask=None):
+        """
+        Encode features of a specific modality to the common space
+
+        Args:
+            features: Tensor of shape [batch_size, token_count, dim] or [batch_size, dim]
+            modality: Modality name (e.g., 'image' or 'text')
+            attention_mask: Optional mask for tokens
+
+        Returns:
+            Encoded features in the common space
+        """
+
+        if features is None:
+            return None
+
+        # Make a clone to avoid modifying the input
+        features_clone = features.clone()
+
+        # Handle single vector input
+        if features_clone.dim() == 2:
+            features_clone = features_clone.unsqueeze(1)  # [batch_size, 1, dim]
+
+        # Project to common dimension
+        encoded = self.encoders[modality](features_clone)  # [batch_size, token_count, fusion_dim]
+
+        # Apply transformer layers
+        for layer in self.shared_encoders[modality]:
+            encoded = layer(encoded, attention_mask)
+
+        return encoded
+
+    def generate(self, source_features, source_modality, target_modality,
+                 source_mask=None, inference=False):
+        """
+        Generate features for the target modality from source modality features
+
+        Args:
+            source_features: Source modality features [batch_size, token_count, dim]
+            source_modality: Source modality name
+            target_modality: Target modality name
+            source_mask: Optional attention mask for source tokens
+            inference: Whether in inference mode (affects output handling)
+
+        Returns:
+            Generated features for target modality
+        """
+        # Check if source features are available
+        is_missing = False
+        if source_features is None:
+            is_missing = True
+        elif torch.sum(torch.abs(source_features)) < 1e-6:
+            is_missing = True
+
+        batch_size = 1
+        device = next(self.parameters()).device
+
+        if is_missing:
+            # Use prior generator for missing source
+            noise = torch.randn(batch_size, 5, 256, device=device)  # Multiple noise tokens
+
+            # Process through prior generator
+            prior_gen = self.prior_generators[target_modality]
+            features = prior_gen[0](noise)  # Initial projection
+
+            # Apply transformer layers
+            for i in range(1, len(prior_gen) - 1):
+                features = prior_gen[i](features)
+
+            # Final projection to target dimension
+            generated = prior_gen[-1](features)
+
+            return generated
+
+        # Get batch size from source features and make a clone to avoid modifying input
+        source_features = source_features.clone().detach()
+
+        if source_features.dim() == 3:
+            batch_size = source_features.size(0)
+        else:
+            batch_size = 1
+            source_features = source_features.unsqueeze(0)  # Add batch dimension
+
+        # Encode source features
+        encoded_source = self.encode(source_features, source_modality, source_mask)
+
+        # Get generator layers
+        generator = self.generators[f"{source_modality}_to_{target_modality}"]
+
+        # Add generation token
+        gen_token = self.gen_tokens[target_modality].expand(batch_size, -1, -1)
+        query = gen_token.clone()  # Clone to avoid inplace modifications
+
+        # First layer is cross-attention
+        query = generator[0](query, encoded_source)
+
+        # Apply remaining transformer layers
+        for i in range(1, len(generator) - 1):
+            query = generator[i](query)
+
+        # Final projection to target dimension
+        generated = generator[-1](query)
+
+        # For inference, return in expected format
+        if inference and generated.size(1) == 1:
+            return generated.squeeze(1)  # Remove token dimension if single token
+
+        return generated
+
+    def forward(self, features, missing_type=None):
+        """
+        Forward pass for generating missing modalities
+
+        Args:
+            features: Dictionary of available features
+            missing_type: Missing modality type (0=none, 1=image, 2=text, 3=both)
+
+        Returns:
+            Dictionary of generated features
+        """
+        # Determine batch size and device
+        batch_size = 1
+        device = next(self.parameters()).device
+
+        # Try to get batch size from features
+        for mod, feat in features.items():
+            if feat is not None:
+                if feat.dim() >= 2:
+                    batch_size = feat.size(0)
+                    device = feat.device
+                    break
+
+        # Create output containers
+        generated_features = {mod: None for mod in self.modalities}
+
+        # If batch processing (tensor of missing types)
+        if isinstance(missing_type, torch.Tensor) and missing_type.dim() > 0:
+            # Initialize output tensors
+            for mod in self.modalities:
+                if mod in features and features[mod] is not None:
+                    token_count = features[mod].size(1) if features[mod].dim() > 2 else 1
+                    generated_features[mod] = torch.zeros(
+                        batch_size, token_count, self.modality_dims[mod],
+                        device=device
+                    )
+
+            # Process each sample based on its missing type
+            for b in range(batch_size):
+                mt = missing_type[b].item()
+
+                # Extract sample features
+                sample_features = {
+                    mod: features[mod][b:b + 1] if mod in features and features[mod] is not None else None
+                    for mod in self.modalities
+                }
+
+                # Generate based on missing type
+                if mt == 1:  # Image missing
+                    if 'text' in sample_features and sample_features['text'] is not None:
+                        img_feat = self.generate(
+                            sample_features['text'], 'text', 'image', inference=True
+                        )
+                        generated_features['image'][b] = img_feat
+
+                elif mt == 2:  # Text missing
+                    if 'image' in sample_features and sample_features['image'] is not None:
+                        txt_feat = self.generate(
+                            sample_features['image'], 'image', 'text', inference=True
+                        )
+                        generated_features['text'][b] = txt_feat
+
+                elif mt == 3:  # Both missing
+                    # Generate both modalities from priors
+                    for mod in self.modalities:
+                        gen_feat = self.generate(None, None, mod, inference=True)
+                        generated_features[mod][b] = gen_feat
+
+                # For mt == 0 (none missing), keep original features
+
+        else:
+            # Single sample processing
+            mt = int(missing_type) if missing_type is not None else 0
+
+            if mt == 1:  # Image missing
+                if 'text' in features and features['text'] is not None:
+                    generated_features['image'] = self.generate(
+                        features['text'], 'text', 'image'
+                    )
+
+            elif mt == 2:  # Text missing
+                if 'image' in features and features['image'] is not None:
+                    generated_features['text'] = self.generate(
+                        features['image'], 'image', 'text'
+                    )
+
+            elif mt == 3:  # Both missing
+                # Generate both modalities from priors
+                for mod in self.modalities:
+                    generated_features[mod] = self.generate(None, None, mod)
+
+        return generated_features
+
+
+class TransformerReconstructor(nn.Module):
+    """
+    Enhanced reconstructor using transformer architecture for cycle consistency
+    """
+
+    def __init__(self, modality_dims, fusion_dim=512, num_layers=2, num_heads=8):
+        """
+
+        Args:
+            modality_dims: Dictionary mapping modality names to their dimensions
+            fusion_dim: Dimension of fusion space
+            num_layers: Number of transformer layers
+            num_heads: Number of attention heads
+        """
+        super().__init__()
+
+        self.modality_dims = modality_dims
+        self.modalities = list(modality_dims.keys())
+
+        # Encoders (shared with generator or separate)
+        self.encoders = nn.ModuleDict({
+
+            mod_name: nn.Sequential(
+                nn.Linear(dim, fusion_dim),
+                nn.LayerNorm(fusion_dim),
+                nn.GELU(),
+                nn.Dropout(0.1)
+            ) for mod_name, dim in modality_dims.items()
+        })
+
+        # Reconstruction transformers for each modality
+        self.decoders = nn.ModuleDict()
+        for source_mod in self.modalities:
+            for target_mod in self.modalities:
+                if source_mod != target_mod:
+                    # Cross-modal reconstruction path
+                    layers = []
+
+                    # First add cross-attention layer
+                    layers.append(CrossAttentionLayer(
+                        fusion_dim, fusion_dim, num_heads
+                    ))
+
+                    # Add transformer layers
+                    for _ in range(num_layers):
+                        layers.append(TransformerEncoderLayer(
+                            fusion_dim, num_heads
+                        ))
+
+                    # Final projection to target modality
+                    layers.append(nn.Sequential(
+                        nn.LayerNorm(fusion_dim),
+                        nn.Linear(fusion_dim, modality_dims[target_mod]),
+                    ))
+
+                    self.decoders[f"{source_mod}_to_{target_mod}"] = nn.ModuleList(layers)
+
+        # Self-reconstruction paths (for complete modality samples)
+        for mod_name in self.modalities:
+            layers = []
+
+            # Add transformer layers
+            for _ in range(num_layers):
+                layers.append(TransformerEncoderLayer(
+                    fusion_dim, num_heads
+                ))
+
+            # Final projection
+            layers.append(nn.Sequential(
+                nn.LayerNorm(fusion_dim),
+                nn.Linear(fusion_dim, modality_dims[mod_name]),
+            ))
+
+            self.decoders[f"{mod_name}_to_{mod_name}"] = nn.ModuleList(layers)
+
+    def reconstruct(self, features, source_modality, target_modality, source_mask=None):
+        """
+        Reconstruct target modality features from source modality
+
+        Args:
+            features: Source modality features
+            source_modality: Source modality name
+            target_modality: Target modality name
+            source_mask: Optional attention mask for source tokens
+
+        Returns:
+            Reconstructed features for target modality
+        """
+        if features is None:
+            return None
+
+        # Make a clone to avoid modifying the input tensor
+        features_clone = features.clone()
+
+        # Handle single vector input
+        if features_clone.dim() == 2:
+            features_clone = features_clone.unsqueeze(1)  # [batch_size, 1, dim]
+
+        # Encode features to fusion space - detach to avoid inplace operations affecting original
+        encoded = self.encoders[source_modality](features_clone)
+
+        # Get decoder path
+        decoder = self.decoders[f"{source_modality}_to_{target_modality}"]
+
+        # For cross-modal reconstruction
+        if source_modality != target_modality:
+            # First layer is cross-attention (using self-attention)
+            query = encoded.clone()  # Clone to avoid inplace modifications
+            query = decoder[0](query, encoded, source_mask)
+
+            # Apply remaining transformer layers
+            for i in range(1, len(decoder) - 1):
+                query = decoder[i](query, source_mask)
+
+            # Final projection
+            reconstructed = decoder[-1](query)
+        else:
+            # For self-reconstruction
+            query = encoded.clone()  # Clone to avoid inplace modifications
+
+            # Apply transformer layers
+            for i in range(len(decoder) - 1):
+                query = decoder[i](query, source_mask)
+
+            # Final projection
+            reconstructed = decoder[-1](query)
+
+        return reconstructed
+
+    def forward(self, features):
+        """
+        Forward pass to reconstruct all modalities
+
+        Args:
+            features: Dictionary of features for different modalities
+
+        Returns:
+            Dictionary of reconstructed features
+        """
+        if not isinstance(features, dict):
+
+            raise ValueError("Expected dictionary of features")
+
+
+        reconstructed = {}
+
+        # Make a defensive copy of the features dictionary to avoid modifying the original
+        features_copy = {}
+        for key, value in features.items():
+            if value is not None:
+                features_copy[key] = value.clone().detach()
+            else:
+                features_copy[key] = None
+
+        # For each available modality, reconstruct all others
+        for source_mod, source_feat in features_copy.items():
+            if source_feat is None or torch.sum(torch.abs(source_feat)) < 1e-6:
+                continue
+
+            for target_mod in self.modalities:
+                # Skip if target is the same as source
+                if target_mod == source_mod:
+                    continue
+
+                # Skip if already reconstructed
+                key = f"{target_mod}_from_{source_mod}"
+                if key in reconstructed:
+                    continue
+
+                # Reconstruct target from source
+                recon_feat = self.reconstruct(source_feat, source_mod, target_mod)
+
+                # Store reconstructed features
+                if recon_feat is not None:
+                    reconstructed[key] = recon_feat
+
+        return reconstructed
+
+
+class EnhancedCycleGenerationModel(nn.Module):
+    """
+    Enhanced cycle generation model with better batch handling and training capabilities
+    """
+
+    def __init__(self, modality_dims, fusion_hidden_dim=512, num_layers=3, num_heads=8):
+        """
+        Initialize the enhanced cycle generation model
+
+        Args:
+            modality_dims: Dictionary mapping modality names to their dimensions
+            fusion_hidden_dim: Dimension of fusion space
+            num_layers: Number of transformer layers
+            num_heads: Number of attention heads
         """
         super().__init__()
         self.modality_dims = modality_dims
         self.modalities = list(modality_dims.keys())
 
-        # 为每个模态创建编码器，将原始特征映射到共享空间
-        self.encoders = nn.ModuleDict({
-            mod_name: nn.Sequential(
-                nn.Linear(dim, fusion_hidden_dim),
-                nn.LayerNorm(fusion_hidden_dim),
-                nn.GELU()
-            ) for mod_name, dim in modality_dims.items()
-        })
+        # Enhanced generator and reconstructor
+        self.generator = EnhancedCrossModalGenerator(
+            modality_dims, fusion_hidden_dim, num_layers, num_heads
+        )
 
-        # 为每个模态对创建生成器
-        self.generators = nn.ModuleDict()
-        for source_mod in self.modalities:
-            for target_mod in self.modalities:
-                if source_mod != target_mod:
-                    self.generators[f"{source_mod}_to_{target_mod}"] = nn.Sequential(
-                        nn.Linear(fusion_hidden_dim, fusion_hidden_dim * 2),
-                        nn.LayerNorm(fusion_hidden_dim * 2),
-                        nn.GELU(),
-                        nn.Dropout(0.1),
-                        ResidualBlock(fusion_hidden_dim * 2),
-                        ResidualBlock(fusion_hidden_dim * 2),
-                        nn.Linear(fusion_hidden_dim * 2, fusion_hidden_dim),
-                        nn.LayerNorm(fusion_hidden_dim),
-                        nn.GELU(),
-                        nn.Linear(fusion_hidden_dim, modality_dims[target_mod]),
-                        nn.Tanh()  # TODO:这个应该换掉，因为导致了生成和真实的分布不匹配
-                    )
+        self.reconstructor = TransformerReconstructor(
+            modality_dims, fusion_hidden_dim, num_layers // 2, num_heads
+        )
 
-        # 对于"both"情况（双模态缺失）需要的先验生成器
-        self.prior_generators = nn.ModuleDict({
-            mod_name: nn.Sequential(
-                nn.Linear(128, fusion_hidden_dim),  # 从更丰富的随机噪声生成
-                nn.LayerNorm(fusion_hidden_dim),
-                nn.GELU(),
-                nn.Linear(fusion_hidden_dim, fusion_hidden_dim),
-                nn.LayerNorm(fusion_hidden_dim),
-                nn.GELU(),
-                nn.Linear(fusion_hidden_dim, dim),
-                nn.Tanh() # TODO:这个应该换掉，因为导致了生成和真实的分布不匹配
-            ) for mod_name, dim in modality_dims.items()
-        })
-
-    def encode(self, features, modality):
-        """将特定模态的特征编码到共享空间"""
-        if features is None:
-            return None
-
-        # 处理多个token的情况
-        if features.dim() > 2:  # [batch_size, token_count, dim]
-            # 对每个token分别编码
-            encoded_features = self.encoders[modality](features)
-            return encoded_features
-        else:  # [token_count, dim] 或 [batch_size, dim]
-            return self.encoders[modality](features)
-
-    def generate(self, source_features, source_modality, target_modality):
-        """基于源模态特征生成目标模态特征"""
-        # 修改: 检测零填充特征而不是None
-        is_zeros = False
-        if source_features is not None:
-            # 判断是否全为零
-            is_zeros = torch.sum(torch.abs(source_features)) < 1e-6
-
-        if source_features is None or is_zeros:
-            # 如果源特征不可用或是零填充，使用先验生成器
-            batch_size = 1  # 默认批次大小
-            noise = torch.randn(batch_size, 128, device=next(self.parameters()).device)
-            return self.prior_generators[target_modality](noise)
-
-        # 编码源特征
-        encoded = self.encode(source_features, source_modality)
-
-        # 使用生成器生成目标特征
-        return self.generators[f"{source_modality}_to_{target_modality}"](encoded)
-
-    def forward(self, features, missing_types):
+    def forward(self, features, missing_type, generate_all=False):
         """
-        前向传播，根据缺失情况生成特征
+        Forward pass for generating missing modalities and reconstruction
 
         Args:
-            features: 字典，键为模态名称，值为该模态的特征（全零表示缺失）
-            missing_types: 张量，表示每个样本的缺失类型 (none=0, image=1, text=2, both=3)
+            features: Dictionary of available features
+            missing_type: Missing modality type (0=none, 1=image, 2=text, 3=both)
+            generate_all: Whether to generate all modalities regardless of missing status
 
         Returns:
-            完整的特征字典，包含原始和生成的特征
+            Tuple of (generated_features, reconstructed_features, cycle_features)
+            - generated_features: Generated features for missing modalities
+            - reconstructed_features: Reconstructed original features
+            - cycle_features: Features after a complete cycle (for cycle consistency)
         """
-        batch_size = missing_types.size(0)
-        device = missing_types.device
+        # Phase 1: Generate missing modalities - make a defensive copy
+        features_copy = {}
+        for key, value in features.items():
+            if value is not None:
+                features_copy[key] = value.clone().detach()
+            else:
+                features_copy[key] = None
 
-        # 创建输出特征字典，初始化为空 list
-        output_features = {mod: [] for mod in self.modalities}
+        generated_features = self.generator(features_copy, missing_type)
 
-        for b in range(batch_size):
-            missing_type = missing_types[b].item()
-
-            # 根据缺失类型生成特征
-            if missing_type == 1:  # 图像缺失
-                # 检查文本是否非零
-                text_feat = features["text"][b:b + 1] if "text" in features else None
-                if text_feat is not None and torch.sum(torch.abs(text_feat)) > 1e-6:
-                    gen_image_feat = self.generate(text_feat, "text", "image")
-                    output_features["image"].append(gen_image_feat)
-                    output_features["text"].append(text_feat)
-
-            elif missing_type == 2:  # 文本缺失
-                # 检查图像是否非零
-                image_feat = features["image"][b:b + 1] if "image" in features else None
-                if image_feat is not None and torch.sum(torch.abs(image_feat)) > 1e-6:
-                    gen_text_feat = self.generate(image_feat, "image", "text")
-                    output_features["text"].append(gen_text_feat)
-                    output_features["image"].append(image_feat)
-
-            elif missing_type == 3:  # 双模态都缺失
-                noise = torch.randn(1, 128, device=device)
-                gen_image_feat = self.prior_generators["image"](noise)
-                gen_text_feat = self.prior_generators["text"](noise)
-                output_features["image"].append(gen_image_feat)
-                output_features["text"].append(gen_text_feat)
-
-            else:  # missing_type == 0, 没缺失
-                for mod in self.modalities:
-                    if mod in features and torch.sum(torch.abs(features[mod][b:b + 1])) > 1e-6:
-                        output_features[mod].append(features[mod][b:b + 1])
-
-        # 最后 stack 回 tensor
+        # Combine original and generated features without modifying originals
+        combined_features = {}
         for mod in self.modalities:
-            if len(output_features[mod]) > 0:
-                output_features[mod] = torch.cat(output_features[mod], dim=0)
-            else:
-                output_features[mod] = None
+            if mod in features and features[mod] is not None:
+                combined_features[mod] = features[mod].clone().detach()
+            elif mod in generated_features and generated_features[mod] is not None:
+                combined_features[mod] = generated_features[mod].clone().detach()
 
-        return output_features
+        # Phase 2: Reconstruct for cycle consistency
+        reconstructed_features = self.reconstructor(combined_features)
 
+        # Phase 3 (optional): Generate all modalities for training
+        cycle_features = None
+        if generate_all:
+            all_generated = {}
 
-class ModReconstructor(nn.Module):
-    """模态重建器 - 用于对比学习以提高生成质量"""
+            # Make another copy to avoid modifying the originals
+            features_for_cycle = {}
+            for key, value in features.items():
+                if value is not None:
+                    features_for_cycle[key] = value.clone().detach()
+                else:
+                    features_for_cycle[key] = None
 
-    def __init__(self, modality_dims):
-        """
+            # For each modality, generate all others
+            for source_mod, source_feat in features_for_cycle.items():
+                if source_feat is None:
+                    continue
 
-        Args:
-            modality_dims: 字典，键为模态名称，值为该模态的特征维度
-        """
-        super().__init__()
-        # TODO: 应该加强一下重建器
-        self.decoders = nn.ModuleDict({
-            mod_name: nn.Sequential(
-                nn.Linear(dim, dim),
-                nn.LayerNorm(dim),
-                nn.GELU(),
-                nn.Linear(dim, dim)
-            ) for mod_name, dim in modality_dims.items()
-        })
+                for target_mod in self.modalities:
+                    if source_mod == target_mod:
+                        continue
 
-        # 添加注意力融合层，用于多token处理
-        self.attention_fusion = nn.ModuleDict({
-            mod_name: nn.MultiheadAttention(embed_dim=dim, num_heads=8, batch_first=True)
-            for mod_name, dim in modality_dims.items()
-        })
-
-    def forward(self, features):
-        """重建各模态特征"""
-        if not isinstance(features, dict):
-            raise ValueError(f"ModReconstructor expects input features as a dict, got {type(features)}")
-        # TODO：应修改重建的逻辑。
-        # 对于完整样本，都重建来训练重建器
-        # 对于图像缺失样本，已有根据原始文本特征生成的生成图片特征。文本->图像->文本。由生成图片特征重建文本特征并与原始文本特征计算损失来训练生成器和重建器
-        # 对于文本缺失样本，已有根据原始图像特征生成的生成文本特征。图像->文本->图像。
-        
-
-        outputs = {}
-        for mod, feat in features.items():
-            if feat is not None:
-                feat = feat.clone()  # 避免inplace问题
-
-                # 使用自注意力机制处理多个token
-                if feat.dim() > 2:  # 批次 + 多token情况
-                    attn_output, _ = self.attention_fusion[mod](
-                        query=feat,
-                        key=feat,
-                        value=feat
+                    # Generate target from source
+                    gen_feat = self.generator.generate(
+                        source_feat.clone().detach(),  # Make sure we don't modify the original
+                        source_mod,
+                        target_mod
                     )
-                    # 对每个token进行解码
-                    outputs[mod] = self.decoders[mod](attn_output)
-                else:  # 单token情况
-                    outputs[mod] = self.decoders[mod](feat)
 
-        return outputs
+                    if gen_feat is not None:
+                        key = f"{target_mod}_from_{source_mod}"
+                        all_generated[key] = gen_feat
 
+            cycle_features = all_generated
 
-class CycleGenerationModel(nn.Module):
-    """循环生成模型 - 实现特征生成和重建的循环一致性"""
+        return generated_features, reconstructed_features, cycle_features
 
-    def __init__(self, modality_dims, fusion_hidden_dim=256):
-        super().__init__()
-        self.modality_dims = modality_dims
-        self.generator = CrossModalGenerator(modality_dims, fusion_hidden_dim)
-        self.reconstructor = ModReconstructor(modality_dims)
-
-    def forward(self, features, missing_type):
+    def generate_for_sample(self, features, missing_type):
         """
-        前向传播，针对单个样本或批量样本进行模态生成和重建
+        Generate missing modalities for a single sample
 
         Args:
-            features: 字典，键为模态名称，值为该模态的特征（可能为None表示缺失）
-            missing_type: 整数或张量，表示缺失类型 (none=0, image=1, text=2, both=3)
+            features: Dictionary of features for one sample
+            missing_type: Missing modality type
 
         Returns:
-            生成的特征和重建的特征
+            Tuple of (generated, reconstructed)
         """
-        # 检查是单个样本还是批量样本
-        batch_mode = isinstance(missing_type, torch.Tensor) and missing_type.dim() > 0
+        # Convert missing_type to int if needed
+        mt = int(missing_type) if not isinstance(missing_type, int) else missing_type
 
-        if not batch_mode:
-            # print("no batch mode")
-            # 单样本处理
-            missing_type = int(missing_type)
-            generated , reconstructed= self._generate_for_sample(features, missing_type)
-
-            # reconstructed = self.reconstructor(generated)
-            return generated, reconstructed
-        else:
-            # print("batch mode")
-            # 批量处理，但逐个样本处理以避免批处理问题
-            batch_size = missing_type.size(0)
-            device = missing_type.device
-
-            # 初始化输出
-            generated_features = {mod: None for mod in self.modality_dims.keys()}
-            reconstructed_features = {mod: None for mod in self.modality_dims.keys()}
-
-            # 逐个样本处理
-            for b in range(batch_size):
-                # 提取当前样本的特征
-                sample_features = {}
-                for mod in features:
-                    if features[mod] is not None:
-                        # 确保我们只取这个样本的特征
-                        sample_features[mod] = features[mod][b:b + 1]
-                    else:
-                        sample_features[mod] = None
-
-                # 生成当前样本的特征
-                mt = missing_type[b].item()
-                gen_sample, recon_sample = self._generate_for_sample(sample_features, mt)
-
-                # 合并到批结果中
-                for mod in gen_sample:
-                    if gen_sample[mod] is not None:
-                        if generated_features[mod] is None:
-                            # 首次分配空间
-                            generated_features[mod] = torch.zeros(
-                                batch_size, self.modality_dims[mod], device=device
-                            )
-                        generated_features[mod][b] = gen_sample[mod]
-
-                for mod in recon_sample:
-                    if recon_sample[mod] is not None:
-                        if reconstructed_features[mod] is None:
-                            # 首次分配空间
-                            reconstructed_features[mod] = torch.zeros(
-                                batch_size, self.modality_dims[mod], device=device
-                            )
-                        reconstructed_features[mod][b] = recon_sample[mod]
-
-            return generated_features, reconstructed_features
-
-    def _generate_for_sample(self, features, missing_type):
-        """针对单个样本生成缺失模态特征"""
-        token_count = 1  # 使用的token数量
-
+        # Generate missing modalities
         generated = {}
-        for mod in self.modality_dims.keys():
-            if features.get(mod) is not None:
-                # 如果特征是2D的，则提取前token_count个token
-                if features[mod].dim() == 2:
-                    if features[mod].size(0) >= token_count:
-                        generated[mod] = features[mod][:token_count].clone()
-                    else:
-                        # 如果token不够，则复制现有的token
-                        repeat_times = (token_count + features[mod].size(0) - 1) // features[mod].size(0)
-                        generated[mod] = features[mod].repeat(repeat_times, 1)[:token_count].clone()
-                else:
-                    # 对于单个样本的情况
-                    generated[mod] = features[mod].clone()
-            else:
-                generated[mod] = None
 
-        # TODO:这里应该添加方法，对于不缺失的情况都生成用于训练生成器和重建
 
-        # 根据缺失类型生成特征
-        if missing_type == 1:  # 图像缺失
-            if features.get("text") is not None:
-                text_feat = generated["text"]  # 使用多个token
-                encoded_text = self.generator.encode(text_feat, "text")
-                generated["image"] = self.generator.generators["text_to_image"](encoded_text)
-                # 添加一点噪声提高泛化能力
-                generated["image"] = generated["image"] + torch.randn_like(generated["image"]) * 0.01
+        if mt == 1:  # Image missing
+            if 'text' in features and features['text'] is not None:
+                generated['image'] = self.generator.generate(
+                    features['text'], 'text', 'image'
+                )
 
-        elif missing_type == 2:  # 文本缺失
-            if features.get("image") is not None:
-                image_feat = generated["image"]  # 使用多个token
-                encoded_image = self.generator.encode(image_feat, "image")
-                generated["text"] = self.generator.generators["image_to_text"](encoded_image)
-                # 添加一点噪声提高泛化能力
-                generated["text"] = generated["text"] + torch.randn_like(generated["text"]) * 0.01
+        elif mt == 2:  # Text missing
+            if 'image' in features and features['image'] is not None:
+                generated['text'] = self.generator.generate(
+                    features['image'], 'image', 'text'
+                )
 
-        elif missing_type == 3:  # 双模态缺失
-            # 使用随机噪声生成特征
-            noise = torch.randn(token_count, 1, device=next(self.parameters()).device)
-            generated["image"] = self.generator.prior_generators["image"](noise)
-            generated["text"] = self.generator.prior_generators["text"](noise)
+        elif mt == 3:  # Both missing
+            # Generate both modalities from priors
+            for mod in self.modalities:
+                generated[mod] = self.generator.generate(None, None, mod)
 
-        # 添加正则项
-        if missing_type == 1:  # Image missing
-            generated["image"] = generated["image"] + torch.randn_like(generated["image"]) * 0.01
-        elif missing_type == 2:  # Text missing
-            generated["text"] = generated["text"] + torch.randn_like(generated["text"]) * 0.01
+        # Combine original and generated
+        combined = {}
+        for mod in self.modalities:
+            if mod in features and features[mod] is not None:
+                combined[mod] = features[mod]
+            elif mod in generated and generated[mod] is not None:
+                combined[mod] = generated[mod]
 
-        return generated, self.reconstructor(generated)
+        # Reconstruct for cycle consistency
+        reconstructed = self.reconstructor(combined)
+
+        return generated, reconstructed
+
