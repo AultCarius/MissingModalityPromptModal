@@ -807,10 +807,10 @@ class Trainer:
                             quality_scores['cross_consistency'].mean().item())
 
                     # Collect fusion weights data
-                    if 'fusion_weights' in additional_info and additional_info[
-                        'fusion_weights'] is not None:
-                        fusion_weights = additional_info['fusion_weights']
-                        fusion_weights_stats.append(fusion_weights.mean(dim=0).cpu().detach().numpy())
+                    # if 'fusion_weights' in additional_info and additional_info[
+                    #     'fusion_weights'] is not None:
+                    #     fusion_weights = additional_info['fusion_weights']
+                    #     fusion_weights_stats.append(fusion_weights.mean(dim=0).cpu().detach().numpy())
 
 
                     # quality_loss = torch.tensor(0.0, device=self.device)
@@ -1109,7 +1109,7 @@ class Trainer:
                 if additional_info and 'fusion_weights' in additional_info and additional_info[
                     'fusion_weights'] is not None:
                     fusion_weights = additional_info['fusion_weights']
-                    fusion_weights_stats.append(fusion_weights.mean(dim=0).cpu().detach().numpy())
+                    # fusion_weights_stats.append(fusion_weights.mean(dim=0).cpu().detach().numpy())
 
                 # Collect feature samples for analysis (limited number)
                 if batch_idx % 10 == 0 and len(all_features['missing_types']) < 1000:
