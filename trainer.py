@@ -729,7 +729,7 @@ class Trainer:
                         img_missing = is_image_missing & (~is_text_missing)
                         if img_missing.any():
                             # 图像缺失时：图像质量应低，文本质量应高，一致性适中
-                            image_quality_target[img_missing] = 0.2  # 生成的图像质量低
+                            image_quality_target[img_missing] = 0.5  # 生成的图像质量低
                             text_quality_target[img_missing] = 0.9  # 真实文本质量高
                             consistency_target[img_missing] = 0.5  # 一致性适中
 
@@ -738,7 +738,7 @@ class Trainer:
                         if txt_missing.any():
                             # 文本缺失时：图像质量应高，文本质量应低，一致性适中
                             image_quality_target[txt_missing] = 0.9  # 真实图像质量高
-                            text_quality_target[txt_missing] = 0.2  # 生成的文本质量低
+                            text_quality_target[txt_missing] = 0.5  # 生成的文本质量低
                             consistency_target[txt_missing] = 0.5  # 一致性适中
 
                         # 3. 两个模态都缺失
@@ -930,8 +930,8 @@ class Trainer:
                                         mean_loss = F.mse_loss(gen_mean, real_mean)
 
                                         # 方差匹配
-                                        real_var = torch.var(real_img_feats, dim=0)
-                                        gen_var = torch.var(gen_img_feats, dim=0)
+                                        real_var = torch.var(real_img_feats, dim=0,unbiased=False)
+                                        gen_var = torch.var(gen_img_feats, dim=0,unbiased=False)
                                         var_loss = F.mse_loss(gen_var, real_var)
 
                                         # 添加到分布损失
@@ -959,8 +959,8 @@ class Trainer:
                                         mean_loss = F.mse_loss(gen_mean, real_mean)
 
                                         # 方差匹配
-                                        real_var = torch.var(real_txt_feats, dim=0)
-                                        gen_var = torch.var(gen_txt_feats, dim=0)
+                                        real_var = torch.var(real_txt_feats, dim=0,unbiased=False)
+                                        gen_var = torch.var(gen_txt_feats, dim=0,unbiased=False)
                                         var_loss = F.mse_loss(gen_var, real_var)
 
                                         # 添加到分布损失
@@ -2029,7 +2029,7 @@ class Trainer:
             # 使用threshold将logits转换为二值预测
             threshold = 0.5  # 与您原始代码中相同的阈值
             preds_sigmoid = torch.sigmoid(preds)
-            binary_preds = (preds > threshold).float()
+            binary_preds = (preds_sigmoid > threshold).float()
 
             try:
                 # 计算多标签准确率（元素级匹配）

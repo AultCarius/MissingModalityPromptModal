@@ -298,6 +298,22 @@ class EnhancedCrossModalGenerator(nn.Module):
         if inference and generated.size(1) == 1:
             return generated.squeeze(1)  # Remove token dimension if single token
 
+        # 增加特征
+        if generated is not None and self.training:
+            # 打破弧形分布的关键步骤
+            batch_size = generated.size(0)
+
+            # 添加结构化噪声
+            noise_std = 0.03  # 调整这个值
+            structured_noise = torch.randn_like(generated) * noise_std
+
+            # 为不同样本添加不同的扰动模式
+            for i in range(batch_size):
+                random_rotation = torch.randn(generated.size(-1)) * 0.05
+                generated[i] = generated[i] + random_rotation
+
+            generated = generated + structured_noise
+
         return generated
 
     def forward(self, features, missing_type=None):
@@ -640,7 +656,6 @@ class EnhancedCycleGenerationModel(nn.Module):
 
         # Phase 2: Reconstruct for cycle consistency
         reconstructed_features = self.reconstructor(combined_features)
-
 
 
 

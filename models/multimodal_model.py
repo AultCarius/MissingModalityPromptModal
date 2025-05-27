@@ -320,7 +320,8 @@ class MultimodalPromptModel(nn.Module):
 
         # 使用质量引导的特征融合替换跨模态提示
         if use_cross_modal_prompt:
-            self.feature_fusion = QualityAwareFeatureFusion(
+            from models.quality_aware_prompting import ImprovedQualityAwareFeatureFusion
+            self.feature_fusion = ImprovedQualityAwareFeatureFusion(
                 self.image_dim,
                 self.text_dim,
                 fusion_dim

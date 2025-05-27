@@ -20,8 +20,8 @@ def combined_reconstruction_loss(original, reconstructed, distribution_weight=0.
     mean_loss = F.mse_loss(mean_recon, mean_orig)
 
     # 匹配方差
-    var_orig = torch.var(original, dim=0)
-    var_recon = torch.var(reconstructed, dim=0)
+    var_orig = torch.var(original, dim=0,unbiased=False)
+    var_recon = torch.var(reconstructed, dim=0,unbiased=False)
     var_loss = F.mse_loss(var_recon, var_orig)
 
     # 总分布损失

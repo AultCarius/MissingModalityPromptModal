@@ -24,7 +24,7 @@ batch_size: 16
 num_workers: 4
 image_size: 224
 patch_size: 16
-lr: 0.0001
+lr: 0.001
 weight_decay: 0.005
 warmup_percent: 0.1
 min_lr: 0.000001
