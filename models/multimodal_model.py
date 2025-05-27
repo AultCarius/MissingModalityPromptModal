@@ -363,6 +363,7 @@ class MultimodalPromptModel(nn.Module):
                 for param in module.parameters():
                     param.requires_grad = False
 
+
     def analyze_feature_distributions(self, original_features, generated_features, reconstructed_features, missing_type,
                                       step="before_processing"):
         """
@@ -738,12 +739,14 @@ class MultimodalPromptModel(nn.Module):
                     non_missing_mask = attention_mask[non_missing] if attention_mask is not None else None
 
 
+
                     if self.use_clip_encoders:
                         try:
                             if hasattr(self.text_encoder, 'embeddings'):
                                 non_missing_embeds = self.text_encoder.embeddings(
                                     non_missing_ids
                                 )
+
                             else:
                                 # 回退方案
                                 non_missing_embeds = self.text_embeddings(non_missing_ids)
@@ -801,7 +804,6 @@ class MultimodalPromptModel(nn.Module):
         # Extract token features for reconstruction (first few tokens of each modality)
         token_count = 1  # Number of tokens to use per modality
 
-        # Save original features for reconstruction loss
         original_features = {
             'image': image_embed[:, :token_count].reshape(batch_size, token_count, -1).detach(),
             'text': text_embed[:, :token_count].reshape(batch_size, token_count, -1).detach()
