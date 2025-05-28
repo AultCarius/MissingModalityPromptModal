@@ -1,7 +1,8 @@
 # 实验配置
 
 
-experiment_name: "mmimdb_test_delete_v2_nogen"
+experiment_name: "mmimdb_test_delete_v4_laterfusion_eot"
+
 
 
 # Model Configuration

@@ -86,8 +86,8 @@ class Trainer:
         # Initialize loss weights for different components
         self.loss_weights = {
             'classification': 1.0,
-            'reconstruction': 2.0,
-            'cycle': 2.0,
+            'reconstruction': 0.5,
+            'cycle': 0.5,
             'contrastive': 0.2,
             'quality': 0.1
         }
@@ -485,6 +485,12 @@ class Trainer:
                 'missing_types': []
             }
 
+            # 为每个模态的分类器单独跟踪性能
+            modality_preds = {
+                'image': [], 'text': [], 'combined': [], 'original': []
+            }
+            modality_labels = []
+
             # Create progress bar
             batch_pbar = tqdm(total=len(self.train_loader),
                               desc=f"Epoch {epoch + 1}/{num_epochs}",
@@ -515,6 +521,9 @@ class Trainer:
                     reconstructed_features = additional_info.get('reconstructed_features', {})
                     quality_scores = additional_info.get('quality_scores', None)
 
+
+
+
                     # ===== 1.分类损失 =====
                     if self.is_single_label:
                         # Single-label classification - use cross-entropy loss
@@ -544,175 +553,175 @@ class Trainer:
                                 logits, label, pos_weight=self.class_weights
                             )
 
-                        # ===== 2. Reconstruction and Cycle Consistency Losses =====
-                        reconstruction_loss = 0.0
-                        cycle_loss = 0.0
-                        generation_quality_loss = 0.0
+                    # ===== 2. Reconstruction and Cycle Consistency Losses =====
+                    reconstruction_loss = 0.0
+                    cycle_loss = 0.0
+                    generation_quality_loss = 0.0
 
-                        # Extract information from additional_info
-                        if additional_info:
-                            orig_features = additional_info.get('original_features', {})
-                            gen_features = additional_info.get('generated_features', {})
-                            recon_features = additional_info.get('reconstructed_features', {})
-                            cycle_features = additional_info.get('cycle_features', {})
+                    # Extract information from additional_info
+                    if additional_info:
+                        orig_features = additional_info.get('original_features', {})
+                        gen_features = additional_info.get('generated_features', {})
+                        recon_features = additional_info.get('reconstructed_features', {})
+                        cycle_features = additional_info.get('cycle_features', {})
 
-                            # Create masks for different sample types
-                            both_modalities = ~is_image_missing & ~is_text_missing  # Complete samples
-                            image_only = ~is_image_missing & is_text_missing  # Only image present
-                            text_only = is_image_missing & ~is_text_missing  # Only text present
-                            both_missing = is_image_missing & is_text_missing  # Both modalities missing
+                        # Create masks for different sample types
+                        both_modalities = ~is_image_missing & ~is_text_missing  # Complete samples
+                        image_only = ~is_image_missing & is_text_missing  # Only image present
+                        text_only = is_image_missing & ~is_text_missing  # Only text present
+                        both_missing = is_image_missing & is_text_missing  # Both modalities missing
 
-                            # Track reconstruction and cycle loss components
-                            recon_components = []
-                            cycle_components = []
+                        # Track reconstruction and cycle loss components
+                        recon_components = []
+                        cycle_components = []
 
-                            # === 2.1 Process samples with only text present (image is missing) ===
-                            if text_only.any() and 'text' in orig_features:
-                                text_orig = orig_features['text'][text_only]  # Original text features
+                        # === 2.1 Process samples with only text present (image is missing) ===
+                        if text_only.any() and 'text' in orig_features:
+                            text_orig = orig_features['text'][text_only]  # Original text features
 
-                                # Check if we have reconstructed text features
-                                text_recon_key = None
-                                for key in recon_features.keys():
-                                    if key.startswith('text_from_') and 'image' in key:
-                                        text_recon_key = key
-                                        break
+                            # Check if we have reconstructed text features
+                            text_recon_key = None
+                            for key in recon_features.keys():
+                                if key.startswith('text_from_') and 'image' in key:
+                                    text_recon_key = key
+                                    break
 
-                                if text_recon_key and text_recon_key in recon_features:
-                                    # Get text that was reconstructed from generated image
-                                    text_recon = recon_features[text_recon_key]
-                                    if text_only.sum() <= text_recon.size(0):
-                                        text_recon = text_recon[text_only]
+                            if text_recon_key and text_recon_key in recon_features:
+                                # Get text that was reconstructed from generated image
+                                text_recon = recon_features[text_recon_key]
+                                if text_only.sum() <= text_recon.size(0):
+                                    text_recon = text_recon[text_only]
 
-                                        # Calculate cycle consistency loss (text -> gen image -> recon text)
-                                        if text_recon.shape == text_orig.shape:
-                                            text_cycle_loss,_ = combined_reconstruction_loss(text_recon, text_orig)
-                                            cycle_components.append(text_cycle_loss)
+                                    # Calculate cycle consistency loss (text -> gen image -> recon text)
+                                    if text_recon.shape == text_orig.shape:
+                                        text_cycle_loss,_ = combined_reconstruction_loss(text_recon, text_orig)
+                                        cycle_components.append(text_cycle_loss)
 
-                                            # Log metrics
-                                            cycle_loss_sum += text_cycle_loss.item()
-                                            gen_stats['image']['mse'].append(text_cycle_loss.item())
-                                            gen_stats['image']['count'] += text_only.sum().item()
+                                        # Log metrics
+                                        cycle_loss_sum += text_cycle_loss.item()
+                                        gen_stats['image']['mse'].append(text_cycle_loss.item())
+                                        gen_stats['image']['count'] += text_only.sum().item()
 
-                            # === 2.2 Process samples with only image present (text is missing) ===
-                            if image_only.any() and 'image' in orig_features:
-                                image_orig = orig_features['image'][image_only]  # Original image features
+                        # === 2.2 Process samples with only image present (text is missing) ===
+                        if image_only.any() and 'image' in orig_features:
+                            image_orig = orig_features['image'][image_only]  # Original image features
 
-                                # Check if we have reconstructed image features
-                                image_recon_key = None
-                                for key in recon_features.keys():
-                                    if key.startswith('image_from_') and 'text' in key:
-                                        image_recon_key = key
-                                        break
+                            # Check if we have reconstructed image features
+                            image_recon_key = None
+                            for key in recon_features.keys():
+                                if key.startswith('image_from_') and 'text' in key:
+                                    image_recon_key = key
+                                    break
 
-                                if image_recon_key and image_recon_key in recon_features:
-                                    # Get image that was reconstructed from generated text
-                                    image_recon = recon_features[image_recon_key]
-                                    if image_only.sum() <= image_recon.size(0):
-                                        image_recon = image_recon[image_only]
+                            if image_recon_key and image_recon_key in recon_features:
+                                # Get image that was reconstructed from generated text
+                                image_recon = recon_features[image_recon_key]
+                                if image_only.sum() <= image_recon.size(0):
+                                    image_recon = image_recon[image_only]
 
-                                        # Calculate cycle consistency loss (image -> gen text -> recon image)
-                                        if image_recon.shape == image_orig.shape:
-                                            image_cycle_loss,_ = combined_reconstruction_loss(image_recon, image_orig)
-                                            cycle_components.append(image_cycle_loss)
+                                    # Calculate cycle consistency loss (image -> gen text -> recon image)
+                                    if image_recon.shape == image_orig.shape:
+                                        image_cycle_loss,_ = combined_reconstruction_loss(image_recon, image_orig)
+                                        cycle_components.append(image_cycle_loss)
 
-                                            # Log metrics
-                                            cycle_loss_sum += image_cycle_loss.item()
-                                            gen_stats['text']['mse'].append(image_cycle_loss.item())
-                                            gen_stats['text']['count'] += image_only.sum().item()
+                                        # Log metrics
+                                        cycle_loss_sum += image_cycle_loss.item()
+                                        gen_stats['text']['mse'].append(image_cycle_loss.item())
+                                        gen_stats['text']['count'] += image_only.sum().item()
 
-                            # === 2.3 Process complete samples (both modalities present) ===
-                            # For complete samples, we can train the generator with direct reconstruction
-                            if both_modalities.any() and recon_features:
-                                # Extract original features for complete samples
-                                if 'image' in orig_features and 'text' in orig_features:
-                                    img_orig = orig_features['image'][both_modalities]
-                                    txt_orig = orig_features['text'][both_modalities]
+                        # === 2.3 Process complete samples (both modalities present) ===
+                        # For complete samples, we can train the generator with direct reconstruction
+                        if both_modalities.any() and recon_features:
+                            # Extract original features for complete samples
+                            if 'image' in orig_features and 'text' in orig_features:
+                                img_orig = orig_features['image'][both_modalities]
+                                txt_orig = orig_features['text'][both_modalities]
 
-                                    # Check which cycle features we have
-                                    for key, features in recon_features.items():
-                                        if key == 'text_from_image' and features is not None:
-                                            # Get generated text from image
-                                            txt_from_img = features
-                                            if both_modalities.sum() <= txt_from_img.size(0):
-                                                txt_from_img = txt_from_img[both_modalities]
+                                # Check which cycle features we have
+                                for key, features in recon_features.items():
+                                    if key == 'text_from_image' and features is not None:
+                                        # Get generated text from image
+                                        txt_from_img = features
+                                        if both_modalities.sum() <= txt_from_img.size(0):
+                                            txt_from_img = txt_from_img[both_modalities]
 
-                                                # Calculate reconstruction loss (how well image->text works)
-                                                if txt_from_img.shape == txt_orig.shape:
-                                                    txt_gen_loss,_ = combined_reconstruction_loss(txt_from_img, txt_orig)
-                                                    recon_components.append(txt_gen_loss*2)
-                                                    recon_loss_sum += txt_gen_loss.item()
+                                            # Calculate reconstruction loss (how well image->text works)
+                                            if txt_from_img.shape == txt_orig.shape:
+                                                txt_gen_loss,_ = combined_reconstruction_loss(txt_from_img, txt_orig)
+                                                recon_components.append(txt_gen_loss*2)
+                                                recon_loss_sum += txt_gen_loss.item()
 
-                                        elif key == 'image_from_text' and features is not None:
-                                            # Get generated image from text
-                                            img_from_txt = features
-                                            if both_modalities.sum() <= img_from_txt.size(0):
-                                                img_from_txt = img_from_txt[both_modalities]
+                                    elif key == 'image_from_text' and features is not None:
+                                        # Get generated image from text
+                                        img_from_txt = features
+                                        if both_modalities.sum() <= img_from_txt.size(0):
+                                            img_from_txt = img_from_txt[both_modalities]
 
-                                                # Calculate reconstruction loss (how well text->image works)
-                                                if img_from_txt.shape == img_orig.shape:
-                                                    img_gen_loss,_ = combined_reconstruction_loss(img_from_txt, img_orig)
-                                                    recon_components.append(img_gen_loss*2)
-                                                    recon_loss_sum += img_gen_loss.item()
+                                            # Calculate reconstruction loss (how well text->image works)
+                                            if img_from_txt.shape == img_orig.shape:
+                                                img_gen_loss,_ = combined_reconstruction_loss(img_from_txt, img_orig)
+                                                recon_components.append(img_gen_loss*2)
+                                                recon_loss_sum += img_gen_loss.item()
 
-                            # === 2.4 Calculate combined reconstruction and cycle losses ===
-                            if recon_components:
-                                reconstruction_loss = sum(recon_components)
+                        # === 2.4 Calculate combined reconstruction and cycle losses ===
+                        if recon_components:
+                            reconstruction_loss = sum(recon_components)
 
-                            if cycle_components:
-                                cycle_loss = sum(cycle_components) / len(cycle_components)
+                        if cycle_components:
+                            cycle_loss = sum(cycle_components) / len(cycle_components)
 
-                            # ===== 3. Contrastive Loss =====
-                            contrastive_loss = 0.0
-                            contrastive_components = []
+                        # ===== 3. Contrastive Loss =====
+                        contrastive_loss = 0.0
+                        contrastive_components = []
 
-                            # Only calculate contrastive loss for complete samples
-                            if both_modalities.any() and recon_features:
-                                # Original features
-                                img_orig = orig_features['image'][
-                                    both_modalities] if 'image' in orig_features else None
-                                txt_orig = orig_features['text'][
-                                    both_modalities] if 'text' in orig_features else None
+                        # Only calculate contrastive loss for complete samples
+                        if both_modalities.any() and recon_features:
+                            # Original features
+                            img_orig = orig_features['image'][
+                                both_modalities] if 'image' in orig_features else None
+                            txt_orig = orig_features['text'][
+                                both_modalities] if 'text' in orig_features else None
 
-                                # Generated features
-                                img_gen = recon_features.get('image_from_text')
-                                txt_gen = recon_features.get('text_from_image')
+                            # Generated features
+                            img_gen = recon_features.get('image_from_text')
+                            txt_gen = recon_features.get('text_from_image')
 
-                                if img_orig is not None and txt_orig is not None and img_gen is not None and txt_gen is not None:
-                                    # Prepare features for contrastive loss (flatten multi-token features)
-                                    if img_orig.dim() > 2:
-                                        img_orig = img_orig.mean(dim=1)  # Average over tokens
-                                    if txt_orig.dim() > 2:
-                                        txt_orig = txt_orig.mean(dim=1)
-                                    if img_gen.dim() > 2:
-                                        img_gen = img_gen.mean(dim=1)
-                                    if txt_gen.dim() > 2:
-                                        txt_gen = txt_gen.mean(dim=1)
+                            if img_orig is not None and txt_orig is not None and img_gen is not None and txt_gen is not None:
+                                # Prepare features for contrastive loss (flatten multi-token features)
+                                if img_orig.dim() > 2:
+                                    img_orig = img_orig.mean(dim=1)  # Average over tokens
+                                if txt_orig.dim() > 2:
+                                    txt_orig = txt_orig.mean(dim=1)
+                                if img_gen.dim() > 2:
+                                    img_gen = img_gen.mean(dim=1)
+                                if txt_gen.dim() > 2:
+                                    txt_gen = txt_gen.mean(dim=1)
 
-                                    # Ensure all tensors have the same batch size
-                                    min_batch = min(img_orig.size(0), txt_orig.size(0), img_gen.size(0),
-                                                    txt_gen.size(0))
-                                    img_orig = img_orig[:min_batch]
-                                    txt_orig = txt_orig[:min_batch]
-                                    img_gen = img_gen[:min_batch]
-                                    txt_gen = txt_gen[:min_batch]
+                                # Ensure all tensors have the same batch size
+                                min_batch = min(img_orig.size(0), txt_orig.size(0), img_gen.size(0),
+                                                txt_gen.size(0))
+                                img_orig = img_orig[:min_batch]
+                                txt_orig = txt_orig[:min_batch]
+                                img_gen = img_gen[:min_batch]
+                                txt_gen = txt_gen[:min_batch]
 
-                                    # 1. Image-to-Text alignment (original image features should be close to original text)
-                                    img_txt_contra = self.modality_contrastive_loss(img_orig, txt_orig)
-                                    contrastive_components.append(img_txt_contra)
+                                # 1. Image-to-Text alignment (original image features should be close to original text)
+                                img_txt_contra = self.modality_contrastive_loss(img_orig, txt_orig)
+                                contrastive_components.append(img_txt_contra)
 
-                                    # 2. Original-to-Generated alignment
-                                    img_gen_contra = self.contrastive_loss(img_orig, img_gen)
-                                    txt_gen_contra = self.contrastive_loss(txt_orig, txt_gen)
-                                    contrastive_components.extend([img_gen_contra, txt_gen_contra])
+                                # 2. Original-to-Generated alignment
+                                img_gen_contra = self.contrastive_loss(img_orig, img_gen)
+                                txt_gen_contra = self.contrastive_loss(txt_orig, txt_gen)
+                                contrastive_components.extend([img_gen_contra, txt_gen_contra])
 
-                                    # 3. Generated-to-Generated alignment (cross-modal)
-                                    gen_contra = self.modality_contrastive_loss(img_gen, txt_gen)
-                                    contrastive_components.append(gen_contra)
+                                # 3. Generated-to-Generated alignment (cross-modal)
+                                gen_contra = self.modality_contrastive_loss(img_gen, txt_gen)
+                                contrastive_components.append(gen_contra)
 
-                            # Calculate average contrastive loss
-                            if contrastive_components:
-                                contrastive_loss = sum(contrastive_components) / len(contrastive_components)
-                                contra_loss_sum += contrastive_loss.item()
+                        # Calculate average contrastive loss
+                        if contrastive_components:
+                            contrastive_loss = sum(contrastive_components) / len(contrastive_components)
+                            contra_loss_sum += contrastive_loss.item()
 
                     # ===== 质量评估器训练 =====
                     # ===== 4. Quality Assessment Loss =====
@@ -1425,6 +1434,17 @@ class Trainer:
             'fusion_weights': []
         }
 
+        # 跟踪不同模态缺失类型的性能
+        missing_type_metrics = {
+            'none': {'preds': [], 'labels': [], 'logits': []},
+            'image': {'preds': [], 'labels': [], 'logits': []},
+            'text': {'preds': [], 'labels': [], 'logits': []},
+            'both': {'preds': [], 'labels': [], 'logits': []}
+        }
+        modality_preds = {
+            'image': [], 'text': [], 'combined': [], 'original': []
+        }
+
         with torch.no_grad():
             for batch in self.val_loader:
                 image, input_ids, attention_mask, label, missing_type = [x.to(self.device) for x in batch]
@@ -1449,10 +1469,35 @@ class Trainer:
                         quality_data['consistency'].append(quality_scores['cross_consistency'].cpu())
                         quality_data['missing_types'].append(missing_type.cpu())
 
-                    # 收集融合权重
-                    if additional_info and 'fusion_weights' in additional_info and additional_info[
-                        'fusion_weights'] is not None:
-                        quality_data['fusion_weights'].append(additional_info['fusion_weights'].cpu())
+                    if 'modality_logits' in additional_info:
+                        modality_logits = additional_info['modality_logits']
+
+                        # 收集每种模态分类器的预测
+                        for modality, mod_logits in modality_logits.items():
+                            # 计算预测
+                            if self.is_single_label:
+                                # 单标签分类
+                                mod_preds = torch.zeros_like(mod_logits)
+                                mod_preds.scatter_(1, mod_logits.argmax(dim=1).unsqueeze(1), 1.0)
+                            else:
+                                # 多标签分类
+                                mod_preds = (mod_logits > -0.2).float()
+
+                            # 仅处理有效的预测（非零logits）
+                            valid_samples = (mod_logits.abs().sum(dim=1) > 1e-6)
+
+                            if valid_samples.any():
+                                valid_preds = mod_preds[valid_samples]
+                                valid_labels = label[valid_samples]
+
+                                # 计算指标
+                                mod_metrics = self._compute_metrics(valid_preds.cpu(), valid_labels.cpu())
+
+                                # 记录日志
+                                self.logger.info(
+                                    f"{modality} classifier metrics ({valid_samples.sum().item()} samples):")
+                                metrics_str = " | ".join([f"{k}={v:.4f}" for k, v in mod_metrics.items()])
+                                self.logger.info(f"  {metrics_str}")
                 else:
                     logits = output
 
@@ -1515,6 +1560,25 @@ class Trainer:
                 else:
                     self._detailed_statistics(mt_logits, mt_labels, mt_preds, f"Missing: {mt_name}")
 
+        # 计算每种模态的指标
+        modality_results = {}
+        for modal_name, preds_list in modality_preds.items():
+            if preds_list:
+                modal_preds = torch.cat(preds_list, dim=0)
+                modal_metrics = self._compute_metrics(modal_preds, all_labels)
+                modality_results[modal_name] = modal_metrics
+
+        # 记录每种模态的性能
+        self.logger.info("\nModality-specific performance (Validation):")
+        for modal_name, modal_metrics in modality_results.items():
+            metrics_str = " | ".join([f"{k}={v:.4f}" for k, v in modal_metrics.items()])
+            self.logger.info(f"  {modal_name.capitalize()}: {metrics_str}")
+
+            # 写入TensorBoard
+            if self.writer and epoch is not None:
+                for k, v in modal_metrics.items():
+                    self.writer.add_scalar(f"{k}/val_{modal_name}", v, epoch)
+
 
         # 处理收集的质量评分数据
         if quality_data['image_quality']:
@@ -1556,6 +1620,8 @@ class Trainer:
                     self.visualize_fusion_weights(epoch, quality_data['fusion_weights'],
                                                   quality_data[
                                                       'missing_types'] if 'missing_types' in quality_data else None)
+
+
 
             # 按质量分数分层分析性能
             img_quality = quality_data['image_quality'].squeeze()

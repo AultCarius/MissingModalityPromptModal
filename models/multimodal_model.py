@@ -335,15 +335,66 @@ class MultimodalPromptModel(nn.Module):
         )
         self.classifier = nn.Linear(fusion_dim, num_classes)
 
+        # self.image_classifier = nn.Sequential(
+        #     nn.Linear(self.image_dim, fusion_dim),
+        #     nn.LayerNorm(fusion_dim),
+        #     nn.GELU(),
+        #     nn.Dropout(0.25),  # Higher dropout for image path
+        #     nn.Linear(fusion_dim, num_classes)
+        # )
+        #
+        # # Text-specific classifier
+        # # 2. 设计更强大的文本分类器
+        # self.text_classifier = nn.Sequential(
+        #     nn.Linear(self.text_dim, fusion_dim * 2),  # 更宽的隐藏层
+        #     nn.LayerNorm(fusion_dim * 2),
+        #     nn.GELU(),
+        #     nn.Dropout(0.1),  # 降低dropout以保留更多信息
+        #     nn.Linear(fusion_dim * 2, fusion_dim),
+        #     nn.GELU(),
+        #     nn.LayerNorm(fusion_dim),
+        #     nn.Linear(fusion_dim, num_classes)
+        # )
+
+        # Modality fusion weights learner
+        self.fusion_weight_net = nn.Sequential(
+            nn.Linear(4, 64),  # Input: missing_type one-hot
+            nn.ReLU(),
+            nn.Linear(64, 2),  # Output: [image_weight, text_weight]
+            nn.Softmax(dim=1)  # Ensure weights sum to 1
+        )
+        self.text_feat_enhancer = nn.Sequential(
+            nn.LayerNorm(self.text_dim),
+            nn.Linear(self.text_dim, self.text_dim),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(self.text_dim, self.text_dim),
+            nn.LayerNorm(self.text_dim)
+        )
+        # 初始化文本分类器最后一层的偏置，使其更容易产生正向预测
+        # with torch.no_grad():
+        #     # 获取最后一层
+        #     last_layer = None
+        #     for module in reversed(self.text_classifier):
+        #         if isinstance(module, nn.Linear):
+        #             last_layer = module
+        #             break
+        #
+        #     if last_layer is not None:
+        #         # 将偏置初始化为小正值，促进正向预测
+        #         last_layer.bias.fill_(0.1)  # 使用0.1作为初始偏置
+
+
+
+
         self.image_feat_norm = nn.LayerNorm(self.image_dim)
         self.text_feat_norm = nn.LayerNorm(self.text_dim)
         self.base_fusion_norm = nn.LayerNorm(fusion_dim)
         self.quality_fusion_norm = nn.LayerNorm(fusion_dim)
 
-        # 为图像特征使用较小的初始权重，抑制其影响
-        self.image_feat_norm.weight.data.fill_(0.8)  # 默认是1.0
-        # 为文本特征使用较大的初始权重，增强其影响
-        self.text_feat_norm.weight.data.fill_(1.2)  # 默认是1.0
+        # 修改为
+        self.image_feat_norm.weight.data.fill_(0.6)  # 降低图像特征影响
+        self.text_feat_norm.weight.data.fill_(1.4)  # 增加文本特征影响
 
         # 冻结预训练参数（如果需要）
         if freeze_image_encoder:
@@ -621,6 +672,37 @@ class MultimodalPromptModel(nn.Module):
 
         return consistency_loss
 
+    def _prepare_clip_image_attention_mask(self, attention_mask, seq_len):
+        """
+        为CLIP视觉Transformer准备注意力掩码（非causal）
+        Args:
+            attention_mask: [batch_size, seq_len]，通常全为1
+            seq_len: token数量（例如patch + cls + prompt）
+
+        Returns:
+            [batch_size, 1, seq_len, seq_len] attention mask
+        """
+        batch_size = attention_mask.shape[0]
+        # full attention with valid tokens
+        mask = attention_mask.unsqueeze(1).unsqueeze(2).repeat(1, 1, seq_len, 1)  # [B,1,S,S]
+        mask = mask.float().masked_fill(mask == 0, float("-inf")).masked_fill(mask == 1, 0.0)
+        return mask
+
+    def _prepare_clip_text_attention_mask(self, attention_mask, seq_len):
+        """
+        为CLIP文本Transformer准备注意力掩码（非causal）
+        Args:
+            attention_mask: [batch_size, seq_len]，1表示有效token，0表示padding
+            seq_len: token数量（包括prompt或eot）
+
+        Returns:
+            [batch_size, 1, 1, seq_len] attention mask，用于广播
+        """
+        extended_mask = attention_mask.unsqueeze(1).unsqueeze(2)  # [B,1,1,S]
+        extended_mask = extended_mask.float().masked_fill(extended_mask == 0, float("-inf")).masked_fill(
+            extended_mask == 1, 0.0)
+        return extended_mask
+
     def _prepare_attention_mask(self, attention_mask, input_shape):
         """准备用于Transformer层的注意力掩码"""
         # 扩展维度以创建4D掩码
@@ -637,9 +719,21 @@ class MultimodalPromptModel(nn.Module):
 
         return extended_attention_mask
 
+    def _prepare_attention_mask_clip(self, attention_mask, hidden_states):
+        """为CLIP文本编码器准备注意力掩码"""
+        if attention_mask is None:
+            return None
+
+        mask = torch.empty(self.context_length + self.prompt_length,
+                           self.context_length + self.prompt_length)
+        mask.fill_(float("-inf"))
+        mask.triu_(1)
+        return mask
+
     def _prepare_clip_attention_mask(self, attention_mask):
         """
         为CLIP视觉模型准备注意力掩码
+        # todo:修改掩码
 
         Args:
             attention_mask: 形状为[batch_size, seq_len]的掩码
@@ -729,48 +823,28 @@ class MultimodalPromptModel(nn.Module):
         text_embed = torch.zeros(batch_size, input_ids.size(1), self.text_dim, device=device)  # 默认零嵌入
         if input_ids is not None and not is_text_missing.all():
 
-            # 只处理非缺失样本
-            non_missing = ~is_text_missing
-            non_missing_count = non_missing.sum().item()
-
-            if non_missing_count > 0:  # 确保有非缺失样本
-                try:
-                    non_missing_ids = input_ids[non_missing]
-                    non_missing_mask = attention_mask[non_missing] if attention_mask is not None else None
-
-
-
-                    if self.use_clip_encoders:
-                        try:
-                            if hasattr(self.text_encoder, 'embeddings'):
-                                non_missing_embeds = self.text_encoder.embeddings(
-                                    non_missing_ids
-                                )
-
-                            else:
-                                # 回退方案
-                                non_missing_embeds = self.text_embeddings(non_missing_ids)
-                        except Exception as e:
-                            print(f"获取CLIP文本嵌入时出错: {str(e)}")
-                            seq_len = non_missing_ids.size(1)
-                            non_missing_embeds = torch.randn(non_missing_count, seq_len, self.text_dim, device=device)
+            try:
+                if self.use_clip_encoders:
+                    if hasattr(self.text_encoder, 'embeddings'):
+                        all_text_embeds = self.text_encoder.embeddings(input_ids)
                     else:
-                        # 标准文本模型
-                        non_missing_embeds = self.text_embeddings(non_missing_ids)
+                        all_text_embeds = self.text_embeddings(input_ids)
+                else:
+                    all_text_embeds = self.text_embeddings(input_ids)
 
-                    # 检查嵌入形状
-                    if non_missing_embeds.size(0) != non_missing_count:
-                        print(f"文本嵌入形状不匹配: {non_missing_embeds.size(0)} vs {non_missing_count}")
-                        # 处理不匹配情况...
+                # 将所有编码结果赋值，包括来自空字符串的嵌入
+                text_embed = all_text_embeds
 
-                    # 安全地赋值嵌入向量（不是IDs）
-                    text_embed[non_missing] = non_missing_embeds
+            except Exception as e:
+                print(f"处理文本嵌入时出错: {str(e)}")
+                # 只有在出错时才回退到零填充
+                text_embed = torch.zeros(batch_size, input_ids.size(1), self.text_dim, device=device)
 
-                except Exception as e:
-                    print(f"处理文本嵌入时出错: {str(e)}")
-                    # 回退策略：使用零填充
-                    seq_len = input_ids.size(1)
-                    text_embed = torch.zeros(batch_size, seq_len, self.text_dim, device=device)
+        for b in range(batch_size):
+            if is_text_missing[b]:
+                # 为缺失的文本创建特殊的mask：只关注第一个token（CLS位置）
+                attention_mask[b, 0] = 1  # 至少保证CLS token有效
+                # 其他位置保持0，这样在后续生成时不会干扰
 
         return image_embed, text_embed, is_image_missing, is_text_missing
 
@@ -885,6 +959,7 @@ class MultimodalPromptModel(nn.Module):
                 seq_len = 77  # Adjust to actual sequence length
                 text_embed = torch.zeros(batch_size, seq_len, self.text_dim, device=device)
                 attention_mask = torch.zeros(batch_size, seq_len, dtype=torch.long, device=device)
+                # todo:检查这里的attention_mask
 
             # Copy generated features to appropriate positions
             for b in range(batch_size):
@@ -961,18 +1036,10 @@ class MultimodalPromptModel(nn.Module):
         image_embed, text_embed, is_image_missing, is_text_missing = self._extract_features(
             image, input_ids, attention_mask, missing_type
         )
-        from utils.debugutils import print_tensor_shapes
-        # print("原始特征")
-        # print("image",image.shape)
-        # print("input_ids",input_ids.shape)
-        # print("attention_mask",attention_mask.shape)
-        # print("image_embed",image_embed.shape)
-        # print("text_embed",text_embed.shape)
-
 
         # 1. 在提取特征后，分析原始特征分布
         # 创建一个随机采样检查标志，避免分析所有批次
-        should_analyze = (torch.rand(1).item() < 0.01)  # 1%的批次进行分析
+        should_analyze = (torch.rand(1).item() < 0.001)  # 1%的批次进行分析
         shoule_analyze_fusion = (torch.rand(1).item() < 0.01)
         # 特征分布分析
         if should_analyze and image_embed is not None and text_embed is not None:
@@ -990,14 +1057,6 @@ class MultimodalPromptModel(nn.Module):
         #     image_embed, text_embed, attention_mask, missing_type
         # )
 
-        # print("重建特征,只重建了最后一个token,额外信息返回的原始特征也只保留了最后一个toekn")
-        # print("attention_mask",attention_mask.shape)
-        # print("image_embed",image_embed.shape)
-        # print("text_embed",text_embed.shape)
-        # print("gen_image",additional_info['generated_features']['image'].shape)
-        # print("gen_text",additional_info['generated_features']['text'].shape)
-        # print("ingen_return_origin",additional_info['original_features']['image'].shape)
-        # print("ingen_return_origin",additional_info['original_features']['text'].shape)
 
         # 初始化提示
         image_prompt = self.image_init_prompt.expand(batch_size, -1, -1)  # [B, prompt_len, D_img]
@@ -1024,8 +1083,9 @@ class MultimodalPromptModel(nn.Module):
                 img_attention_mask = torch.ones((batch_size, img_seq_len), device=device)
                 # 将掩码转换为CLIP注意力层期望的格式
                 # 将形状为[batch_size, seq_len]的掩码转换为[batch_size, 1, seq_len, seq_len]
-                extended_img_mask = self._prepare_clip_attention_mask(img_attention_mask)
-                # CLIP的视觉层需要attention_mask和causal_attention_mask
+                extended_img_mask = self._prepare_clip_image_attention_mask(img_attention_mask, img_seq_len)
+                # extended_img_mask = self._prepare_clip_attention_mask(img_attention_mask)
+
                 temp_img = self.image_blocks[i](
                     hidden_states=temp_img,
                     attention_mask=extended_img_mask,
@@ -1037,7 +1097,8 @@ class MultimodalPromptModel(nn.Module):
                 temp_img = self.image_blocks[i](temp_img)
 
             # 处理文本的注意力掩码
-            extended_attention_mask = self._prepare_attention_mask(attention_mask, text_embed.shape[1])
+            # extended_attention_mask = self._prepare_attention_mask(attention_mask, text_embed.shape[1])
+            extended_attention_mask = self._prepare_clip_text_attention_mask(attention_mask, text_embed.shape[1])
 
             if self.encoder_type == 'clip' or self.use_clip_encoders:
                 temp_txt = self.text_blocks[i](
@@ -1074,7 +1135,8 @@ class MultimodalPromptModel(nn.Module):
 
                 # 创建掩码并扩展维度
                 img_attention_mask = torch.ones((batch_size, img_seq_len), device=device)
-                extended_img_mask = self._prepare_clip_attention_mask(img_attention_mask)
+                extended_img_mask = self._prepare_clip_image_attention_mask(img_attention_mask, img_with_prompt.shape[1])
+                # extended_img_mask = self._prepare_clip_attention_mask(img_attention_mask)
 
                 # CLIP的视觉层需要attention_mask和causal_attention_mask
                 img_with_prompt = self.image_blocks[i](
@@ -1095,7 +1157,7 @@ class MultimodalPromptModel(nn.Module):
                 torch.ones(batch_size, self.text_prompt_len, device=attention_mask.device),
                 attention_mask
             ], dim=1)
-            extended_attention_mask = self._prepare_attention_mask(extended_mask, txt_with_prompt.shape[1])
+            extended_attention_mask = self._prepare_clip_text_attention_mask(extended_mask, txt_with_prompt.shape[1])
 
             if self.encoder_type == 'clip':
                 txt_with_prompt = self.text_blocks[i](
@@ -1127,7 +1189,8 @@ class MultimodalPromptModel(nn.Module):
 
                 # 创建掩码并扩展维度
                 img_attention_mask = torch.ones((batch_size, img_seq_len), device=device)
-                extended_img_mask = self._prepare_clip_attention_mask(img_attention_mask)
+                extended_img_mask = self._prepare_clip_image_attention_mask(img_attention_mask, img_seq_len)
+                # extended_img_mask = self._prepare_clip_attention_mask(img_attention_mask)
 
                 # CLIP的视觉层需要attention_mask和causal_attention_mask
                 image_embed = self.image_blocks[i](
@@ -1140,7 +1203,7 @@ class MultimodalPromptModel(nn.Module):
                 # 标准ViT层
                 image_embed = self.image_blocks[i](image_embed)
 
-            extended_attention_mask = self._prepare_attention_mask(attention_mask, text_embed.shape[1])
+            extended_attention_mask = self._prepare_clip_text_attention_mask(attention_mask, text_embed.shape[1])
             if self.encoder_type == 'clip':
                 text_embed = self.text_blocks[i](
                     text_embed,
@@ -1173,7 +1236,26 @@ class MultimodalPromptModel(nn.Module):
         # print(image_embed.shape,text_embed.shape)
         # 提取CLS token特征
         image_feat = image_embed[:, 0]  # [B, D_img]
-        text_feat = text_embed[:, 0]  # [B, D_txt]
+        # For CLIP text encoders
+        # 对于CLIP文本模型，应该使用EOT token，而不是第一个token
+        if self.encoder_type == 'clip':
+            # 找到每个序列中EOT token的位置
+            # 在CLIP中，EOT token通常是最后一个非padding token
+            if attention_mask is not None:
+                # 获取每个序列的长度（最后一个非padding token的位置）
+                seq_lengths = attention_mask.sum(dim=1) - 1  # 索引是从0开始的
+
+                # 创建batch索引
+                batch_indices = torch.arange(text_embed.size(0), device=text_embed.device)
+
+                # 提取每个序列中EOT token位置的特征
+                text_feat = text_embed[batch_indices, seq_lengths]
+            else:
+                # 如果没有attention mask，假设所有序列都是相同长度，使用最后一个token
+                text_feat = text_embed[:, -1]
+        else:
+            # 非CLIP模型（如RoBERTa）使用第一个token（CLS token）
+            text_feat = text_embed[:, 0]  # [B, D_txt]
 
         image_feat_norm = self.image_feat_norm(image_feat)
         text_feat_norm = self.text_feat_norm(text_feat)
@@ -1202,7 +1284,7 @@ class MultimodalPromptModel(nn.Module):
             'text': text_feat.unsqueeze(1) if text_feat is not None else None  # [B, 1, D_txt]
         }
 
-        # 在这里生成cls token
+        # 在这里生成cls token与eot token
         processed_image,processed_text,processed_attenmask , additional_info = self._process_modalities(
             features_for_generation['image'],
             features_for_generation['text'],
@@ -1235,6 +1317,71 @@ class MultimodalPromptModel(nn.Module):
         # 5. 在质量评估和特征融合前
         if should_analyze:
             self.analyze_features_at_key_points("特征融合前", image_feat_norm.detach(), text_feat_norm.detach())
+
+        if not hasattr(self, 'image_classifier'):
+            self.image_classifier = nn.Linear(self.image_dim, self.classifier.out_features).to(image_feat.device)
+            self.text_classifier = nn.Linear(self.text_dim, self.classifier.out_features).to(text_feat.device)
+            with torch.no_grad():
+                # 为图像分类器使用合适的初始化
+                nn.init.xavier_uniform_(self.image_classifier.weight)
+                if self.image_classifier.bias is not None:
+                    nn.init.zeros_(self.image_classifier.bias)
+
+                # 为文本分类器使用合适的初始化
+                nn.init.xavier_uniform_(self.text_classifier.weight)
+                if self.text_classifier.bias is not None:
+                    nn.init.zeros_(self.text_classifier.bias)
+
+                # 如果原始分类器有偏置，复制到新分类器
+                if hasattr(self.classifier, 'bias') and self.classifier.bias is not None:
+                    self.image_classifier.bias.copy_(self.classifier.bias)
+                    self.text_classifier.bias.copy_(self.classifier.bias)
+
+
+        # img_logits = self.image_classifier(image_feat)
+        # txt_logits = self.text_classifier(text_feat)
+
+        batch_size = image_feat.size(0)
+        num_classes = self.classifier.out_features
+        device = image_feat.device
+
+        # 创建掩码
+        both_present = (~is_image_missing) & (~is_text_missing)
+        only_image = (~is_image_missing) & is_text_missing
+        only_text = is_image_missing & (~is_text_missing)
+        both_missing = is_image_missing & is_text_missing
+
+        img_logits = torch.zeros(batch_size, num_classes, device=device)
+        txt_logits = torch.zeros(batch_size, num_classes, device=device)
+        combined_logits = torch.zeros(batch_size, num_classes, device=device)
+
+        # 应用各个分类器
+        if only_image.any():
+            img_logits[only_image] = self.image_classifier(image_feat[only_image])
+
+        if only_text.any():
+            txt_logits[only_text] = self.text_classifier(text_feat[only_text])
+
+        if both_present.any():
+            # 对于都存在的样本，计算两个分类器的结果并融合
+            img_pred = self.image_classifier(image_feat[both_present])
+            txt_pred = self.text_classifier(text_feat[both_present])
+
+            # 简单的加权融合（可以使用质量分数作为权重）
+            if quality_scores is not None:
+                img_weight = quality_scores['image']['final_score'][both_present]
+                txt_weight = quality_scores['text']['final_score'][both_present]
+                weights_sum = img_weight + txt_weight + 1e-8  # 避免除零
+
+                img_weight_norm = img_weight / weights_sum
+                txt_weight_norm = txt_weight / weights_sum
+
+                combined_logits[both_present] = (img_pred * img_weight_norm) + (txt_pred * txt_weight_norm)
+            else:
+                # 默认等权融合
+                combined_logits[both_present] = (img_pred + txt_pred) / 2.0
+
+
 
         # 质量引导的特征融合（如果启用）
         fusion_weights = None
@@ -1322,6 +1469,15 @@ class MultimodalPromptModel(nn.Module):
             print(f"Text LayerNorm weights: {self.text_feat_norm.weight.mean().item():.4f}")
             print(f"Image LayerNorm weights: {self.base_fusion_norm.weight.mean().item():.4f}")
             print(f"Text LayerNorm weights: {self.quality_fusion_norm.weight.mean().item():.4f}")
+
+        additional_info.update({
+            'modality_logits': {
+                'image': img_logits,
+                'text': txt_logits,
+                'combined': combined_logits,
+                'original': logits
+            }
+        })
 
         return (logits, additional_info)
 

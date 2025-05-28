@@ -63,9 +63,20 @@ class MMIMDBDataset(Dataset):
             if genre in GENRE_CLASS_DICT:
                 label[GENRE_CLASS_DICT[genre]] = 1.0
 
+
+        # 4. 模态缺失模拟 - 存储原始数据并标记缺失
+        missing_type = self._simulate_missing()
+
         # 2. 文本处理
         plot = metadata["plot"][0] if isinstance(metadata["plot"], list) else metadata["plot"]
-        encoded = self.tokenizer(plot, padding="max_length", truncation=True,
+
+        if missing_type in ["text", "both"]:
+            # 使用空字符串而不是零填充
+            text_to_encode = ""  # 或者使用 "[MISSING]" 等特殊标记
+        else:
+            text_to_encode = plot
+
+        encoded = self.tokenizer(text_to_encode, padding="max_length", truncation=True,
                                  max_length=self.max_length, return_tensors="pt")
         # print("input_ids:",encoded["input_ids"].shape,"attention_mask",encoded["input_ids"].shape)
         input_ids = encoded["input_ids"].squeeze(0)
@@ -75,17 +86,6 @@ class MMIMDBDataset(Dataset):
         image = Image.open(img_path).convert("RGB")
         image = self.image_transform(image)
 
-        # 4. 模态缺失模拟 - 存储原始数据并标记缺失
-        missing_type = self._simulate_missing()
-
-        # # 保存原始数据
-        # original_image = image.clone()
-        # original_input_ids = input_ids.clone()
-        # original_attention_mask = attention_mask.clone()
-
-        # 标记缺失模态（但不清零原始数据）
-        # is_image_missing = missing_type in ["image", "both"]
-        # is_text_missing = missing_type in ["text", "both"]
 
         missing_type_tensor = torch.tensor({
                                                "none": 0, "image": 1, "text": 2, "both": 3
@@ -94,11 +94,6 @@ class MMIMDBDataset(Dataset):
         if missing_type in ["image", "both"]:
             # 用零张量替代图像，保留相同的形状
             image = torch.zeros_like(image)
-
-        if missing_type in ["text", "both"]:
-            # 用零张量替代文本，保留相同的形状
-            input_ids = torch.zeros_like(input_ids)
-            attention_mask = torch.zeros_like(attention_mask)
 
         return (
             image, input_ids, attention_mask,
