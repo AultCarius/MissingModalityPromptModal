@@ -335,6 +335,34 @@ class MultimodalPromptModel(nn.Module):
         )
         self.classifier = nn.Linear(fusion_dim, num_classes)
 
+        self.image_classifier = nn.Sequential(
+            nn.Linear(self.image_dim, fusion_dim),
+            nn.LayerNorm(fusion_dim),
+            nn.GELU(),
+            nn.Dropout(0.25),  # Higher dropout for image path
+            nn.Linear(fusion_dim, num_classes)
+        )
+
+        # Text-specific classifier
+        self.text_classifier = nn.Sequential(
+            nn.Linear(self.text_dim, fusion_dim),
+            nn.LayerNorm(fusion_dim),
+            nn.GELU(),
+            nn.Dropout(0.15),  # Lower dropout for text path
+            nn.Linear(fusion_dim, num_classes)
+        )
+        # Modality fusion weights learner
+        self.fusion_weight_net = nn.Sequential(
+            nn.Linear(4, 64),  # Input: missing_type one-hot
+            nn.ReLU(),
+            nn.Linear(64, 2),  # Output: [image_weight, text_weight]
+            nn.Softmax(dim=1)  # Ensure weights sum to 1
+        )
+
+
+
+
+
         self.image_feat_norm = nn.LayerNorm(self.image_dim)
         self.text_feat_norm = nn.LayerNorm(self.text_dim)
         self.base_fusion_norm = nn.LayerNorm(fusion_dim)
@@ -636,6 +664,22 @@ class MultimodalPromptModel(nn.Module):
 
         return extended_attention_mask
 
+    def _prepare_attention_mask_clip(self, attention_mask, hidden_states):
+        """为CLIP文本编码器准备注意力掩码"""
+        if attention_mask is None:
+            return None
+
+        # 使用transformers库的标准掩码处理函数
+        from transformers.models.clip.modeling_clip import _prepare_4d_attention_mask
+
+        # CLIP需要4D掩码: [batch_size, 1, seq_len, seq_len]
+        extended_attention_mask = _prepare_4d_attention_mask(
+            attention_mask,
+            hidden_states.dtype,
+            tgt_len=hidden_states.shape[1]
+        )
+
+        return extended_attention_mask
     def _prepare_clip_attention_mask(self, attention_mask):
         """
         为CLIP视觉模型准备注意力掩码
@@ -727,47 +771,28 @@ class MultimodalPromptModel(nn.Module):
         # 处理文本特征 (如果存在且不是缺失的)
         text_embed = torch.zeros(batch_size, input_ids.size(1), self.text_dim, device=device)  # 默认零嵌入
         if input_ids is not None and not is_text_missing.all():
-
-            # 只处理非缺失样本
-            non_missing = ~is_text_missing
-            non_missing_count = non_missing.sum().item()
-
-            if non_missing_count > 0:  # 确保有非缺失样本
-                try:
-                    non_missing_ids = input_ids[non_missing]
-                    non_missing_mask = attention_mask[non_missing] if attention_mask is not None else None
-
-
-                    if self.use_clip_encoders:
-                        try:
-                            if hasattr(self.text_encoder, 'embeddings'):
-                                non_missing_embeds = self.text_encoder.embeddings(
-                                    non_missing_ids
-                                )
-                            else:
-                                # 回退方案
-                                non_missing_embeds = self.text_embeddings(non_missing_ids)
-                        except Exception as e:
-                            print(f"获取CLIP文本嵌入时出错: {str(e)}")
-                            seq_len = non_missing_ids.size(1)
-                            non_missing_embeds = torch.randn(non_missing_count, seq_len, self.text_dim, device=device)
+            try:
+                if self.use_clip_encoders:
+                    if hasattr(self.text_encoder, 'embeddings'):
+                        all_text_embeds = self.text_encoder.embeddings(input_ids)
                     else:
-                        # 标准文本模型
-                        non_missing_embeds = self.text_embeddings(non_missing_ids)
+                        all_text_embeds = self.text_embeddings(input_ids)
+                else:
+                    all_text_embeds = self.text_embeddings(input_ids)
 
-                    # 检查嵌入形状
-                    if non_missing_embeds.size(0) != non_missing_count:
-                        print(f"文本嵌入形状不匹配: {non_missing_embeds.size(0)} vs {non_missing_count}")
-                        # 处理不匹配情况...
+                # 将所有编码结果赋值，包括来自空字符串的嵌入
+                text_embed = all_text_embeds
 
-                    # 安全地赋值嵌入向量（不是IDs）
-                    text_embed[non_missing] = non_missing_embeds
+            except Exception as e:
+                print(f"处理文本嵌入时出错: {str(e)}")
+                # 只有在出错时才回退到零填充
+                text_embed = torch.zeros(batch_size, input_ids.size(1), self.text_dim, device=device)
 
-                except Exception as e:
-                    print(f"处理文本嵌入时出错: {str(e)}")
-                    # 回退策略：使用零填充
-                    seq_len = input_ids.size(1)
-                    text_embed = torch.zeros(batch_size, seq_len, self.text_dim, device=device)
+        for b in range(batch_size):
+            if is_text_missing[b]:
+                # 为缺失的文本创建特殊的mask：只关注第一个token（CLS位置）
+                attention_mask[b, 0] = 1  # 至少保证CLS token有效
+                # 其他位置保持0，这样在后续生成时不会干扰
 
         return image_embed, text_embed, is_image_missing, is_text_missing
 
@@ -959,14 +984,6 @@ class MultimodalPromptModel(nn.Module):
         image_embed, text_embed, is_image_missing, is_text_missing = self._extract_features(
             image, input_ids, attention_mask, missing_type
         )
-        from utils.debugutils import print_tensor_shapes
-        # print("原始特征")
-        # print("image",image.shape)
-        # print("input_ids",input_ids.shape)
-        # print("attention_mask",attention_mask.shape)
-        # print("image_embed",image_embed.shape)
-        # print("text_embed",text_embed.shape)
-
 
         # 1. 在提取特征后，分析原始特征分布
         # 创建一个随机采样检查标志，避免分析所有批次
@@ -1022,8 +1039,9 @@ class MultimodalPromptModel(nn.Module):
                 img_attention_mask = torch.ones((batch_size, img_seq_len), device=device)
                 # 将掩码转换为CLIP注意力层期望的格式
                 # 将形状为[batch_size, seq_len]的掩码转换为[batch_size, 1, seq_len, seq_len]
-                extended_img_mask = self._prepare_clip_attention_mask(img_attention_mask)
-                # CLIP的视觉层需要attention_mask和causal_attention_mask
+                extended_img_mask = self._prepare_attention_mask(img_attention_mask, img_seq_len)
+                # extended_img_mask = self._prepare_clip_attention_mask(img_attention_mask)
+
                 temp_img = self.image_blocks[i](
                     hidden_states=temp_img,
                     attention_mask=extended_img_mask,
@@ -1035,7 +1053,8 @@ class MultimodalPromptModel(nn.Module):
                 temp_img = self.image_blocks[i](temp_img)
 
             # 处理文本的注意力掩码
-            extended_attention_mask = self._prepare_attention_mask(attention_mask, text_embed.shape[1])
+            # extended_attention_mask = self._prepare_attention_mask(attention_mask, text_embed.shape[1])
+            extended_attention_mask = self._prepare_attention_mask_clip(attention_mask, text_embed)
 
             if self.encoder_type == 'clip' or self.use_clip_encoders:
                 temp_txt = self.text_blocks[i](
@@ -1072,7 +1091,8 @@ class MultimodalPromptModel(nn.Module):
 
                 # 创建掩码并扩展维度
                 img_attention_mask = torch.ones((batch_size, img_seq_len), device=device)
-                extended_img_mask = self._prepare_clip_attention_mask(img_attention_mask)
+                extended_img_mask = self._prepare_attention_mask(img_attention_mask, img_with_prompt.shape[1])
+                # extended_img_mask = self._prepare_clip_attention_mask(img_attention_mask)
 
                 # CLIP的视觉层需要attention_mask和causal_attention_mask
                 img_with_prompt = self.image_blocks[i](
@@ -1125,7 +1145,8 @@ class MultimodalPromptModel(nn.Module):
 
                 # 创建掩码并扩展维度
                 img_attention_mask = torch.ones((batch_size, img_seq_len), device=device)
-                extended_img_mask = self._prepare_clip_attention_mask(img_attention_mask)
+                extended_img_mask = self._prepare_attention_mask(img_attention_mask, img_seq_len)
+                # extended_img_mask = self._prepare_clip_attention_mask(img_attention_mask)
 
                 # CLIP的视觉层需要attention_mask和causal_attention_mask
                 image_embed = self.image_blocks[i](
@@ -1234,6 +1255,44 @@ class MultimodalPromptModel(nn.Module):
         if should_analyze:
             self.analyze_features_at_key_points("特征融合前", image_feat_norm.detach(), text_feat_norm.detach())
 
+
+        # TODO: 后期融合
+        # === NEW: SEPARATE MODALITY CLASSIFICATION ===
+        # Compute logits from each modality's classifier
+        image_logits = self.image_classifier(image_feat_norm)
+        text_logits = self.text_classifier(text_feat_norm)
+        # Determine fusion weights based on quality or missing type
+        if quality_scores is not None:
+            # Use quality scores to determine weights
+            img_weight = quality_scores['image']['final_score']
+            txt_weight = quality_scores['text']['final_score']
+        else:
+            # Use one-hot encoded missing type for weight prediction
+            missing_one_hot = F.one_hot(missing_type, num_classes=4).float()
+            fusion_weights = self.fusion_weight_net(missing_one_hot)
+            img_weight = fusion_weights[:, 0:1]  # First column for image weight
+            txt_weight = fusion_weights[:, 1:2]  # Second column for text weight
+        # Add missing type specific adjustments
+        # Increase weight for the present modality, decrease for missing
+        img_weight = torch.where(is_image_missing.unsqueeze(1),
+                                 img_weight * 0.3,  # Reduce weight if missing
+                                 img_weight * 1.2)  # Increase weight if present
+
+        txt_weight = torch.where(is_text_missing.unsqueeze(1),
+                                 txt_weight * 0.3,  # Reduce weight if missing
+                                 txt_weight * 1.2)  # Increase weight if present
+
+        # Normalize weights to sum to 1
+        weight_sum = img_weight + txt_weight + 1e-8  # Avoid division by zero
+        img_weight = img_weight / weight_sum
+        txt_weight = txt_weight / weight_sum
+
+        # Late fusion: weighted combination of modality-specific logits
+        logits = img_weight * image_logits + txt_weight * text_logits
+
+
+
+
         # 质量引导的特征融合（如果启用）
         fusion_weights = None
         quality_guided_feat = None
@@ -1304,7 +1363,7 @@ class MultimodalPromptModel(nn.Module):
         if should_analyze and hidden is not None:
             self.analyze_features_at_key_points("最终融合hidden", hidden.detach(), None)
 
-        logits = self.classifier(hidden)
+        # logits = self.classifier(hidden)
 
         additional_info.update({
             'quality_scores': quality_scores,

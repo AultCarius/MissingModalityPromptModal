@@ -1,13 +1,13 @@
 # 实验配置
 
-experiment_name: "mmimdb_test_delete_v2_nogen"
+experiment_name: "mmimdb_test_delete_v4_laterfusion"
 
 # Model Configuration
 image_model_name: "openai/clip-vit-base-patch16" #[vit_base_patch16_224,openai/clip-vit-base-patch16]
 text_model_name: "openai/clip-vit-base-patch16" #[roberta-base,openai/clip-vit-base-patch16]
 encoder_type: "clip"  # "clip" or "roberta"
-image_prompt_len: 36
-text_prompt_len: 36
+image_prompt_len: 18
+text_prompt_len: 18
 prompt_depth: 6
 fusion_dim: 512
 freeze_image_encoder: True
@@ -16,7 +16,7 @@ use_quality_prompt: True
 use_cross_modal_prompt: True
 initial_recon_weight: 1
 final_recon_weight: 0.1
-max_length: 77
+max_length: 41
 
 # Training Configuration
 epochs: 40
