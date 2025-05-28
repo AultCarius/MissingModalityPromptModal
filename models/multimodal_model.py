@@ -189,23 +189,64 @@ class MultimodalPromptModel(nn.Module):
             self.image_dim = self.image_encoder.config.hidden_size
             self.text_dim = self.text_encoder.config.hidden_size
 
-            print(f"Using CLIP encoders - Image dim: {self.image_dim}, Text dim: {self.text_dim}")
+            # 获取CLIP的投影维度
+            if hasattr(self.image_encoder.config, 'projection_dim'):
+                self.clip_projection_dim = self.image_encoder.config.projection_dim
+            else:
+                self.clip_projection_dim = 512  # CLIP默认投影维度
+
+            print(f"Using CLIP encoders - Image dim: {self.image_dim}, Text dim: {self.text_dim}, Projection dim: {self.clip_projection_dim}")
 
             # 根据CLIP模型的真实结构设置组件
-            # CLIP视觉模型
-            self.image_patch_embed = self.image_encoder.vision_model.embeddings  # 正确访问embeddings
-            self.image_blocks = self.image_encoder.vision_model.encoder.layers
-            self.image_norm = self.image_encoder.vision_model.post_layernorm
+            # CLIP视觉模型 - 修正访问路径
+            if hasattr(self.image_encoder, 'vision_model'):
+                # 如果是完整的CLIP模型
+                self.image_patch_embed = self.image_encoder.vision_model.embeddings
+                self.image_blocks = self.image_encoder.vision_model.encoder.layers
+                self.image_norm = self.image_encoder.vision_model.post_layernorm
+                self.vision_projection = self.image_encoder.visual_projection if hasattr(self.image_encoder,
+                                                                                         'visual_projection') else None
+            elif hasattr(self.image_encoder, 'embeddings'):
+                # 如果是CLIPVisionModel
+                self.image_patch_embed = self.image_encoder.embeddings
+                self.image_blocks = self.image_encoder.encoder.layers
+                self.image_norm = self.image_encoder.post_layernorm
+                self.vision_projection = nn.Linear(self.image_dim, self.clip_projection_dim, bias=False)
+                # 使用正交初始化
+                nn.init.orthogonal_(self.vision_projection.weight)
+            else:
+                raise ValueError("Unsupported CLIP vision model structure")
 
-            # CLIP文本模型
-            self.text_embeddings = self.text_encoder.text_model.embeddings
-            self.text_blocks = self.text_encoder.text_model.encoder.layers
-            self.text_norm = self.text_encoder.text_model.final_layer_norm
+            # CLIP文本模型 - 修正访问路径
+            if hasattr(self.text_encoder, 'text_model'):
+                self.text_embeddings = self.text_encoder.text_model.embeddings
+                self.text_blocks = self.text_encoder.text_model.encoder.layers
+                self.text_norm = self.text_encoder.text_model.final_layer_norm
+                # 获取text投影层
+                self.text_projection = self.text_encoder.text_projection if hasattr(self.text_encoder, 'text_projection') else None
+            elif hasattr(self.text_encoder, 'embeddings'):
+                self.text_embeddings = self.text_encoder.embeddings
+                self.text_blocks = self.text_encoder.encoder.layers
+                self.text_norm = self.text_encoder.final_layer_norm
+                # 如果是单独的text model，可能没有投影层，需要创建
+                self.text_projection = nn.Linear(self.text_dim, self.clip_projection_dim, bias=False)
+                # 使用正交初始化
+                nn.init.orthogonal_(self.text_projection.weight)
 
             # 创建兼容接口
             self.image_cls_token = nn.Parameter(torch.zeros(1, 1, self.image_dim))
-            self.image_pos_embed = nn.Parameter(torch.zeros(1, 197, self.image_dim))  # 仅作为占位符
+            # CLIP vision模型的position embeddings数量
+            if hasattr(self.image_encoder, 'vision_model'):
+                pos_embed_size = self.image_encoder.vision_model.embeddings.position_embedding.num_embeddings
+            else:
+                pos_embed_size = self.image_encoder.embeddings.position_embedding.num_embeddings
+
+            self.image_pos_embed = nn.Parameter(torch.zeros(1, pos_embed_size, self.image_dim))
             self.image_pos_drop = nn.Dropout(0.0)
+
+            # 初始化position embeddings
+            nn.init.trunc_normal_(self.image_pos_embed, std=0.02)
+            nn.init.trunc_normal_(self.image_cls_token, std=0.02)
 
         else:
             # 处理常规编码器
@@ -281,10 +322,15 @@ class MultimodalPromptModel(nn.Module):
 
         # 集成模态生成器（使用CycleGenerationModel替代CrossModalGenerator）
         if use_modality_generator:
+            # modality_dims = {
+            #     'image': self.image_dim,
+            #     'text': self.text_dim
+            # }
             modality_dims = {
-                'image': self.image_dim,
-                'text': self.text_dim
+                'image': self.clip_projection_dim ,
+                'text': self.clip_projection_dim
             }
+
             # self.modality_generator = CycleGenerationModel(modality_dims, fusion_hidden_dim=fusion_dim)
 
             self.modality_generator = EnhancedCycleGenerationModel(
@@ -294,9 +340,9 @@ class MultimodalPromptModel(nn.Module):
                 num_heads=4  # Can be configured via a parameter
             )
 
-        # 使用增强的质量评估器替换原有评估器
-        if use_quality_prompt:
-            self.quality_estimator = EnhancedModalityQualityEstimator(self.image_dim, self.text_dim)
+
+
+
 
         # 模态内层间提示
         self.cross_modal_layer = nn.ModuleList([
@@ -314,16 +360,42 @@ class MultimodalPromptModel(nn.Module):
         ])
 
         # 融合和分类层
-        fusion_input_dim = self.image_dim + self.text_dim + 4  # 基础特征 + 缺失类型
+        fusion_input_dim = self.clip_projection_dim *2 + 4  # 基础特征 + 缺失类型
+        # fusion_input_dim = self.image_dim + self.text_dim + 4  # 基础特征 + 缺失类型
         if use_quality_prompt:
             fusion_input_dim += 13  # 增加质量评分（2个质量特征5+3个详细评分1）
 
-        # 使用质量引导的特征融合替换跨模态提示
+        # # 使用增强的质量评估器替换原有评估器
+        # if use_quality_prompt:
+        #     self.quality_estimator = EnhancedModalityQualityEstimator(self.image_dim, self.text_dim)
+        #
+        # # 使用质量引导的特征融合替换跨模态提示
+        # if use_cross_modal_prompt:
+        #     from models.quality_aware_prompting import ImprovedQualityAwareFeatureFusion
+        #     self.feature_fusion = ImprovedQualityAwareFeatureFusion(
+        #         self.image_dim,
+        #         self.text_dim,
+        #         fusion_dim
+        #     )
+
+
+
+        # 标记使用CLIP投影
+        self.use_clip_projections = True
+
+        # 更新融合维度设置，使用CLIP投影维度
+        if use_quality_prompt:
+            # 质量评估器也需要使用投影后的维度
+            self.quality_estimator = EnhancedModalityQualityEstimator(
+                self.clip_projection_dim, self.clip_projection_dim
+            )
+
+        # 特征融合也使用投影维度
         if use_cross_modal_prompt:
             from models.quality_aware_prompting import ImprovedQualityAwareFeatureFusion
             self.feature_fusion = ImprovedQualityAwareFeatureFusion(
-                self.image_dim,
-                self.text_dim,
+                self.clip_projection_dim,
+                self.clip_projection_dim,
                 fusion_dim
             )
 
@@ -387,14 +459,11 @@ class MultimodalPromptModel(nn.Module):
 
 
 
-        self.image_feat_norm = nn.LayerNorm(self.image_dim)
-        self.text_feat_norm = nn.LayerNorm(self.text_dim)
+        self.image_feat_norm = nn.LayerNorm(self.clip_projection_dim )
+        self.text_feat_norm = nn.LayerNorm(self.clip_projection_dim )
         self.base_fusion_norm = nn.LayerNorm(fusion_dim)
         self.quality_fusion_norm = nn.LayerNorm(fusion_dim)
 
-        # 修改为
-        self.image_feat_norm.weight.data.fill_(0.6)  # 降低图像特征影响
-        self.text_feat_norm.weight.data.fill_(1.4)  # 增加文本特征影响
 
         # 冻结预训练参数（如果需要）
         if freeze_image_encoder:
@@ -413,6 +482,40 @@ class MultimodalPromptModel(nn.Module):
             for module in [self.text_embeddings, self.text_blocks, self.text_norm]:
                 for param in module.parameters():
                     param.requires_grad = False
+
+    def apply_clip_projections(self, image_feat, text_feat):
+        """
+        应用CLIP投影层，将图像和文本特征投影到统一的语义空间
+
+        Args:
+            image_feat: 图像特征 [batch_size, image_dim]
+            text_feat: 文本特征 [batch_size, text_dim]
+
+        Returns:
+            projected_image_feat: 投影后的图像特征 [batch_size, projection_dim]
+            projected_text_feat: 投影后的文本特征 [batch_size, projection_dim]
+        """
+        projected_image_feat = None
+        projected_text_feat = None
+
+        if self.use_clip_projections:
+            # 应用图像投影
+            if image_feat is not None and self.vision_projection is not None:
+                projected_image_feat = self.vision_projection(image_feat)
+                # 归一化（CLIP的标准做法）
+                projected_image_feat = F.normalize(projected_image_feat, p=2, dim=-1)
+
+            # 应用文本投影
+            if text_feat is not None and self.text_projection is not None:
+                projected_text_feat = self.text_projection(text_feat)
+                # 归一化（CLIP的标准做法）
+                projected_text_feat = F.normalize(projected_text_feat, p=2, dim=-1)
+        else:
+            # 不使用CLIP投影时，直接返回原特征
+            projected_image_feat = image_feat
+            projected_text_feat = text_feat
+
+        return projected_image_feat, projected_text_feat
 
     def analyze_feature_distributions(self, original_features, generated_features, reconstructed_features, missing_type,
                                       step="before_processing"):
@@ -702,6 +805,24 @@ class MultimodalPromptModel(nn.Module):
             extended_mask == 1, 0.0)
         return extended_mask
 
+    def _prepare_causal_attention_mask(self, seq_len: int, device: torch.device) -> torch.Tensor:
+        """
+        构造 causal attention mask，用于阻止每个位置看到它右边的 token。
+
+        Args:
+            seq_len (int): 输入序列长度（prompt + text）
+            device (torch.device): 设备
+
+        Returns:
+            causal_mask: [1, 1, seq_len, seq_len] 的 mask，float 类型，填充为 0 或 -inf
+        """
+        causal_mask = torch.triu(
+            torch.ones(seq_len, seq_len, dtype=torch.float32, device=device) * float('-inf'),
+            diagonal=1
+        )  # 上三角为 -inf，下三角为 0
+        causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, seq_len, seq_len]
+        return causal_mask
+
     def _prepare_attention_mask(self, attention_mask, input_shape):
         """准备用于Transformer层的注意力掩码"""
         # 扩展维度以创建4D掩码
@@ -786,32 +907,30 @@ class MultimodalPromptModel(nn.Module):
 
                 if self.use_clip_encoders:
                     try:
-                        # 尝试直接获取embeddings输出
-                        if hasattr(self.image_encoder, 'embeddings'):
-                            non_missing_embeds = self.image_encoder.embeddings(pixel_values=non_missing_images)
+                        # 使用CLIP vision model的embeddings
+                        if hasattr(self.image_encoder, 'vision_model'):
+                            # 完整CLIP模型
+                            embeddings = self.image_encoder.vision_model.embeddings
                         else:
-                            # 回退方案
-                            with torch.no_grad():
-                                vision_outputs = self.image_encoder(
-                                    pixel_values=non_missing_images,
-                                    output_hidden_states=True,
-                                    output_attentions=False,
-                                    return_dict=True
-                                )
-                                non_missing_embeds = vision_outputs.hidden_states[0] if hasattr(vision_outputs,
-                                                                                                'hidden_states') else None
+                            # CLIPVisionModel
+                            embeddings = self.image_encoder.embeddings
 
-                        if non_missing_embeds is None:
-                            print("WARNING: Unable to get proper embeddings from CLIP vision model.")
-                            non_missing_embeds = torch.randn(non_missing.sum(), 197, self.image_dim, device=device)
+                        # 获取patch embeddings
+                        non_missing_embeds = embeddings(pixel_values=non_missing_images)
+
+                        # CLIP vision模型通常已经包含了CLS token和position embeddings
+                        # 所以我们直接使用embeddings的输出
+
                     except Exception as e:
                         print(f"Error extracting CLIP vision embeddings: {e}")
-                        non_missing_embeds = torch.randn(non_missing.sum(), 197, self.image_dim, device=device)
+                        # 创建备用的随机嵌入
+                        seq_len = 197  # CLIP ViT-B/16的典型序列长度
+                        non_missing_embeds = torch.randn(non_missing.sum(), seq_len, self.image_dim, device=device)
                 else:
-                    # 标准ViT模型
-                    patch_embeds = self.image_patch_embed(non_missing_images)  # [B_non_missing, N, D_img]
-                    cls_token = self.image_cls_token.expand(non_missing.sum(), -1, -1)  # [B_non_missing, 1, D_img]
-                    non_missing_embeds = torch.cat((cls_token, patch_embeds), dim=1)  # [B_non_missing, N+1, D_img]
+                    # 标准ViT模型处理（原有代码）
+                    patch_embeds = self.image_patch_embed(non_missing_images)
+                    cls_token = self.image_cls_token.expand(non_missing.sum(), -1, -1)
+                    non_missing_embeds = torch.cat((cls_token, patch_embeds), dim=1)
                     non_missing_embeds = non_missing_embeds + self.image_pos_embed[:, :non_missing_embeds.size(1), :]
                     non_missing_embeds = self.image_pos_drop(non_missing_embeds)
 
@@ -819,23 +938,26 @@ class MultimodalPromptModel(nn.Module):
                 image_embed[non_missing] = non_missing_embeds
 
         # 处理文本特征 (如果存在且不是缺失的)
-        text_embed = torch.zeros(batch_size, input_ids.size(1), self.text_dim, device=device)  # 默认零嵌入
+        text_embed = torch.zeros(batch_size, input_ids.size(1), self.text_dim, device=device)
         if input_ids is not None and not is_text_missing.all():
             try:
                 if self.use_clip_encoders:
-                    if hasattr(self.text_encoder, 'embeddings'):
-                        all_text_embeds = self.text_encoder.embeddings(input_ids)
+                    # 使用CLIP text model的embeddings
+                    if hasattr(self.text_encoder, 'text_model'):
+                        # 完整CLIP模型
+                        all_text_embeds = self.text_encoder.text_model.embeddings(input_ids)
                     else:
-                        all_text_embeds = self.text_embeddings(input_ids)
+                        # CLIPTextModel
+                        all_text_embeds = self.text_encoder.embeddings(input_ids)
                 else:
+                    # 其他文本模型
                     all_text_embeds = self.text_embeddings(input_ids)
 
-                # 将所有编码结果赋值，包括来自空字符串的嵌入
+                # 将所有编码结果赋值
                 text_embed = all_text_embeds
 
             except Exception as e:
                 print(f"处理文本嵌入时出错: {str(e)}")
-                # 只有在出错时才回退到零填充
                 text_embed = torch.zeros(batch_size, input_ids.size(1), self.text_dim, device=device)
 
         for b in range(batch_size):
@@ -1072,45 +1194,45 @@ class MultimodalPromptModel(nn.Module):
             if pre_img_feature is not None and pre_text_feature is not None:
                 self.analyze_features_at_key_points("模态处理后", pre_img_feature, pre_text_feature)
 
-        for i in range(2):  # 使用前两层获取初步特征
-            # 修改处理CLIP视觉层的部分（在forward方法中）
-            if self.use_clip_encoders:
-                # CLIP视觉模型需要特殊处理
-                # 为CLIP层创建适当的注意力掩码
-                img_seq_len = temp_img.shape[1]
-                # 创建一个二维形状的掩码 [batch_size, seq_len]
-                img_attention_mask = torch.ones((batch_size, img_seq_len), device=device)
-                # 将掩码转换为CLIP注意力层期望的格式
-                # 将形状为[batch_size, seq_len]的掩码转换为[batch_size, 1, seq_len, seq_len]
-                extended_img_mask = self._prepare_clip_image_attention_mask(img_attention_mask, img_seq_len)
-                # extended_img_mask = self._prepare_clip_attention_mask(img_attention_mask)
-
-                temp_img = self.image_blocks[i](
-                    hidden_states=temp_img,
-                    attention_mask=extended_img_mask,
-                    causal_attention_mask=None,
-                    output_attentions=False
-                )[0]
-            else:
-                # 标准ViT层
-                temp_img = self.image_blocks[i](temp_img)
-
-            # 处理文本的注意力掩码
-            # extended_attention_mask = self._prepare_attention_mask(attention_mask, text_embed.shape[1])
-            extended_attention_mask = self._prepare_clip_text_attention_mask(attention_mask, text_embed.shape[1])
-
-            if self.encoder_type == 'clip' or self.use_clip_encoders:
-                temp_txt = self.text_blocks[i](
-                    temp_txt,
-                    attention_mask=extended_attention_mask,
-                    causal_attention_mask=None,
-                    output_attentions=False
-                )[0]
-            elif self.encoder_type == 'roberta':
-                temp_txt = self.text_blocks[i](
-                    temp_txt,
-                    attention_mask=extended_attention_mask
-                )[0]
+        # for i in range(2):  # 使用前两层获取初步特征
+        #     # 修改处理CLIP视觉层的部分（在forward方法中）
+        #     if self.use_clip_encoders:
+        #         # CLIP视觉模型需要特殊处理
+        #         # 为CLIP层创建适当的注意力掩码
+        #         img_seq_len = temp_img.shape[1]
+        #         # 创建一个二维形状的掩码 [batch_size, seq_len]
+        #         img_attention_mask = torch.ones((batch_size, img_seq_len), device=device)
+        #         # 将掩码转换为CLIP注意力层期望的格式
+        #         # 将形状为[batch_size, seq_len]的掩码转换为[batch_size, 1, seq_len, seq_len]
+        #         extended_img_mask = self._prepare_clip_image_attention_mask(img_attention_mask, img_seq_len)
+        #         # extended_img_mask = self._prepare_clip_attention_mask(img_attention_mask)
+        #
+        #         temp_img = self.image_blocks[i](
+        #             hidden_states=temp_img,
+        #             attention_mask=extended_img_mask,
+        #             causal_attention_mask=None,
+        #             output_attentions=False
+        #         )[0]
+        #     else:
+        #         # 标准ViT层
+        #         temp_img = self.image_blocks[i](temp_img)
+        #
+        #     # 处理文本的注意力掩码
+        #     # extended_attention_mask = self._prepare_attention_mask(attention_mask, text_embed.shape[1])
+        #     extended_attention_mask = self._prepare_clip_text_attention_mask(attention_mask, text_embed.shape[1])
+        #
+        #     if self.encoder_type == 'clip' or self.use_clip_encoders:
+        #         temp_txt = self.text_blocks[i](
+        #             temp_txt,
+        #             attention_mask=extended_attention_mask,
+        #             causal_attention_mask=None,
+        #             output_attentions=False
+        #         )[0]
+        #     elif self.encoder_type == 'roberta':
+        #         temp_txt = self.text_blocks[i](
+        #             temp_txt,
+        #             attention_mask=extended_attention_mask
+        #         )[0]
 
         # 2. 在应用Transformer层前
         if should_analyze:
@@ -1123,60 +1245,81 @@ class MultimodalPromptModel(nn.Module):
         quality_scores = None
 
         # 跨层处理
+        # 在跨层处理中修复CLIP层的调用
+        # 在跨层处理中修复CLIP层的调用
         for i in range(self.prompt_depth):
             # 图像：拼接提示并处理
             img_with_prompt = torch.cat([image_prompt, image_embed], dim=1)
-            # 在forward方法中，修改两处处理CLIP视觉层的代码（i < prompt_depth的情况）
+
             if self.use_clip_encoders:
                 # CLIP视觉模型需要特殊处理
-                # 为CLIP层创建适当的注意力掩码
                 img_seq_len = img_with_prompt.shape[1]
 
-                # 创建掩码并扩展维度
+                # 创建attention mask
                 img_attention_mask = torch.ones((batch_size, img_seq_len), device=device)
-                extended_img_mask = self._prepare_clip_image_attention_mask(img_attention_mask, img_with_prompt.shape[1])
-                # extended_img_mask = self._prepare_clip_attention_mask(img_attention_mask)
+                extended_img_mask = self._prepare_clip_image_attention_mask(img_attention_mask, img_seq_len)
 
-                # CLIP的视觉层需要attention_mask和causal_attention_mask
-                img_with_prompt = self.image_blocks[i](
-                    hidden_states=img_with_prompt,
-                    attention_mask=extended_img_mask,
-                    causal_attention_mask=None,
-                    output_attentions=False
-                )[0]
+                # CLIP的视觉Transformer层调用
+                if hasattr(self.image_blocks[i], '__call__'):
+                    # 对于CLIPVisionModel的层
+                    img_with_prompt = self.image_blocks[i](
+                        img_with_prompt,
+                        attention_mask=extended_img_mask,
+                        causal_attention_mask=None,
+                        output_attentions=False
+                    )[0]  # 只取hidden_states
+                else:
+                    # 备用方案
+                    img_with_prompt = self.image_blocks[i](img_with_prompt)
             else:
                 # 标准ViT层
                 img_with_prompt = self.image_blocks[i](img_with_prompt)
+
             image_prompt, image_embed = img_with_prompt[:, :self.image_prompt_len], img_with_prompt[:,
                                                                                     self.image_prompt_len:]
 
             # 文本：拼接提示并处理
             txt_with_prompt = torch.cat([text_prompt, text_embed], dim=1)
-            extended_mask = torch.cat([
-                torch.ones(batch_size, self.text_prompt_len, device=attention_mask.device),
-                attention_mask
-            ], dim=1)
-            extended_attention_mask = self._prepare_clip_text_attention_mask(extended_mask, txt_with_prompt.shape[1])
+            full_attention_mask = torch.cat([
+                torch.ones(batch_size, self.text_prompt_len, device=attention_mask.device),  # 对应 prompt
+                attention_mask  # 对应原始 text
+            ], dim=1)  # [B, full_seq_len] = [B, 125]
+            # 构建 extended mask 和 causal mask
+            extended_mask = self._prepare_clip_text_attention_mask(full_attention_mask, txt_with_prompt.shape[1])
 
-            if self.encoder_type == 'clip':
-                txt_with_prompt = self.text_blocks[i](
-                    txt_with_prompt,
-                    attention_mask=extended_attention_mask,
-                    causal_attention_mask=None,
-                    output_attentions=False
-                )[0]
-            elif self.encoder_type == 'roberta':
-                txt_with_prompt = self.text_blocks[i](
-                    txt_with_prompt,
-                    attention_mask=extended_attention_mask
-                )[0]
+            # CLIP文本模型的层调用
+            if self.use_clip_encoders:
+                # 为CLIP text model准备causal attention mask
+                seq_len = txt_with_prompt.size(1)
+                causal_attention_mask = self._prepare_causal_attention_mask(seq_len,device=attention_mask.device)
+                if hasattr(self.text_blocks[i], '__call__'):
+                    # 对于CLIPTextModel的层
+                    layer_output = self.text_blocks[i](
+                        txt_with_prompt,
+                        attention_mask=extended_mask,
+                        causal_attention_mask=causal_attention_mask,
+                        output_attentions=False
+                    )
+                    txt_with_prompt = layer_output[0]  # 只取hidden_states
+                else:
+                    # 备用方案
+                    txt_with_prompt = self.text_blocks[i](txt_with_prompt)
+            else:
+                # 其他文本模型的处理
+                extended_attention_mask = self._prepare_clip_text_attention_mask(extended_mask,
+                                                                                 txt_with_prompt.shape[1])
+
+                if self.encoder_type == 'roberta':
+                    txt_with_prompt = self.text_blocks[i](
+                        txt_with_prompt,
+                        attention_mask=extended_attention_mask
+                    )[0]
 
             text_prompt, text_embed = txt_with_prompt[:, :self.text_prompt_len], txt_with_prompt[:,
                                                                                  self.text_prompt_len:]
 
             # 跨模态交互更新提示
             if i < len(self.cross_modal_layer):
-                # 从当前层特征更新提示
                 image_prompt = self.image_InterPrompt_layer[i](image_prompt, image_embed)
                 text_prompt = self.text_InterPrompt_layer[i](text_prompt, text_embed)
 
@@ -1190,6 +1333,7 @@ class MultimodalPromptModel(nn.Module):
                 img_attention_mask = torch.ones((batch_size, img_seq_len), device=device)
                 extended_img_mask = self._prepare_clip_image_attention_mask(img_attention_mask, img_seq_len)
                 # extended_img_mask = self._prepare_clip_attention_mask(img_attention_mask)
+                causal_attention_mask = self._prepare_causal_attention_mask(img_seq_len, device=attention_mask.device)
 
                 # CLIP的视觉层需要attention_mask和causal_attention_mask
                 image_embed = self.image_blocks[i](
@@ -1203,11 +1347,12 @@ class MultimodalPromptModel(nn.Module):
                 image_embed = self.image_blocks[i](image_embed)
 
             extended_attention_mask = self._prepare_clip_text_attention_mask(attention_mask, text_embed.shape[1])
+            causal_attention_mask = self._prepare_causal_attention_mask(text_embed.shape[1], device=attention_mask.device)
             if self.encoder_type == 'clip':
                 text_embed = self.text_blocks[i](
                     text_embed,
                     attention_mask=extended_attention_mask,
-                    causal_attention_mask=None,
+                    causal_attention_mask=causal_attention_mask,
                     output_attentions=False
                 )[0]
             elif self.encoder_type == 'roberta':
@@ -1237,54 +1382,73 @@ class MultimodalPromptModel(nn.Module):
         image_feat = image_embed[:, 0]  # [B, D_img]
         # For CLIP text encoders
         # 对于CLIP文本模型，应该使用EOT token，而不是第一个token
+        # 修复文本特征提取
         if self.encoder_type == 'clip':
-            # 找到每个序列中EOT token的位置
-            # 在CLIP中，EOT token通常是最后一个非padding token
+            # 对于CLIP文本模型，需要正确处理EOT token
             if attention_mask is not None:
-                # 获取每个序列的长度（最后一个非padding token的位置）
-                seq_lengths = attention_mask.sum(dim=1) - 1  # 索引是从0开始的
+                # 计算每个序列的有效长度
+                seq_lengths = attention_mask.sum(dim=1) - 1  # EOT token位置
 
-                # 创建batch索引
+                # 处理边界情况：确保序列长度至少为0
+                seq_lengths = torch.clamp(seq_lengths, min=0, max=text_embed.size(1) - 1)
+
+                # 检查是否有无效的attention_mask（全零）
+                valid_sequences = attention_mask.sum(dim=1) > 0
+
+                # 对于无效序列，使用第一个位置（通常是开始标记）
+                seq_lengths[~valid_sequences] = 0
+
+                # 提取EOT token特征
                 batch_indices = torch.arange(text_embed.size(0), device=text_embed.device)
-
-                # 提取每个序列中EOT token位置的特征
                 text_feat = text_embed[batch_indices, seq_lengths]
+
+                # 对于无效序列，将特征置零（这些通常是缺失的文本）
+                text_feat[~valid_sequences] = 0
             else:
-                # 如果没有attention mask，假设所有序列都是相同长度，使用最后一个token
+                # 如果没有attention mask，使用最后一个token
                 text_feat = text_embed[:, -1]
         else:
             # 非CLIP模型（如RoBERTa）使用第一个token（CLS token）
-            text_feat = text_embed[:, 0]  # [B, D_txt]
+            text_feat = text_embed[:, 0]
 
-        image_feat_norm = self.image_feat_norm(image_feat)
-        text_feat_norm = self.text_feat_norm(text_feat)
+        # *** 关键步骤：应用CLIP投影层 ***
+        # 这里是应用投影的最佳时机：在获得最终的CLS/EOT特征后，但在后续处理前
+        if self.use_clip_projections:
+            # print("应用CLIP投影层...")  # 调试信息
+            image_feat_projected, text_feat_projected = self.apply_clip_projections(image_feat, text_feat)
 
-        # 收集模态特征用于epoch分析（在训练时且随机采样）
-        if self.training and hasattr(self, 'fusion_analyzer') and self.fusion_analyzer is not None:
-            # 随机采样收集特征，避免收集所有批次
-            should_collect = (torch.rand(1).item() < 0.1)  # 30%的批次收集特征
-            if should_collect:
-                try:
-                    self.fusion_analyzer.collect_modality_features(
-                        image_feat=image_feat_norm.detach(),  # 使用归一化后的特征
-                        text_feat=text_feat_norm.detach(),  # 使用归一化后的特征
-                        missing_type=missing_type
-                    )
-                except Exception as e:
-                    # 如果收集失败，不影响训练
-                    pass
+            # 调试：检查投影前后的特征
+            if torch.rand(1).item() < 0.002:  # 1%概率打印调试信息
+                print(f"投影前 - 图像特征: mean={image_feat.mean().item():.6f}, std={image_feat.std().item():.6f}")
+                print(f"投影前 - 文本特征: mean={text_feat.mean().item():.6f}, std={text_feat.std().item():.6f}")
+                print(
+                    f"投影后 - 图像特征: mean={image_feat_projected.mean().item():.6f}, std={image_feat_projected.std().item():.6f}")
+                print(
+                    f"投影后 - 文本特征: mean={text_feat_projected.mean().item():.6f}, std={text_feat_projected.std().item():.6f}")
+
+                # 检查特征相似度
+                similarity = F.cosine_similarity(
+                    image_feat_projected.mean(dim=0, keepdim=True),
+                    text_feat_projected.mean(dim=0, keepdim=True)
+                )
+                print(f"投影后特征相似度: {similarity.item():.6f}")
+        else:
+            image_feat_projected = image_feat
+            text_feat_projected = text_feat
 
 
-        image_feat = image_feat_norm
-        text_feat = text_feat_norm
+        # 1. 保存原始 Transformer 输出特征，用于后续生成
+        orig_image_feat = image_feat_projected  # [B, D_img]
+        orig_text_feat = text_feat_projected  # [B, D_txt]
 
+        # 2. 构造输入给生成器：直接使用原始未归一化的特征
         features_for_generation = {
-            'image': image_feat.unsqueeze(1) if image_feat is not None else None,  # [B, 1, D_img]
-            'text': text_feat.unsqueeze(1) if text_feat is not None else None  # [B, 1, D_txt]
+            'image': orig_image_feat.unsqueeze(1) if orig_image_feat is not None else None,  # [B, 1, D_img]
+            'text': orig_text_feat.unsqueeze(1) if orig_text_feat is not None else None  # [B, 1, D_txt]
         }
 
-        # 在这里生成cls token与eot token
-        processed_image,processed_text,processed_attenmask , additional_info = self._process_modalities(
+        # 3. 生成器处理，返回生成后的 CLS 或 EOT token（表示缺失模态）
+        processed_image, processed_text, processed_attenmask, additional_info = self._process_modalities(
             features_for_generation['image'],
             features_for_generation['text'],
             attention_mask,
@@ -1292,16 +1456,34 @@ class MultimodalPromptModel(nn.Module):
         )
         generated_features = additional_info.get('generated_features', {})
 
-        # 用生成特征替换原始clstoken
+        # 4. 替换缺失模态的原始特征
+        # 注意此处仍是未归一化的特征
         if is_image_missing.any() and 'image' in generated_features and generated_features['image'] is not None:
             for b in range(batch_size):
                 if is_image_missing[b]:
-                    image_feat[b] = generated_features['image'][b].squeeze(0)
+                    orig_image_feat[b] = generated_features['image'][b].squeeze(0)
 
         if is_text_missing.any() and 'text' in generated_features and generated_features['text'] is not None:
             for b in range(batch_size):
                 if is_text_missing[b]:
-                    text_feat[b] = generated_features['text'][b].squeeze(0)
+                    orig_text_feat[b] = generated_features['text'][b].squeeze(0)
+
+        # 5. 对最终的 image/text 特征统一进行归一化（包括原始或替换后的）
+        image_feat_norm = self.image_feat_norm(orig_image_feat)
+        text_feat_norm = self.text_feat_norm(orig_text_feat)
+
+        # 6. 可选：采样记录用于分析的模态特征
+        if self.training and hasattr(self, 'fusion_analyzer') and self.fusion_analyzer is not None:
+            should_collect = (torch.rand(1).item() < 0.1)
+            if should_collect:
+                try:
+                    self.fusion_analyzer.collect_modality_features(
+                        image_feat=image_feat_norm.detach(),
+                        text_feat=text_feat_norm.detach(),
+                        missing_type=missing_type
+                    )
+                except Exception:
+                    pass
 
 
         # 5. 在质量评估和特征融合前
@@ -1318,8 +1500,8 @@ class MultimodalPromptModel(nn.Module):
             self.analyze_features_at_key_points("特征融合前", image_feat_norm.detach(), text_feat_norm.detach())
 
         if not hasattr(self, 'image_classifier'):
-            self.image_classifier = nn.Linear(self.image_dim, self.classifier.out_features).to(image_feat.device)
-            self.text_classifier = nn.Linear(self.text_dim, self.classifier.out_features).to(text_feat.device)
+            self.image_classifier = nn.Linear(self.clip_projection_dim , self.classifier.out_features).to(image_feat.device)
+            self.text_classifier = nn.Linear(self.clip_projection_dim , self.classifier.out_features).to(text_feat.device)
             with torch.no_grad():
                 # 为图像分类器使用合适的初始化
                 nn.init.xavier_uniform_(self.image_classifier.weight)
@@ -1356,15 +1538,15 @@ class MultimodalPromptModel(nn.Module):
 
         # 应用各个分类器
         if only_image.any():
-            img_logits[only_image] = self.image_classifier(image_feat[only_image])
+            img_logits[only_image] = self.image_classifier(image_feat_norm[only_image])
 
         if only_text.any():
-            txt_logits[only_text] = self.text_classifier(text_feat[only_text])
+            txt_logits[only_text] = self.text_classifier(text_feat_norm[only_text])
 
         if both_present.any():
             # 对于都存在的样本，计算两个分类器的结果并融合
-            img_pred = self.image_classifier(image_feat[both_present])
-            txt_pred = self.text_classifier(text_feat[both_present])
+            img_pred = self.image_classifier(image_feat_norm[both_present])
+            txt_pred = self.text_classifier(text_feat_norm[both_present])
 
             # 简单的加权融合（可以使用质量分数作为权重）
             if quality_scores is not None:
@@ -1383,91 +1565,13 @@ class MultimodalPromptModel(nn.Module):
 
 
         # # TODO: 后期融合
-        # # === NEW: SEPARATE MODALITY CLASSIFICATION ===
-        # # Compute logits from each modality's classifier
-        # enhanced_text_feat = self.text_feat_enhancer(text_feat_norm)
-        # image_logits = self.image_classifier(image_feat_norm)
-        # text_logits = self.text_classifier(enhanced_text_feat)
-        # # Determine fusion weights based on quality or missing type
-        # if quality_scores is not None:
-        #     # Use quality scores to determine weights
-        #     img_weight = quality_scores['image']['final_score']
-        #     txt_weight = quality_scores['text']['final_score']
-        # else:
-        #     # Use one-hot encoded missing type for weight prediction
-        #     missing_one_hot = F.one_hot(missing_type, num_classes=4).float()
-        #     fusion_weights = self.fusion_weight_net(missing_one_hot)
-        #     img_weight = fusion_weights[:, 0:1]  # First column for image weight
-        #     txt_weight = fusion_weights[:, 1:2]  # Second column for text weight
-        # # Add missing type specific adjustments
-        # # Increase weight for the present modality, decrease for missing
-        # img_weight = torch.where(is_image_missing.unsqueeze(1),
-        #                          img_weight * 0.3,  # Reduce weight if missing
-        #                          img_weight * 1.2)  # Increase weight if present
-        #
-        # txt_weight = torch.where(is_text_missing.unsqueeze(1),
-        #                          txt_weight * 0.3,  # Reduce weight if missing
-        #                          txt_weight * 1.2)  # Increase weight if present
-        #
-        # # Normalize weights to sum to 1
-        # weight_sum = img_weight + txt_weight + 1e-8  # Avoid division by zero
-        # img_weight = img_weight / weight_sum
-        # txt_weight = txt_weight / weight_sum
-        #
-        # # Late fusion: weighted combination of modality-specific logits
-        # logits = img_weight * image_logits + txt_weight * text_logits
-        #
-        # if self.training and torch.rand(1).item() < 0.01:  # 1%概率进行统计
-        #     with torch.no_grad():
-        #         # 记录特征和logits统计
-        #         txt_feat_mean = enhanced_text_feat.mean().item()
-        #         txt_feat_std = enhanced_text_feat.std().item()
-        #         txt_logits_mean = text_logits.mean().item()
-        #         txt_logits_std = text_logits.std().item()
-        #
-        #         # 统计正向预测比例
-        #         txt_pos_pred_ratio = (text_logits > 0).float().mean().item()
-        #         img_pos_pred_ratio = (image_logits > 0).float().mean().item()
-        #
-        #         print(f"\nText feature stats: mean={txt_feat_mean:.4f}, std={txt_feat_std:.4f}")
-        #         print(f"Text logits stats: mean={txt_logits_mean:.4f}, std={txt_logits_std:.4f}")
-        #         print(f"Positive prediction ratio - Text: {txt_pos_pred_ratio:.4f}, Image: {img_pos_pred_ratio:.4f}")
-        #
-        #         # 分别统计不同缺失类型的情况
-        #         for mt, mt_name in enumerate(['none', 'image', 'text', 'both']):
-        #             mt_mask = (missing_type == mt)
-        #             if mt_mask.any():
-        #                 mt_txt_logits = text_logits[mt_mask]
-        #                 mt_txt_pos_ratio = (mt_txt_logits > 0).float().mean().item()
-        #                 print(f"Missing type '{mt_name}': Text positive ratio = {mt_txt_pos_ratio:.4f}")
-        #
-        #
-        #         text_decision_threshold = torch.full_like(text_logits, -0.2)  # 默认阈值为-0.2
-        #         img_decision_threshold = torch.full_like(image_logits, 0.0)  # 默认阈值为0
-        #
-        #         # 针对图像缺失情况降低文本决策阈值，更容易产生正向预测
-        #         for b in range(batch_size):
-        #             if is_image_missing[b]:
-        #                 text_decision_threshold[b] = -0.5  # 当图像缺失时使用更低的阈值
-        #             if is_text_missing[b]:
-        #                 img_decision_threshold[b] = -0.3  # 当文本缺失时使用更低的图像阈值
-        #
-        #         # 根据动态阈值进行预测
-        #         text_preds = (text_logits > text_decision_threshold).float()
-        #         image_preds = (image_logits > img_decision_threshold).float()
-        #
-        #         # 使用动态阈值和权重的最终融合
-        #         weighted_preds = img_weight * image_preds + txt_weight * text_preds
-        #         final_preds = (weighted_preds > 0.5).float()  # 最终二值化
-        #         print(final_preds)
-
 
 
         # 质量引导的特征融合（如果启用）
         fusion_weights = None
         quality_guided_feat = None
         if self.use_quality_prompt and self.use_cross_modal_prompt:
-            quality_guided_feat, fusion_weights = self.feature_fusion(image_feat, text_feat, quality_scores)
+            quality_guided_feat, fusion_weights = self.feature_fusion(image_feat_norm, text_feat_norm, quality_scores)
 
 
 
@@ -1481,13 +1585,13 @@ class MultimodalPromptModel(nn.Module):
         # Add quality scores if enabled
         if self.use_quality_prompt:
             image_group = torch.cat([
-                image_feat,
+                image_feat_norm,
                 quality_scores['image']['final_score'],
                 quality_scores['image']['quality'],
             ], dim=1)
 
             text_group = torch.cat([
-                text_feat,
+                text_feat_norm,
                 quality_scores['text']['final_score'],
                 quality_scores['text']['quality'],
             ], dim=1)
@@ -1499,7 +1603,7 @@ class MultimodalPromptModel(nn.Module):
                 F.one_hot(missing_type, num_classes=4).float()
             ], dim=1)
         else:
-            features_to_concat = torch.cat([image_feat, text_feat, F.one_hot(missing_type, num_classes=4).float()], dim=1)
+            features_to_concat = torch.cat([image_feat_norm, text_feat_norm, F.one_hot(missing_type, num_classes=4).float()], dim=1)
 
         # Concatenate all features
         base_hidden = self.fusion(features_to_concat)
@@ -1592,14 +1696,24 @@ def create_multimodal_prompt_model(
         use_clip_encoders = True
         print(f"Detected matching CLIP model names. Using unified CLIP encoders: {image_model_name}")
 
-        from transformers import CLIPVisionModel, CLIPTextModel
+        from transformers import CLIPVisionModel, CLIPTextModel, CLIPModel
 
-        # 加载CLIP模型组件
-        vision_encoder = CLIPVisionModel.from_pretrained(image_model_name)
-        text_encoder = CLIPTextModel.from_pretrained(text_model_name)
-
-        print("CLIP vision model:", vision_encoder.__class__.__name__)
-        print("CLIP text model:", text_encoder.__class__.__name__)
+        # 方法1：直接加载完整的CLIP模型然后提取组件
+        try:
+            clip_model = CLIPModel.from_pretrained(image_model_name)
+            vision_encoder = clip_model.vision_model
+            text_encoder = clip_model.text_model
+            print("Successfully loaded CLIP model components from unified model")
+        except Exception as e:
+            print(f"Failed to load unified CLIP model: {e}")
+            # 方法2：分别加载vision和text模型
+            try:
+                vision_encoder = CLIPVisionModel.from_pretrained(image_model_name)
+                text_encoder = CLIPTextModel.from_pretrained(text_model_name)
+                print("Successfully loaded separate CLIP vision and text models")
+            except Exception as e2:
+                print(f"Failed to load separate CLIP models: {e2}")
+                raise e2
 
         # 创建并返回使用CLIP编码器的模型
         return MultimodalPromptModel(
