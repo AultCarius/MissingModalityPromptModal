@@ -335,26 +335,26 @@ class MultimodalPromptModel(nn.Module):
         )
         self.classifier = nn.Linear(fusion_dim, num_classes)
 
-        self.image_classifier = nn.Sequential(
-            nn.Linear(self.image_dim, fusion_dim),
-            nn.LayerNorm(fusion_dim),
-            nn.GELU(),
-            nn.Dropout(0.25),  # Higher dropout for image path
-            nn.Linear(fusion_dim, num_classes)
-        )
-
-        # Text-specific classifier
-        # 2. 设计更强大的文本分类器
-        self.text_classifier = nn.Sequential(
-            nn.Linear(self.text_dim, fusion_dim * 2),  # 更宽的隐藏层
-            nn.LayerNorm(fusion_dim * 2),
-            nn.GELU(),
-            nn.Dropout(0.1),  # 降低dropout以保留更多信息
-            nn.Linear(fusion_dim * 2, fusion_dim),
-            nn.GELU(),
-            nn.LayerNorm(fusion_dim),
-            nn.Linear(fusion_dim, num_classes)
-        )
+        # self.image_classifier = nn.Sequential(
+        #     nn.Linear(self.image_dim, fusion_dim),
+        #     nn.LayerNorm(fusion_dim),
+        #     nn.GELU(),
+        #     nn.Dropout(0.25),  # Higher dropout for image path
+        #     nn.Linear(fusion_dim, num_classes)
+        # )
+        #
+        # # Text-specific classifier
+        # # 2. 设计更强大的文本分类器
+        # self.text_classifier = nn.Sequential(
+        #     nn.Linear(self.text_dim, fusion_dim * 2),  # 更宽的隐藏层
+        #     nn.LayerNorm(fusion_dim * 2),
+        #     nn.GELU(),
+        #     nn.Dropout(0.1),  # 降低dropout以保留更多信息
+        #     nn.Linear(fusion_dim * 2, fusion_dim),
+        #     nn.GELU(),
+        #     nn.LayerNorm(fusion_dim),
+        #     nn.Linear(fusion_dim, num_classes)
+        # )
 
         # Modality fusion weights learner
         self.fusion_weight_net = nn.Sequential(
@@ -372,17 +372,17 @@ class MultimodalPromptModel(nn.Module):
             nn.LayerNorm(self.text_dim)
         )
         # 初始化文本分类器最后一层的偏置，使其更容易产生正向预测
-        with torch.no_grad():
-            # 获取最后一层
-            last_layer = None
-            for module in reversed(self.text_classifier):
-                if isinstance(module, nn.Linear):
-                    last_layer = module
-                    break
-
-            if last_layer is not None:
-                # 将偏置初始化为小正值，促进正向预测
-                last_layer.bias.fill_(0.1)  # 使用0.1作为初始偏置
+        # with torch.no_grad():
+        #     # 获取最后一层
+        #     last_layer = None
+        #     for module in reversed(self.text_classifier):
+        #         if isinstance(module, nn.Linear):
+        #             last_layer = module
+        #             break
+        #
+        #     if last_layer is not None:
+        #         # 将偏置初始化为小正值，促进正向预测
+        #         last_layer.bias.fill_(0.1)  # 使用0.1作为初始偏置
 
 
 
@@ -392,10 +392,9 @@ class MultimodalPromptModel(nn.Module):
         self.base_fusion_norm = nn.LayerNorm(fusion_dim)
         self.quality_fusion_norm = nn.LayerNorm(fusion_dim)
 
-        # 为图像特征使用较小的初始权重，抑制其影响
-        self.image_feat_norm.weight.data.fill_(0.8)  # 默认是1.0
-        # 为文本特征使用较大的初始权重，增强其影响
-        self.text_feat_norm.weight.data.fill_(1.2)  # 默认是1.0
+        # 修改为
+        self.image_feat_norm.weight.data.fill_(0.6)  # 降低图像特征影响
+        self.text_feat_norm.weight.data.fill_(1.4)  # 增加文本特征影响
 
         # 冻结预训练参数（如果需要）
         if freeze_image_encoder:
@@ -959,6 +958,7 @@ class MultimodalPromptModel(nn.Module):
                 seq_len = 77  # Adjust to actual sequence length
                 text_embed = torch.zeros(batch_size, seq_len, self.text_dim, device=device)
                 attention_mask = torch.zeros(batch_size, seq_len, dtype=torch.long, device=device)
+                # todo:检查这里的attention_mask
 
             # Copy generated features to appropriate positions
             for b in range(batch_size):
@@ -1283,7 +1283,7 @@ class MultimodalPromptModel(nn.Module):
             'text': text_feat.unsqueeze(1) if text_feat is not None else None  # [B, 1, D_txt]
         }
 
-        # 在这里生成cls token
+        # 在这里生成cls token与eot token
         processed_image,processed_text,processed_attenmask , additional_info = self._process_modalities(
             features_for_generation['image'],
             features_for_generation['text'],
@@ -1317,85 +1317,149 @@ class MultimodalPromptModel(nn.Module):
         if should_analyze:
             self.analyze_features_at_key_points("特征融合前", image_feat_norm.detach(), text_feat_norm.detach())
 
-
-        # TODO: 后期融合
-        # === NEW: SEPARATE MODALITY CLASSIFICATION ===
-        # Compute logits from each modality's classifier
-        enhanced_text_feat = self.text_feat_enhancer(text_feat_norm)
-        image_logits = self.image_classifier(image_feat_norm)
-        text_logits = self.text_classifier(enhanced_text_feat)
-        # Determine fusion weights based on quality or missing type
-        if quality_scores is not None:
-            # Use quality scores to determine weights
-            img_weight = quality_scores['image']['final_score']
-            txt_weight = quality_scores['text']['final_score']
-        else:
-            # Use one-hot encoded missing type for weight prediction
-            missing_one_hot = F.one_hot(missing_type, num_classes=4).float()
-            fusion_weights = self.fusion_weight_net(missing_one_hot)
-            img_weight = fusion_weights[:, 0:1]  # First column for image weight
-            txt_weight = fusion_weights[:, 1:2]  # Second column for text weight
-        # Add missing type specific adjustments
-        # Increase weight for the present modality, decrease for missing
-        img_weight = torch.where(is_image_missing.unsqueeze(1),
-                                 img_weight * 0.3,  # Reduce weight if missing
-                                 img_weight * 1.2)  # Increase weight if present
-
-        txt_weight = torch.where(is_text_missing.unsqueeze(1),
-                                 txt_weight * 0.3,  # Reduce weight if missing
-                                 txt_weight * 1.2)  # Increase weight if present
-
-        # Normalize weights to sum to 1
-        weight_sum = img_weight + txt_weight + 1e-8  # Avoid division by zero
-        img_weight = img_weight / weight_sum
-        txt_weight = txt_weight / weight_sum
-
-        # Late fusion: weighted combination of modality-specific logits
-        logits = img_weight * image_logits + txt_weight * text_logits
-
-        if self.training and torch.rand(1).item() < 0.01:  # 1%概率进行统计
+        if not hasattr(self, 'image_classifier'):
+            self.image_classifier = nn.Linear(self.image_dim, self.classifier.out_features).to(image_feat.device)
+            self.text_classifier = nn.Linear(self.text_dim, self.classifier.out_features).to(text_feat.device)
             with torch.no_grad():
-                # 记录特征和logits统计
-                txt_feat_mean = enhanced_text_feat.mean().item()
-                txt_feat_std = enhanced_text_feat.std().item()
-                txt_logits_mean = text_logits.mean().item()
-                txt_logits_std = text_logits.std().item()
+                # 为图像分类器使用合适的初始化
+                nn.init.xavier_uniform_(self.image_classifier.weight)
+                if self.image_classifier.bias is not None:
+                    nn.init.zeros_(self.image_classifier.bias)
 
-                # 统计正向预测比例
-                txt_pos_pred_ratio = (text_logits > 0).float().mean().item()
-                img_pos_pred_ratio = (image_logits > 0).float().mean().item()
+                # 为文本分类器使用合适的初始化
+                nn.init.xavier_uniform_(self.text_classifier.weight)
+                if self.text_classifier.bias is not None:
+                    nn.init.zeros_(self.text_classifier.bias)
 
-                print(f"\nText feature stats: mean={txt_feat_mean:.4f}, std={txt_feat_std:.4f}")
-                print(f"Text logits stats: mean={txt_logits_mean:.4f}, std={txt_logits_std:.4f}")
-                print(f"Positive prediction ratio - Text: {txt_pos_pred_ratio:.4f}, Image: {img_pos_pred_ratio:.4f}")
-
-                # 分别统计不同缺失类型的情况
-                for mt, mt_name in enumerate(['none', 'image', 'text', 'both']):
-                    mt_mask = (missing_type == mt)
-                    if mt_mask.any():
-                        mt_txt_logits = text_logits[mt_mask]
-                        mt_txt_pos_ratio = (mt_txt_logits > 0).float().mean().item()
-                        print(f"Missing type '{mt_name}': Text positive ratio = {mt_txt_pos_ratio:.4f}")
+                # 如果原始分类器有偏置，复制到新分类器
+                if hasattr(self.classifier, 'bias') and self.classifier.bias is not None:
+                    self.image_classifier.bias.copy_(self.classifier.bias)
+                    self.text_classifier.bias.copy_(self.classifier.bias)
 
 
-                text_decision_threshold = torch.full_like(text_logits, -0.2)  # 默认阈值为-0.2
-                img_decision_threshold = torch.full_like(image_logits, 0.0)  # 默认阈值为0
+        # img_logits = self.image_classifier(image_feat)
+        # txt_logits = self.text_classifier(text_feat)
 
-                # 针对图像缺失情况降低文本决策阈值，更容易产生正向预测
-                for b in range(batch_size):
-                    if is_image_missing[b]:
-                        text_decision_threshold[b] = -0.5  # 当图像缺失时使用更低的阈值
-                    if is_text_missing[b]:
-                        img_decision_threshold[b] = -0.3  # 当文本缺失时使用更低的图像阈值
+        batch_size = image_feat.size(0)
+        num_classes = self.classifier.out_features
+        device = image_feat.device
 
-                # 根据动态阈值进行预测
-                text_preds = (text_logits > text_decision_threshold).float()
-                image_preds = (image_logits > img_decision_threshold).float()
+        # 创建掩码
+        both_present = (~is_image_missing) & (~is_text_missing)
+        only_image = (~is_image_missing) & is_text_missing
+        only_text = is_image_missing & (~is_text_missing)
+        both_missing = is_image_missing & is_text_missing
 
-                # 使用动态阈值和权重的最终融合
-                weighted_preds = img_weight * image_preds + txt_weight * text_preds
-                final_preds = (weighted_preds > 0.5).float()  # 最终二值化
-                print(final_preds)
+        img_logits = torch.zeros(batch_size, num_classes, device=device)
+        txt_logits = torch.zeros(batch_size, num_classes, device=device)
+        combined_logits = torch.zeros(batch_size, num_classes, device=device)
+
+        # 应用各个分类器
+        if only_image.any():
+            img_logits[only_image] = self.image_classifier(image_feat[only_image])
+
+        if only_text.any():
+            txt_logits[only_text] = self.text_classifier(text_feat[only_text])
+
+        if both_present.any():
+            # 对于都存在的样本，计算两个分类器的结果并融合
+            img_pred = self.image_classifier(image_feat[both_present])
+            txt_pred = self.text_classifier(text_feat[both_present])
+
+            # 简单的加权融合（可以使用质量分数作为权重）
+            if quality_scores is not None:
+                img_weight = quality_scores['image']['final_score'][both_present]
+                txt_weight = quality_scores['text']['final_score'][both_present]
+                weights_sum = img_weight + txt_weight + 1e-8  # 避免除零
+
+                img_weight_norm = img_weight / weights_sum
+                txt_weight_norm = txt_weight / weights_sum
+
+                combined_logits[both_present] = (img_pred * img_weight_norm) + (txt_pred * txt_weight_norm)
+            else:
+                # 默认等权融合
+                combined_logits[both_present] = (img_pred + txt_pred) / 2.0
+
+
+
+        # # TODO: 后期融合
+        # # === NEW: SEPARATE MODALITY CLASSIFICATION ===
+        # # Compute logits from each modality's classifier
+        # enhanced_text_feat = self.text_feat_enhancer(text_feat_norm)
+        # image_logits = self.image_classifier(image_feat_norm)
+        # text_logits = self.text_classifier(enhanced_text_feat)
+        # # Determine fusion weights based on quality or missing type
+        # if quality_scores is not None:
+        #     # Use quality scores to determine weights
+        #     img_weight = quality_scores['image']['final_score']
+        #     txt_weight = quality_scores['text']['final_score']
+        # else:
+        #     # Use one-hot encoded missing type for weight prediction
+        #     missing_one_hot = F.one_hot(missing_type, num_classes=4).float()
+        #     fusion_weights = self.fusion_weight_net(missing_one_hot)
+        #     img_weight = fusion_weights[:, 0:1]  # First column for image weight
+        #     txt_weight = fusion_weights[:, 1:2]  # Second column for text weight
+        # # Add missing type specific adjustments
+        # # Increase weight for the present modality, decrease for missing
+        # img_weight = torch.where(is_image_missing.unsqueeze(1),
+        #                          img_weight * 0.3,  # Reduce weight if missing
+        #                          img_weight * 1.2)  # Increase weight if present
+        #
+        # txt_weight = torch.where(is_text_missing.unsqueeze(1),
+        #                          txt_weight * 0.3,  # Reduce weight if missing
+        #                          txt_weight * 1.2)  # Increase weight if present
+        #
+        # # Normalize weights to sum to 1
+        # weight_sum = img_weight + txt_weight + 1e-8  # Avoid division by zero
+        # img_weight = img_weight / weight_sum
+        # txt_weight = txt_weight / weight_sum
+        #
+        # # Late fusion: weighted combination of modality-specific logits
+        # logits = img_weight * image_logits + txt_weight * text_logits
+        #
+        # if self.training and torch.rand(1).item() < 0.01:  # 1%概率进行统计
+        #     with torch.no_grad():
+        #         # 记录特征和logits统计
+        #         txt_feat_mean = enhanced_text_feat.mean().item()
+        #         txt_feat_std = enhanced_text_feat.std().item()
+        #         txt_logits_mean = text_logits.mean().item()
+        #         txt_logits_std = text_logits.std().item()
+        #
+        #         # 统计正向预测比例
+        #         txt_pos_pred_ratio = (text_logits > 0).float().mean().item()
+        #         img_pos_pred_ratio = (image_logits > 0).float().mean().item()
+        #
+        #         print(f"\nText feature stats: mean={txt_feat_mean:.4f}, std={txt_feat_std:.4f}")
+        #         print(f"Text logits stats: mean={txt_logits_mean:.4f}, std={txt_logits_std:.4f}")
+        #         print(f"Positive prediction ratio - Text: {txt_pos_pred_ratio:.4f}, Image: {img_pos_pred_ratio:.4f}")
+        #
+        #         # 分别统计不同缺失类型的情况
+        #         for mt, mt_name in enumerate(['none', 'image', 'text', 'both']):
+        #             mt_mask = (missing_type == mt)
+        #             if mt_mask.any():
+        #                 mt_txt_logits = text_logits[mt_mask]
+        #                 mt_txt_pos_ratio = (mt_txt_logits > 0).float().mean().item()
+        #                 print(f"Missing type '{mt_name}': Text positive ratio = {mt_txt_pos_ratio:.4f}")
+        #
+        #
+        #         text_decision_threshold = torch.full_like(text_logits, -0.2)  # 默认阈值为-0.2
+        #         img_decision_threshold = torch.full_like(image_logits, 0.0)  # 默认阈值为0
+        #
+        #         # 针对图像缺失情况降低文本决策阈值，更容易产生正向预测
+        #         for b in range(batch_size):
+        #             if is_image_missing[b]:
+        #                 text_decision_threshold[b] = -0.5  # 当图像缺失时使用更低的阈值
+        #             if is_text_missing[b]:
+        #                 img_decision_threshold[b] = -0.3  # 当文本缺失时使用更低的图像阈值
+        #
+        #         # 根据动态阈值进行预测
+        #         text_preds = (text_logits > text_decision_threshold).float()
+        #         image_preds = (image_logits > img_decision_threshold).float()
+        #
+        #         # 使用动态阈值和权重的最终融合
+        #         weighted_preds = img_weight * image_preds + txt_weight * text_preds
+        #         final_preds = (weighted_preds > 0.5).float()  # 最终二值化
+        #         print(final_preds)
 
 
 
@@ -1469,7 +1533,7 @@ class MultimodalPromptModel(nn.Module):
         if should_analyze and hidden is not None:
             self.analyze_features_at_key_points("最终融合hidden", hidden.detach(), None)
 
-        # logits = self.classifier(hidden)
+        logits = self.classifier(hidden)
 
         additional_info.update({
             'quality_scores': quality_scores,
@@ -1485,6 +1549,15 @@ class MultimodalPromptModel(nn.Module):
             print(f"Text LayerNorm weights: {self.text_feat_norm.weight.mean().item():.4f}")
             print(f"Image LayerNorm weights: {self.base_fusion_norm.weight.mean().item():.4f}")
             print(f"Text LayerNorm weights: {self.quality_fusion_norm.weight.mean().item():.4f}")
+
+        additional_info.update({
+            'modality_logits': {
+                'image': img_logits,
+                'text': txt_logits,
+                'combined': combined_logits,
+                'original': logits
+            }
+        })
 
         return (logits, additional_info)
 
