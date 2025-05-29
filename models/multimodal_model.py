@@ -483,6 +483,7 @@ class MultimodalPromptModel(nn.Module):
                 for param in module.parameters():
                     param.requires_grad = False
 
+
     def apply_clip_projections(self, image_feat, text_feat):
         """
         应用CLIP投影层，将图像和文本特征投影到统一的语义空间
@@ -516,6 +517,7 @@ class MultimodalPromptModel(nn.Module):
             projected_text_feat = text_feat
 
         return projected_image_feat, projected_text_feat
+
 
     def analyze_feature_distributions(self, original_features, generated_features, reconstructed_features, missing_type,
                                       step="before_processing"):
@@ -940,6 +942,7 @@ class MultimodalPromptModel(nn.Module):
         # 处理文本特征 (如果存在且不是缺失的)
         text_embed = torch.zeros(batch_size, input_ids.size(1), self.text_dim, device=device)
         if input_ids is not None and not is_text_missing.all():
+
             try:
                 if self.use_clip_encoders:
                     # 使用CLIP text model的embeddings
@@ -998,7 +1001,6 @@ class MultimodalPromptModel(nn.Module):
         # Extract token features for reconstruction (first few tokens of each modality)
         token_count = 1  # Number of tokens to use per modality
 
-        # Save original features for reconstruction loss
         original_features = {
             'image': image_embed[:, :token_count].reshape(batch_size, token_count, -1).detach(),
             'text': text_embed[:, :token_count].reshape(batch_size, token_count, -1).detach()
@@ -1561,11 +1563,6 @@ class MultimodalPromptModel(nn.Module):
             else:
                 # 默认等权融合
                 combined_logits[both_present] = (img_pred + txt_pred) / 2.0
-
-
-
-        # # TODO: 后期融合
-
 
         # 质量引导的特征融合（如果启用）
         fusion_weights = None
