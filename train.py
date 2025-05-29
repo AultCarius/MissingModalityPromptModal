@@ -31,9 +31,10 @@ if __name__ == '__main__':
         config["experiment_name"] = f"{model_type}_fusion{fusion_dim}_miss{missing_prob}"
     print(f"Starting experiment: {config['experiment_name']}")
 
-
-    tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-base-patch16")
-    # tokenizer = RobertaTokenizer.from_pretrained("roberta-base")
+    if config.get("encoder_type", "clip"):
+        tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-base-patch16")
+    else:
+        tokenizer = RobertaTokenizer.from_pretrained("roberta-base")
 
     # Set up data module
     if config.get("dataset", "mmimdb") == "food101":

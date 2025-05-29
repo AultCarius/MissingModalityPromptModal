@@ -9,8 +9,8 @@ experiment_name: "mmimdb_test_delete_v4_laterfusion_eot"
 image_model_name: "openai/clip-vit-base-patch16" #[vit_base_patch16_224,openai/clip-vit-base-patch16]
 text_model_name: "openai/clip-vit-base-patch16" #[roberta-base,openai/clip-vit-base-patch16]
 encoder_type: "clip"  # "clip" or "roberta"
-image_prompt_len: 36
-text_prompt_len: 36
+image_prompt_len: 24
+text_prompt_len: 48
 prompt_depth: 6
 fusion_dim: 512
 freeze_image_encoder: True
